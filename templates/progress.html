@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>生成中... - 図解つくーる</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', 'Noto Sans JP', sans-serif; }
+    @keyframes shimmer {
+      0% { background-position: -200% 0; }
+      100% { background-position: 200% 0; }
+    }
+    .skeleton {
+      background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+    }
+    @keyframes pulse-ring {
+      0% { box-shadow: 0 0 0 0 rgba(147, 51, 234, 0.6); }
+      100% { box-shadow: 0 0 0 14px rgba(147, 51, 234, 0); }
+    }
+    .ring-pulse { animation: pulse-ring 1.5s infinite; }
+    @keyframes pop-in {
+      0% { opacity: 0; transform: scale(0.92); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+    .pop-in { animation: pop-in 0.4s ease-out; }
+    .grid-card { transition: all 0.2s; }
+    .grid-card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.08); }
+    /* スクロールバー */
+    .scroll-y::-webkit-scrollbar { width: 6px; }
+    .scroll-y::-webkit-scrollbar-track { background: transparent; }
+    .scroll-y::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+  <!-- Navbar -->
+  <nav class="bg-white/90 backdrop-blur border-b border-gray-200 sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="/" class="flex items-center gap-2.5">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-600 to-pink-600 flex items-center justify-center">
+          <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 3v11.25A2.25 2.25 0 006 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0118 16.5h-2.25"/>
+          </svg>
+        </div>
+        <span class="font-bold text-gray-900 text-base">図解つくーる</span>
+      </a>
+      <div class="flex items-center gap-3">
+        <span class="text-xs text-gray-400 font-mono">{{ job_id }}</span>
+        <a href="/" class="text-xs text-purple-600 hover:underline">+ 新規ジョブ</a>
+      </div>
+    </div>
+  </nav>
+
+  <div class="max-w-7xl mx-auto px-6 py-6">
+
+    <!-- ヘッダー & 進捗バー -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-6 mb-6 shadow-sm">
+      <div class="flex items-start justify-between gap-4 mb-4">
+        <div class="flex-1 min-w-0">
+          <h1 id="jobTitle" class="text-xl font-bold text-gray-900 truncate">生成中...</h1>
+          <p id="jobMessage" class="text-sm text-gray-500 mt-1">原稿を分析しています...</p>
+        </div>
+        <div id="statusBadge" class="flex-shrink-0 inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-50 text-blue-700 text-sm font-medium">
+          <span class="w-2 h-2 bg-blue-500 rounded-full ring-pulse"></span>
+          <span>実行中</span>
+        </div>
+      </div>
+
+      <!-- 全体進捗バー -->
+      <div class="mb-4">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex gap-3 text-xs text-gray-500">
+            <span>Phase <span id="phaseNum" class="font-semibold text-gray-900">0</span>/3</span>
+            <span class="text-gray-300">|</span>
+            <span class="font-semibold text-purple-600" id="overallPercent">0%</span>
+          </div>
+          <div class="text-xs text-gray-500 hidden md:block">
+            目標: <span id="targetCountVal" class="font-semibold text-gray-900">--</span>枚 /
+            並列: <span id="concurrencyVal" class="font-semibold text-gray-900">--</span>枚同時
+          </div>
+        </div>
+        <div class="h-2 bg-gray-100 rounded-full overflow-hidden">
+          <div id="overallBar" class="h-full bg-gradient-to-r from-purple-500 to-pink-500 transition-all duration-500" style="width:0%"></div>
+        </div>
+      </div>
+
+      <!-- 画像生成サマリ -->
+      <div class="grid grid-cols-4 gap-3" id="imgSummary">
+        <div class="bg-gray-50 rounded-lg p-3 text-center">
+          <div class="text-2xl font-bold text-gray-900" id="totalCount">0</div>
+          <div class="text-xs text-gray-500 mt-0.5">合計</div>
+        </div>
+        <div class="bg-yellow-50 rounded-lg p-3 text-center">
+          <div class="text-2xl font-bold text-yellow-600" id="generatingCount">0</div>
+          <div class="text-xs text-gray-500 mt-0.5">生成中</div>
+        </div>
+        <div class="bg-green-50 rounded-lg p-3 text-center">
+          <div class="text-2xl font-bold text-green-600" id="completedCount">0</div>
+          <div class="text-xs text-gray-500 mt-0.5">完了</div>
+        </div>
+        <div class="bg-red-50 rounded-lg p-3 text-center">
+          <div class="text-2xl font-bold text-red-600" id="failedCount">0</div>
+          <div class="text-xs text-gray-500 mt-0.5">失敗</div>
+        </div>
+      </div>
+
+      <!-- 完了時のアクション -->
+      <div id="actions" class="hidden mt-5 flex flex-wrap gap-3">
+        <a id="downloadBtn" href="" class="inline-flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-medium rounded-xl hover:from-purple-700 hover:to-pink-700 transition shadow-md">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
+          ZIP でダウンロード
+        </a>
+        <a href="/" class="inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition">
+          + 新しいジョブを作成
+        </a>
+      </div>
+    </div>
+
+    <!-- メイン: グリッド + サイドログ -->
+    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+
+      <!-- 画像グリッド -->
+      <div class="lg:col-span-3">
+        <div class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-sm font-semibold text-gray-900">図解グリッド</h2>
+            <div class="flex items-center gap-2 text-xs text-gray-400">
+              <span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-gray-300"></span>待機</span>
+              <span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></span>生成中</span>
+              <span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-green-500"></span>完了</span>
+              <span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-red-500"></span>失敗</span>
+            </div>
+          </div>
+          <div id="imgGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-3">
+            <!-- 動的に生成 -->
+            <div class="col-span-full text-center text-sm text-gray-400 py-12">
+              抽出が完了するとここに図解が並びます...
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- アクティビティログ -->
+      <div class="lg:col-span-1">
+        <div class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm sticky top-20">
+          <h2 class="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
+            <svg class="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 9v.776"/></svg>
+            アクティビティ
+          </h2>
+          <div id="logsContainer" class="space-y-2 max-h-[600px] overflow-y-auto scroll-y text-xs">
+            <p class="text-gray-400 text-center py-6">起動を待機しています...</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- 拡大表示モーダル -->
+  <div id="modal" class="hidden fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6" onclick="closeModal(event)">
+    <div class="max-w-5xl w-full bg-white rounded-2xl overflow-hidden shadow-2xl" onclick="event.stopPropagation()">
+      <div class="flex items-center justify-between px-5 py-3 border-b border-gray-200">
+        <div class="min-w-0">
+          <p id="modalTitle" class="text-sm font-semibold text-gray-900 truncate"></p>
+          <p id="modalSection" class="text-xs text-gray-500 mt-0.5"></p>
+        </div>
+        <button onclick="closeModal()" class="text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+      </div>
+      <div class="bg-gray-100 flex items-center justify-center p-4">
+        <img id="modalImg" src="" class="max-w-full max-h-[70vh] object-contain rounded-lg shadow">
+      </div>
+      <div class="px-5 py-3 border-t border-gray-200 bg-gray-50">
+        <p class="text-xs text-gray-500 mb-1">対応する原稿の抜粋:</p>
+        <p id="modalExcerpt" class="text-sm text-gray-800"></p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const JOB_ID = "{{ job_id }}";
+    let logsSince = 0;
+    let stopped = false;
+    let knownItems = {}; // index -> item
+
+    const els = {
+      jobTitle: document.getElementById('jobTitle'),
+      jobMessage: document.getElementById('jobMessage'),
+      statusBadge: document.getElementById('statusBadge'),
+      phaseNum: document.getElementById('phaseNum'),
+      overallBar: document.getElementById('overallBar'),
+      overallPercent: document.getElementById('overallPercent'),
+      targetCountVal: document.getElementById('targetCountVal'),
+      concurrencyVal: document.getElementById('concurrencyVal'),
+      totalCount: document.getElementById('totalCount'),
+      generatingCount: document.getElementById('generatingCount'),
+      completedCount: document.getElementById('completedCount'),
+      failedCount: document.getElementById('failedCount'),
+      imgGrid: document.getElementById('imgGrid'),
+      logsContainer: document.getElementById('logsContainer'),
+      actions: document.getElementById('actions'),
+      downloadBtn: document.getElementById('downloadBtn'),
+    };
+
+    function escapeHtml(s) {
+      if (!s) return '';
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+    }
+
+    function statusBadgeHtml(status) {
+      const map = {
+        running:    { color: 'bg-blue-50 text-blue-700',   dot: 'bg-blue-500 ring-pulse',   label: '実行中' },
+        queued:     { color: 'bg-gray-100 text-gray-700',  dot: 'bg-gray-400',             label: '待機中' },
+        completed:  { color: 'bg-green-50 text-green-700', dot: 'bg-green-500',            label: '完了' },
+        error:      { color: 'bg-red-50 text-red-700',     dot: 'bg-red-500',              label: 'エラー' },
+        not_found:  { color: 'bg-gray-100 text-gray-500',  dot: 'bg-gray-300',             label: '見つかりません' },
+      };
+      const v = map[status] || map.running;
+      return `<span class="w-2 h-2 ${v.dot} rounded-full"></span><span>${v.label}</span>`;
+    }
+
+    function renderItem(item) {
+      const idx = item.index;
+      const status = item.status || 'pending';
+      const filename = item.filename;
+      const section = escapeHtml(item.section || '');
+      const keypoint = escapeHtml(item.keypoint || item.excerpt?.substring(0, 30) || `図 ${idx}`);
+      const excerpt = escapeHtml(item.excerpt || '');
+
+      let inner = '';
+      if (status === 'ok' && filename) {
+        inner = `
+          <div class="aspect-video bg-gray-100 overflow-hidden cursor-pointer pop-in"
+               onclick='openModal(${idx})'>
+            <img src="/results/${JOB_ID}/images/${filename}" alt="${keypoint}" class="w-full h-full object-cover" loading="lazy">
+          </div>
+          <div class="px-2 py-1.5 bg-white">
+            <p class="text-[10px] text-gray-400 truncate">${section}</p>
+            <p class="text-xs text-gray-800 truncate font-medium">${keypoint}</p>
+          </div>`;
+      } else if (status === 'generating') {
+        inner = `
+          <div class="aspect-video skeleton flex items-center justify-center relative">
+            <div class="absolute inset-0 flex items-center justify-center">
+              <div class="w-10 h-10 rounded-full border-4 border-purple-200 border-t-purple-600 animate-spin"></div>
+            </div>
+          </div>
+          <div class="px-2 py-1.5 bg-yellow-50">
+            <p class="text-[10px] text-yellow-700 truncate">生成中...</p>
+            <p class="text-xs text-gray-700 truncate">${keypoint}</p>
+          </div>`;
+      } else if (status === 'failed') {
+        inner = `
+          <div class="aspect-video bg-red-50 flex items-center justify-center">
+            <svg class="w-8 h-8 text-red-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+          </div>
+          <div class="px-2 py-1.5 bg-red-50">
+            <p class="text-[10px] text-red-600 truncate">失敗</p>
+            <p class="text-xs text-gray-700 truncate">${keypoint}</p>
+          </div>`;
+      } else {
+        // pending
+        inner = `
+          <div class="aspect-video bg-gray-50 flex items-center justify-center">
+            <span class="text-xs text-gray-300">待機中</span>
+          </div>
+          <div class="px-2 py-1.5 bg-white">
+            <p class="text-[10px] text-gray-400 truncate">${section}</p>
+            <p class="text-xs text-gray-500 truncate">${keypoint}</p>
+          </div>`;
+      }
+
+      // フッター: 番号
+      return `
+        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border border-gray-200 bg-white" data-status="${status}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
+          <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${String(idx).padStart(3, '0')}</span>
+          ${inner}
+        </div>`;
+    }
+
+    function rebuildGrid(items) {
+      // ソート
+      items.sort((a, b) => (a.index || 0) - (b.index || 0));
+      const grid = els.imgGrid;
+      // 部分更新: 既存と差分があるカードのみ書き換える
+      const existingIds = new Set(Array.from(grid.querySelectorAll('[id^="card-"]')).map(e => parseInt(e.id.replace('card-', ''))));
+      const newIds = new Set(items.map(i => i.index));
+
+      // 全て新規（初回）
+      if (existingIds.size === 0 && items.length > 0) {
+        grid.innerHTML = items.map(renderItem).join('');
+        return;
+      }
+
+      // 既存のうち、ステータスが変わったものだけ書き換え
+      items.forEach(item => {
+        const card = document.getElementById(`card-${item.index}`);
+        const prevStatus = card?.getAttribute('data-status');
+        if (!card) {
+          // 新規追加
+          grid.insertAdjacentHTML('beforeend', renderItem(item));
+        } else if (prevStatus !== item.status) {
+          card.outerHTML = renderItem(item);
+        }
+      });
+    }
+
+    function updateSummary(items, jobState) {
+      const total = items.length;
+      const completed = items.filter(i => i.status === 'ok').length;
+      const generating = items.filter(i => i.status === 'generating').length;
+      const failed = items.filter(i => i.status === 'failed').length;
+      els.totalCount.textContent = total;
+      els.completedCount.textContent = completed;
+      els.generatingCount.textContent = generating;
+      els.failedCount.textContent = failed;
+    }
+
+    async function pollStatus() {
+      try {
+        const res = await fetch(`/api/status/${JOB_ID}`);
+        if (!res.ok) return;
+        const state = await res.json();
+
+        // ヘッダ更新
+        els.jobMessage.textContent = state.message || '...';
+        els.phaseNum.textContent = state.phase || 0;
+        els.overallBar.style.width = `${state.percent || 0}%`;
+        els.overallPercent.textContent = `${state.percent || 0}%`;
+        if (state.target_count) els.targetCountVal.textContent = state.target_count;
+        if (state.concurrency) els.concurrencyVal.textContent = state.concurrency;
+        if (state.title) els.jobTitle.textContent = state.title;
+
+        // ステータスバッジ
+        els.statusBadge.innerHTML = statusBadgeHtml(state.status);
+        const colorMap = {
+          running: 'bg-blue-50 text-blue-700',
+          queued: 'bg-gray-100 text-gray-700',
+          completed: 'bg-green-50 text-green-700',
+          error: 'bg-red-50 text-red-700',
+        };
+        els.statusBadge.className = `flex-shrink-0 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${colorMap[state.status] || 'bg-gray-100 text-gray-700'}`;
+
+        if (state.status === 'completed') {
+          stopped = true;
+          els.actions.classList.remove('hidden');
+          els.downloadBtn.href = `/download/${JOB_ID}`;
+        }
+        if (state.status === 'error') {
+          stopped = true;
+        }
+      } catch (e) {
+        console.error('status error', e);
+      }
+    }
+
+    async function pollItems() {
+      try {
+        const res = await fetch(`/api/items/${JOB_ID}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const items = data.items || [];
+        if (items.length > 0) {
+          rebuildGrid(items);
+          updateSummary(items);
+          // 内部キャッシュ
+          items.forEach(i => { knownItems[i.index] = i; });
+        }
+      } catch (e) {
+        console.error('items error', e);
+      }
+    }
+
+    async function pollLogs() {
+      try {
+        const res = await fetch(`/api/logs/${JOB_ID}?since=${logsSince}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const newLogs = data.logs || [];
+        if (newLogs.length === 0) return;
+        logsSince += newLogs.length;
+
+        // 初回はクリア
+        if (logsSince === newLogs.length) els.logsContainer.innerHTML = '';
+
+        const colorMap = {
+          system: 'bg-gray-50 text-gray-700',
+          analyze: 'bg-blue-50 text-blue-700',
+          extract: 'bg-purple-50 text-purple-700',
+          prompter: 'bg-pink-50 text-pink-700',
+          generator: 'bg-amber-50 text-amber-700',
+          error: 'bg-red-50 text-red-700',
+          warn: 'bg-yellow-50 text-yellow-700',
+          setup: 'bg-gray-50 text-gray-700',
+        };
+
+        newLogs.forEach(log => {
+          const div = document.createElement('div');
+          div.className = `p-2 rounded-md ${colorMap[log.category] || 'bg-gray-50 text-gray-700'}`;
+          div.innerHTML = `
+            <div class="flex items-center justify-between gap-2 mb-0.5">
+              <span class="text-[10px] font-mono opacity-60">${log.time}</span>
+              <span class="text-[10px] font-semibold uppercase opacity-70">${log.category}</span>
+            </div>
+            <p class="text-xs leading-snug">${escapeHtml(log.message)}</p>
+            ${log.detail ? `<p class="text-[10px] opacity-70 mt-0.5">${escapeHtml(log.detail)}</p>` : ''}
+          `;
+          els.logsContainer.appendChild(div);
+        });
+        els.logsContainer.scrollTop = els.logsContainer.scrollHeight;
+      } catch (e) {
+        console.error('logs error', e);
+      }
+    }
+
+    function openModal(idx) {
+      const card = document.getElementById(`card-${idx}`);
+      if (!card) return;
+      const filename = card.getAttribute('data-filename');
+      if (!filename) return;
+      document.getElementById('modalImg').src = `/results/${JOB_ID}/images/${filename}`;
+      document.getElementById('modalTitle').textContent = card.getAttribute('data-keypoint') || `図 ${idx}`;
+      document.getElementById('modalSection').textContent = card.getAttribute('data-section') || '';
+      document.getElementById('modalExcerpt').textContent = card.getAttribute('data-excerpt') || '';
+      document.getElementById('modal').classList.remove('hidden');
+    }
+    function closeModal(e) {
+      if (e && e.target.tagName === 'IMG') return;
+      document.getElementById('modal').classList.add('hidden');
+    }
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeModal();
+    });
+
+    // ポーリング開始
+    async function tick() {
+      await Promise.all([pollStatus(), pollItems(), pollLogs()]);
+      if (!stopped) {
+        setTimeout(tick, 1500);
+      } else {
+        // 完了後も最終データを1回だけ取得
+        setTimeout(async () => {
+          await Promise.all([pollItems(), pollLogs()]);
+        }, 1500);
+      }
+    }
+    tick();
+  </script>
+</body>
+</html>
