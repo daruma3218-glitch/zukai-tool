@@ -29,6 +29,7 @@ from flask import (
 
 from utils import load_env, load_json
 from pipeline import DiagramPipeline
+from generator import PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -133,11 +134,15 @@ def _add_log(job_id: str, category: str, message: str, detail: str = ""):
 
 
 def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
-                         user_instructions: str, concurrency: int):
+                         user_instructions: str, concurrency: int,
+                         provider: str = PROVIDER_NANOBANANA,
+                         openai_quality: str = "medium"):
     job_dir = OUTPUT_DIR / job_id
+    provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
         _set_job_state(job_id, status="running", phase=0, message="開始しています...", percent=0)
-        _add_log(job_id, "system", f"ジョブ {job_id} を開始（目標 {target_count} 枚 / 並列 {concurrency}）")
+        _add_log(job_id, "system",
+                 f"ジョブ {job_id} を開始（{provider_label} / 目標 {target_count} 枚 / 並列 {concurrency}）")
 
         def on_progress(phase, msg, pct):
             _set_job_state(job_id, status="running", phase=phase, message=msg, percent=pct)
@@ -155,6 +160,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             target_count=target_count,
             user_instructions=user_instructions,
             concurrency=concurrency,
+            provider=provider,
+            openai_quality=openai_quality,
             progress_callback=on_progress,
             log_callback=on_log,
             item_callback=on_item,
@@ -206,18 +213,29 @@ def index():
         past_jobs=past_jobs[:30],
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
+        has_openai=bool(os.environ.get("OPENAI_API_KEY")),
     )
 
 
 @app.route("/start", methods=["POST"])
 @login_required
 def start_job():
-    # API キー確認
+    # provider を先に取得
+    provider = request.form.get("provider", PROVIDER_NANOBANANA)
+    if provider not in VALID_PROVIDERS:
+        provider = PROVIDER_NANOBANANA
+    openai_quality = request.form.get("openai_quality", "medium")
+    if openai_quality not in ("low", "medium", "high"):
+        openai_quality = "medium"
+
+    # API キー確認（プロバイダ別）
     missing = []
     if not os.environ.get("ANTHROPIC_API_KEY"):
         missing.append("ANTHROPIC_API_KEY")
-    if not os.environ.get("GEMINI_API_KEY"):
+    if provider == PROVIDER_NANOBANANA and not os.environ.get("GEMINI_API_KEY"):
         missing.append("GEMINI_API_KEY")
+    if provider == PROVIDER_GPT_IMAGE and not os.environ.get("OPENAI_API_KEY"):
+        missing.append("OPENAI_API_KEY")
     if missing:
         return jsonify({"error": f"{', '.join(missing)} が設定されていません"}), 400
 
@@ -264,11 +282,13 @@ def start_job():
         percent=0,
         target_count=target_count,
         concurrency=concurrency,
+        provider=provider,
+        openai_quality=openai_quality if provider == PROVIDER_GPT_IMAGE else None,
     )
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(job_id, manuscript_text, target_count, user_instructions, concurrency),
+        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality),
         daemon=True,
     )
     thread.start()

@@ -9,6 +9,12 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_IMAGE_MODEL
+        value: "gpt-image-2"
+      - key: GEMINI_IMAGE_MODEL
+        value: "gemini-3.1-flash-image-preview"
       - key: APP_PASSWORD
         sync: false
       - key: SECRET_KEY

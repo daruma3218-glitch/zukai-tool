@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Phase 3: 並列画像生成エージェント
+"""Phase 3: 並列画像生成エージェント（マルチプロバイダ対応）
 
-asyncio + Semaphore で同時 N 枚を並列生成する。Gemini SDK は同期なので
-loop.run_in_executor で thread pool に委譲する（真の並列化）。
+asyncio + Semaphore で同時 N 枚を並列生成する。
+プロバイダは 2 種類から選択可:
+  - "nanobanana": Google Gemini Flash Image（高速・安価・16:9 自然）
+  - "gpt-image":  OpenAI gpt-image-2（高品質・テキスト精度高）
+
+両 SDK は同期 API なので loop.run_in_executor で thread pool に委譲する。
 """
 
 import asyncio
@@ -12,13 +16,21 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+# Gemini SDK
 from google import genai
 from google.genai import types
 
 
-IMAGE_MODEL = "gemini-3.1-flash-image-preview"
-DEFAULT_CONCURRENCY = 12  # 同時並列数
+# ===== モデル設定 =====
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_OPENAI_MODEL = "gpt-image-2"
+DEFAULT_CONCURRENCY = 12
 MAX_RETRIES = 3
+
+# プロバイダ識別子
+PROVIDER_NANOBANANA = "nanobanana"
+PROVIDER_GPT_IMAGE = "gpt-image"
+VALID_PROVIDERS = (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE)
 
 
 def _build_full_prompt(user_prompt: str, prompt_type: str = "illustration") -> str:
@@ -54,27 +66,25 @@ def _build_full_prompt(user_prompt: str, prompt_type: str = "illustration") -> s
     return f"{style}{common}\n\nContent to visualize:\n{user_prompt}"
 
 
-def _sync_generate_image(
+# ===== Gemini (nanobanana) =====
+def _sync_generate_image_gemini(
     client: genai.Client,
     full_prompt: str,
     output_path: Path,
-) -> tuple[bool, str]:
-    """1 枚の画像を同期生成（thread pool で呼ばれる）
-
-    戻り値: (success, error_message)
-    """
+    model_name: str = DEFAULT_GEMINI_MODEL,
+) -> tuple:
+    """1 枚の画像を同期生成（Gemini）"""
     last_error = ""
     for attempt in range(MAX_RETRIES):
         try:
             response = client.models.generate_content(
-                model=IMAGE_MODEL,
+                model=model_name,
                 contents=full_prompt,
                 config=types.GenerateContentConfig(
                     response_modalities=["TEXT", "IMAGE"],
                 ),
             )
 
-            # response.parts → 画像データを探す
             parts_iter = []
             if hasattr(response, "parts") and response.parts:
                 parts_iter = response.parts
@@ -93,7 +103,6 @@ def _sync_generate_image(
                     return True, ""
 
             last_error = "no image in response"
-            # テキスト返答があれば原因の手がかりに
             for part in parts_iter:
                 txt = getattr(part, "text", None)
                 if txt:
@@ -104,36 +113,137 @@ def _sync_generate_image(
             err = str(e)
             last_error = err[:200]
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                # レート制限: 30 秒 x attempt+1 待機
                 time.sleep(30 * (attempt + 1))
                 continue
             if "safety" in err.lower() or "block" in err.lower():
                 return False, f"safety blocked: {err[:120]}"
             if "not found" in err.lower() or "404" in err:
-                return False, f"model not available: {IMAGE_MODEL}"
+                return False, f"model not available: {model_name}"
             time.sleep(3 + 2 * attempt)
 
     return False, last_error or "max retries exceeded"
 
 
+# ===== OpenAI (gpt-image-2) =====
+def _sync_generate_image_openai(
+    client,  # openai.OpenAI
+    full_prompt: str,
+    output_path: Path,
+    model_name: str = DEFAULT_OPENAI_MODEL,
+    size: str = "1536x1024",  # 3:2 横長（16:9 に最も近い）
+    quality: str = "medium",  # low / medium / high
+) -> tuple:
+    """1 枚の画像を同期生成（OpenAI gpt-image-2）"""
+    last_error = ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.images.generate(
+                model=model_name,
+                prompt=full_prompt,
+                n=1,
+                size=size,
+                quality=quality,
+            )
+
+            if not response or not response.data:
+                last_error = "no data in response"
+                continue
+
+            datum = response.data[0]
+            # 新 API: b64_json で base64 が返る
+            b64 = getattr(datum, "b64_json", None)
+            url = getattr(datum, "url", None)
+
+            if b64:
+                img_data = base64.b64decode(b64)
+                output_path.write_bytes(img_data)
+                return True, ""
+            elif url:
+                # URL なら fetch
+                import urllib.request
+                with urllib.request.urlopen(url, timeout=60) as r:
+                    output_path.write_bytes(r.read())
+                return True, ""
+            else:
+                last_error = "neither b64_json nor url in response"
+
+        except Exception as e:
+            err = str(e)
+            last_error = err[:200]
+            err_lower = err.lower()
+            if "429" in err or "rate" in err_lower or "limit" in err_lower:
+                time.sleep(30 * (attempt + 1))
+                continue
+            if "safety" in err_lower or "policy" in err_lower or "moderation" in err_lower:
+                return False, f"content policy blocked: {err[:120]}"
+            if "404" in err or "model_not_found" in err_lower or "does not exist" in err_lower:
+                return False, f"model not available: {model_name} ({err[:80]})"
+            if "401" in err or "invalid api key" in err_lower:
+                return False, f"invalid OpenAI API key: {err[:80]}"
+            time.sleep(3 + 2 * attempt)
+
+    return False, last_error or "max retries exceeded"
+
+
+# ===== 並列ジェネレータ =====
 class ParallelImageGenerator:
-    """asyncio + Semaphore による並列画像生成器"""
+    """asyncio + Semaphore による並列画像生成器（マルチプロバイダ）"""
 
     def __init__(
         self,
-        api_key: str,
+        provider: str,
+        gemini_api_key: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
+        gemini_model: Optional[str] = None,
+        openai_model: Optional[str] = None,
+        openai_quality: str = "medium",
+        openai_size: str = "1536x1024",
         concurrency: int = DEFAULT_CONCURRENCY,
         progress_callback: Optional[Callable[[dict], None]] = None,
     ):
-        self.client = genai.Client(api_key=api_key)
+        if provider not in VALID_PROVIDERS:
+            raise ValueError(f"unknown provider: {provider} (valid: {VALID_PROVIDERS})")
+        self.provider = provider
+        self.openai_quality = openai_quality
+        self.openai_size = openai_size
+
+        # クライアント初期化（必要な分だけ）
+        self.gemini_client = None
+        self.openai_client = None
+        self.gemini_model = gemini_model or DEFAULT_GEMINI_MODEL
+        self.openai_model = openai_model or DEFAULT_OPENAI_MODEL
+
+        if provider == PROVIDER_NANOBANANA:
+            if not gemini_api_key:
+                raise RuntimeError("nanobanana を使うには GEMINI_API_KEY が必要です")
+            self.gemini_client = genai.Client(api_key=gemini_api_key)
+        elif provider == PROVIDER_GPT_IMAGE:
+            if not openai_api_key:
+                raise RuntimeError("gpt-image を使うには OPENAI_API_KEY が必要です")
+            import openai  # 遅延 import
+            self.openai_client = openai.OpenAI(api_key=openai_api_key)
+
         self.concurrency = max(1, min(concurrency, 32))
         self.progress_callback = progress_callback or (lambda info: None)
-        # Lock は async 関数内で生成する（Python 3.9 では __init__ で
-        # asyncio.Lock() を作ると get_event_loop() エラーになる）
+        # Lock は async 関数内で生成する（Python 3.9 対策）
         self._counter_lock: Optional[asyncio.Lock] = None
         self._completed = 0
         self._failed = 0
         self._total = 0
+
+    def _dispatch_sync_generate(self, full_prompt: str, output_path: Path) -> tuple:
+        """provider に応じた同期生成関数を呼び分ける"""
+        if self.provider == PROVIDER_NANOBANANA:
+            return _sync_generate_image_gemini(
+                self.gemini_client, full_prompt, output_path, self.gemini_model
+            )
+        else:  # gpt-image
+            return _sync_generate_image_openai(
+                self.openai_client, full_prompt, output_path,
+                model_name=self.openai_model,
+                size=self.openai_size,
+                quality=self.openai_quality,
+            )
 
     async def _generate_one(
         self,
@@ -152,13 +262,13 @@ class ParallelImageGenerator:
         output_path = output_dir / filename
 
         async with semaphore:
-            # 開始通知
             self.progress_callback({
                 "index": idx,
                 "status": "generating",
                 "section": section,
                 "keypoint": keypoint,
                 "excerpt": excerpt,
+                "provider": self.provider,
             })
 
             full_prompt = _build_full_prompt(prompt_text, prompt_type)
@@ -167,8 +277,7 @@ class ParallelImageGenerator:
             try:
                 success, error = await loop.run_in_executor(
                     None,
-                    _sync_generate_image,
-                    self.client,
+                    self._dispatch_sync_generate,
                     full_prompt,
                     output_path,
                 )
@@ -191,11 +300,11 @@ class ParallelImageGenerator:
                 "keypoint": keypoint,
                 "type": prompt_type,
                 "prompt": prompt_text,
+                "provider": self.provider,
                 "success": success,
                 "error": error if not success else "",
             }
 
-            # 完了通知（リアルタイムでフロントへ）
             self.progress_callback({
                 "index": idx,
                 "status": "ok" if success else "failed",
@@ -204,6 +313,7 @@ class ParallelImageGenerator:
                 "excerpt": excerpt,
                 "filename": filename if success else None,
                 "error": error if not success else "",
+                "provider": self.provider,
                 "completed_total": completed_now,
                 "failed_total": failed_now,
                 "grand_total": self._total,
@@ -211,11 +321,7 @@ class ParallelImageGenerator:
 
             return result
 
-    async def generate_all(
-        self,
-        prompts: list,
-        output_dir: Path,
-    ) -> list:
+    async def generate_all(self, prompts: list, output_dir: Path) -> list:
         """全プロンプトを並列生成"""
         output_dir.mkdir(parents=True, exist_ok=True)
         self._completed = 0
@@ -229,21 +335,42 @@ class ParallelImageGenerator:
             self._generate_one(p, output_dir, semaphore)
             for p in prompts
         ]
-        # gather で並列実行（順序は保たれる）
         results = await asyncio.gather(*tasks, return_exceptions=False)
         return results
 
 
 def run_parallel_generation(
-    api_key: str,
     prompts: list,
     output_dir: Path,
+    provider: str = PROVIDER_NANOBANANA,
+    gemini_api_key: Optional[str] = None,
+    openai_api_key: Optional[str] = None,
+    gemini_model: Optional[str] = None,
+    openai_model: Optional[str] = None,
+    openai_quality: str = "medium",
+    openai_size: str = "1536x1024",
     concurrency: int = DEFAULT_CONCURRENCY,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> list:
     """同期エントリポイント: pipeline から呼び出す"""
+    # 環境変数からデフォルト補完
+    if gemini_api_key is None:
+        gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+    if openai_api_key is None:
+        openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    if gemini_model is None:
+        gemini_model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_GEMINI_MODEL)
+    if openai_model is None:
+        openai_model = os.environ.get("OPENAI_IMAGE_MODEL", DEFAULT_OPENAI_MODEL)
+
     generator = ParallelImageGenerator(
-        api_key=api_key,
+        provider=provider,
+        gemini_api_key=gemini_api_key,
+        openai_api_key=openai_api_key,
+        gemini_model=gemini_model,
+        openai_model=openai_model,
+        openai_quality=openai_quality,
+        openai_size=openai_size,
         concurrency=concurrency,
         progress_callback=progress_callback,
     )

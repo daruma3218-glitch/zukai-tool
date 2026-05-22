@@ -20,7 +20,13 @@ from utils import (
 )
 from extractor import analyze_manuscript, extract_visual_points
 from prompter import generate_all_prompts
-from generator import run_parallel_generation, DEFAULT_CONCURRENCY
+from generator import (
+    run_parallel_generation,
+    DEFAULT_CONCURRENCY,
+    PROVIDER_NANOBANANA,
+    PROVIDER_GPT_IMAGE,
+    VALID_PROVIDERS,
+)
 
 
 class DiagramPipeline:
@@ -33,6 +39,8 @@ class DiagramPipeline:
         target_count: int = 50,
         user_instructions: str = "",
         concurrency: int = DEFAULT_CONCURRENCY,
+        provider: str = PROVIDER_NANOBANANA,
+        openai_quality: str = "medium",
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
         item_callback: Optional[Callable] = None,
@@ -42,6 +50,8 @@ class DiagramPipeline:
         self.target_count = max(1, min(target_count, 200))
         self.user_instructions = user_instructions
         self.concurrency = concurrency
+        self.provider = provider if provider in VALID_PROVIDERS else PROVIDER_NANOBANANA
+        self.openai_quality = openai_quality
         self.progress_callback = progress_callback or (lambda phase, msg, pct: None)
         self.log_callback = log_callback or (lambda *a, **kw: None)
         self.item_callback = item_callback or (lambda info: None)
@@ -107,8 +117,13 @@ class DiagramPipeline:
     def run(self) -> dict:
         client = get_anthropic_client()
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        if not gemini_key:
-            raise RuntimeError("GEMINI_API_KEY が設定されていません。")
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+
+        # プロバイダ別の API キー必須チェック
+        if self.provider == PROVIDER_NANOBANANA and not gemini_key:
+            raise RuntimeError("nanobanana を使うには GEMINI_API_KEY が必要です。")
+        if self.provider == PROVIDER_GPT_IMAGE and not openai_key:
+            raise RuntimeError("gpt-image を使うには OPENAI_API_KEY が必要です。")
 
         # Phase 0: バリデーション + 原稿保存
         self._progress(0, "原稿を保存中...", 1)
@@ -180,17 +195,21 @@ class DiagramPipeline:
         self._progress(2, f"プロンプト生成完了: {len(prompts)} 件", 45)
 
         # Phase 3: 並列画像生成
-        self._progress(3, f"画像を並列生成中（同時 {self.concurrency} 枚）...", 50)
+        provider_label = "nanobanana (Gemini)" if self.provider == PROVIDER_NANOBANANA else "gpt-image (OpenAI)"
+        self._progress(3, f"画像を並列生成中（{provider_label} / 同時 {self.concurrency} 枚）...", 50)
         self._log(
             "generator",
-            f"Gemini で画像 {len(prompts)} 枚を並列生成します",
-            f"並列度: {self.concurrency} / モデル: gemini-3.1-flash-image-preview",
+            f"{provider_label} で画像 {len(prompts)} 枚を並列生成します",
+            f"並列度: {self.concurrency}",
         )
 
         results = run_parallel_generation(
-            api_key=gemini_key,
             prompts=prompts,
             output_dir=self.images_dir,
+            provider=self.provider,
+            gemini_api_key=gemini_key,
+            openai_api_key=openai_key,
+            openai_quality=self.openai_quality,
             concurrency=self.concurrency,
             progress_callback=self._on_item_event,
         )
@@ -212,6 +231,8 @@ class DiagramPipeline:
             "user_instructions": self.user_instructions,
             "target_count": self.target_count,
             "concurrency": self.concurrency,
+            "provider": self.provider,
+            "openai_quality": self.openai_quality if self.provider == PROVIDER_GPT_IMAGE else None,
             "succeeded": success_count,
             "failed": fail_count,
             "items": results,
