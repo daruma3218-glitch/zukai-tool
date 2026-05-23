@@ -13,6 +13,7 @@ import asyncio
 import base64
 import os
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -20,12 +21,50 @@ from typing import Callable, Optional
 from google import genai
 from google.genai import types
 
+# Pillow（クロップ用）
+from PIL import Image
+
 
 # ===== モデル設定 =====
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-image-preview"
 DEFAULT_OPENAI_MODEL = "gpt-image-2"
 DEFAULT_CONCURRENCY = 12
 MAX_RETRIES = 3
+
+# 出力アスペクト比（16:9 に統一）
+TARGET_RATIO = 16 / 9
+
+
+def _save_as_16_9(image_bytes: bytes, output_path: Path) -> None:
+    """画像バイト列を中央クロップして 16:9 で保存する。
+
+    - 既に 16:9 ならそのまま保存
+    - 横長すぎ（例 OpenAI 3:2）→ 左右をクロップ
+    - 縦長すぎ → 上下をクロップ
+    """
+    img = Image.open(BytesIO(image_bytes))
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    w, h = img.size
+    current = w / h if h else 1.0
+
+    if abs(current - TARGET_RATIO) < 0.01:
+        # 既にほぼ 16:9
+        img.save(output_path, format="PNG")
+        return
+
+    if current > TARGET_RATIO:
+        # 横長すぎ → 左右をクロップ
+        new_w = int(round(h * TARGET_RATIO))
+        left = (w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, h))
+    else:
+        # 縦長すぎ → 上下をクロップ
+        new_h = int(round(w / TARGET_RATIO))
+        top = (h - new_h) // 2
+        img = img.crop((0, top, w, top + new_h))
+
+    img.save(output_path, format="PNG")
 
 # プロバイダ識別子
 PROVIDER_NANOBANANA = "nanobanana"
@@ -99,7 +138,7 @@ def _sync_generate_image_gemini(
                     img_data = inline.data
                     if isinstance(img_data, str):
                         img_data = base64.b64decode(img_data)
-                    output_path.write_bytes(img_data)
+                    _save_as_16_9(img_data, output_path)
                     return True, ""
 
             last_error = "no image in response"
@@ -156,13 +195,13 @@ def _sync_generate_image_openai(
 
             if b64:
                 img_data = base64.b64decode(b64)
-                output_path.write_bytes(img_data)
+                _save_as_16_9(img_data, output_path)
                 return True, ""
             elif url:
                 # URL なら fetch
                 import urllib.request
                 with urllib.request.urlopen(url, timeout=60) as r:
-                    output_path.write_bytes(r.read())
+                    _save_as_16_9(r.read(), output_path)
                 return True, ""
             else:
                 last_error = "neither b64_json nor url in response"
