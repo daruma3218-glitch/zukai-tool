@@ -76,12 +76,18 @@ def extract_visual_points(
 ) -> list:
     """原稿からN個の視覚化ポイントを抽出する。
 
+    【重要】ハルシネーション防止のため、すべて原文ママの文字列を使う:
+        - excerpt: 原稿そのままの一節（1〜3文）
+        - keypoint: 抜粋内の核心フレーズ（原文ママ、10〜30文字）
+        - allowed_terms: 画像内に入れて良い日本語（原文に登場する語のみ）
+
     各ポイントは以下を含む:
         index: 順序（1始まり）
-        excerpt: 原稿からの抜粋（1〜3文）
+        excerpt: 原稿からの抜粋（1〜3文、原文ママ）
         section: 対応するセクション名
         type: illustration | map | diagram | chart のいずれか
-        keypoint: その抜粋の核心（10〜30文字）
+        keypoint: その抜粋の核心フレーズ（原文ママ、10〜30文字）
+        allowed_terms: 画像内テキストとして使用可能な日本語のリスト（原文に登場する語のみ）
     """
     log = log or (lambda *a, **kw: None)
 
@@ -136,7 +142,7 @@ def extract_visual_points(
 1. **原稿の順番通り**に抽出すること（最初の段落 → 最後の段落へ）
 2. **満遍なく抽出**: 1つのセクションに偏らず、原稿全体から均等に拾う
 3. **{target_count}個ぴったり**抽出すること（多くも少なくもダメ）
-4. 各抜粋は**原稿に実在する文章**を使う（要約や創作は禁止）
+4. 各抜粋は**原稿に実在する文章**を使う（要約や創作は絶対禁止）
 5. 抜粋は1〜3文程度（長すぎず短すぎず、視覚化に必要な情報を含む）
 6. 重要な数値・固有名詞・地名・概念・人物・出来事を優先
 7. typeは内容に最適なものを選ぶ:
@@ -145,22 +151,29 @@ def extract_visual_points(
    - diagram: 仕組み・概念・フロー・構造
    - chart: 数値比較・統計・割合・推移
 
+【最重要: ハルシネーション禁止】
+- keypoint は**抜粋内の単語のみで構成**された短いフレーズにすること（要約禁止、原文ママ）
+- allowed_terms は**抜粋内に実在する日本語の語句のみ**を列挙すること（固有名詞・地名・数値・年代など）
+- 抜粋に登場しない言葉は keypoint にも allowed_terms にも絶対に入れない
+
 【出力JSON形式】
 JSON配列のみで返すこと（前置き・後書き・コードブロック禁止）:
 [
   {{
     "index": 1,
-    "excerpt": "原稿からの正確な抜粋（1〜3文）",
+    "excerpt": "原稿からの正確な抜粋（1〜3文、原文ママ）",
     "section": "対応するセクション名（上記セクション構成から選ぶ）",
     "type": "illustration",
-    "keypoint": "この抜粋の核心を10〜30文字で要約"
+    "keypoint": "抜粋内の核心フレーズ（原文ママの単語だけで10〜30文字）",
+    "allowed_terms": ["原文に出てくる語句1", "数値や固有名詞", "..."]
   }},
   {{
     "index": 2,
     "excerpt": "...",
     "section": "...",
     "type": "diagram",
-    "keypoint": "..."
+    "keypoint": "...",
+    "allowed_terms": ["..."]
   }}
 ]
 
@@ -207,7 +220,7 @@ JSON配列のみで返すこと:
             break
         excerpts.extend(extra)
 
-    # index を振り直し（順序保持）
+    # index を振り直し（順序保持）+ allowed_terms 検証
     for i, e in enumerate(excerpts[:target_count]):
         e["index"] = i + 1
         # type のデフォルト値
@@ -215,8 +228,33 @@ JSON配列のみで返すこと:
             e["type"] = "illustration"
         # 必須フィールドの補完
         e.setdefault("section", "")
-        e.setdefault("keypoint", e.get("excerpt", "")[:30])
         e.setdefault("excerpt", "")
+        ex_text = e.get("excerpt", "")
+        e.setdefault("keypoint", ex_text[:30])
+
+        # allowed_terms: 必ずリスト型にする
+        terms = e.get("allowed_terms", [])
+        if not isinstance(terms, list):
+            terms = []
+        # 抜粋に実在する語のみフィルタ（ハルシネーション排除）
+        verified_terms = []
+        for t in terms:
+            if isinstance(t, str) and t.strip() and t.strip() in ex_text:
+                verified_terms.append(t.strip())
+        # 重複削除（順序保持）
+        seen = set()
+        deduped = []
+        for t in verified_terms:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        e["allowed_terms"] = deduped
+
+        # keypoint も抜粋内の単語で構成されているか簡易チェック（厳格ではない）
+        kp = e.get("keypoint", "")
+        if kp and kp not in ex_text:
+            # 抜粋から先頭 30 文字を使う（フォールバック）
+            e["keypoint"] = ex_text[:30]
 
     final = excerpts[:target_count]
     log("extractor", f"最終抽出数: {len(final)} 個")
@@ -226,10 +264,11 @@ JSON配列のみで返すこと:
         idx = len(final) + 1
         final.append({
             "index": idx,
-            "excerpt": title + " に関する追加図解",
+            "excerpt": title,
             "section": sections[0] if sections else title,
             "type": "illustration",
-            "keypoint": f"追加の図解 {idx}",
+            "keypoint": title[:30],
+            "allowed_terms": [],
         })
 
     return final

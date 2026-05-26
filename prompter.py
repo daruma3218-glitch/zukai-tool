@@ -53,29 +53,37 @@ def generate_prompts_batch(
 
 【必須ルール】
 1. プロンプトは英語で記述（画像生成モデル向け）
-2. 画像内の文字は**日本語のみ**にすること（"text in Japanese only" 等を明記）
-3. 画像にタイトル文字は不要（"no title text", "no heading" を明記）
-4. **16:9 横長**（"16:9 aspect ratio, landscape orientation"）
-5. **シンプルでわかりやすい**仕上がり（情報過多にしない）
-6. 内容に応じてイラストのタッチを変える:
+2. **画像内テキストの厳格制約**: もし画像内に日本語テキストを入れる場合、**allowed_terms に登場する語句のみ**使うこと。それ以外の地名・人名・数値・補足ラベルは**絶対に追加しない**。
+3. allowed_terms が空または曖昧な場合は、**画像内にテキストを一切入れない**（"no text in image", "purely visual, no labels" と明記）
+4. 画像にタイトル文字は不要（"no title text", "no heading" を明記）
+5. **16:9 横長**（"16:9 aspect ratio, landscape orientation"）
+6. **シンプルでわかりやすい**仕上がり（情報過多にしない）
+7. 内容に応じてイラストのタッチを変える:
    - illustration: 水彩風 / フラット / 線画 / 切り絵 / 3D風 / コミック風 / ミニマルから最適なものを選ぶ
-   - map: 航空写真風（aerial / satellite imagery style）。日本語の地名ラベル
+   - map: 航空写真風（aerial / satellite imagery style）。**地名ラベルは allowed_terms にあるもののみ**、なければラベルなし
    - diagram: 概念図・フロー図（矢印とボックス、3〜5要素まで）
-   - chart: 棒グラフ・円グラフ・推移グラフ（要素は3〜5個まで、数値は具体的に）
-7. カラフル可（パステル・ビビッド・モノトーンなど自由）
-8. 元の excerpt の情報（数値・固有名詞・地名）をプロンプトに反映する
-9. 各プロンプトは互いに**異なるビジュアル**にする（同じ構図の連発禁止）
+   - chart: 棒グラフ・円グラフ・推移グラフ（要素は3〜5個まで、数値は **allowed_terms にあるもののみ**）
+8. カラフル可（パステル・ビビッド・モノトーンなど自由）
+9. **excerpt と allowed_terms に登場しない情報は絶対にプロンプトに含めない**（推測・補完・常識補足はすべて禁止）
+10. 各プロンプトは互いに**異なるビジュアル**にする（同じ構図の連発禁止）
+
+【画像内テキストの記述例】
+- allowed_terms = ["東京", "100億円"] の場合:
+  "The only Japanese text allowed in this image is exactly: 東京, 100億円. Do NOT add any other text, labels, numbers, or annotations."
+- allowed_terms = [] の場合:
+  "No text in image. Purely visual, no labels, no numbers, no captions."
 
 【出力JSON形式】
 JSON配列のみで返すこと（マークダウン禁止）:
 [
   {{
     "index": (元のindexをそのまま使う),
-    "prompt": "英語プロンプト（スタイル指定・日本語ラベル指定・no title text を含む）",
+    "prompt": "英語プロンプト（上記テキスト制約を必ず含めること）",
     "section": "セクション名",
     "excerpt": "元の抜粋（そのまま）",
     "type": "元のtype（そのまま）",
-    "keypoint": "元のkeypoint（そのまま）"
+    "keypoint": "元のkeypoint（そのまま）",
+    "allowed_terms": (元のallowed_termsをそのまま)
   }}
 ]
 
@@ -91,19 +99,21 @@ JSON配列のみで返すこと（マークダウン禁止）:
         idx = ex.get("index")
         if idx in prompts_by_index:
             p = prompts_by_index[idx]
-            # 入力フィールドで補完
+            # 入力フィールドで補完（allowed_terms は入力側を必ず優先 = ハルシネーション排除）
             p.setdefault("section", ex.get("section", ""))
             p.setdefault("excerpt", ex.get("excerpt", ""))
             p.setdefault("type", ex.get("type", "illustration"))
             p.setdefault("keypoint", ex.get("keypoint", ""))
+            p["allowed_terms"] = ex.get("allowed_terms", [])  # 必ず元データを使う
             merged.append(p)
         else:
-            # フォールバック: 簡易プロンプトを生成
+            # フォールバック: 簡易プロンプトを生成（テキストなし安全モード）
             ex_text = ex.get("excerpt", "")[:100]
             t = ex.get("type", "illustration")
             fallback_prompt = (
                 f"A {t} representing: {ex_text}. "
-                "Simple, clear visual style. Japanese text labels only. "
+                "Simple, clear visual style. "
+                "No text in image. Purely visual, no labels, no numbers. "
                 "No title text. 16:9 landscape orientation."
             )
             merged.append({
@@ -113,6 +123,7 @@ JSON配列のみで返すこと（マークダウン禁止）:
                 "excerpt": ex.get("excerpt", ""),
                 "type": t,
                 "keypoint": ex.get("keypoint", ""),
+                "allowed_terms": ex.get("allowed_terms", []),
             })
     return merged
 

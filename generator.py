@@ -72,8 +72,16 @@ PROVIDER_GPT_IMAGE = "gpt-image"
 VALID_PROVIDERS = (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE)
 
 
-def _build_full_prompt(user_prompt: str, prompt_type: str = "illustration") -> str:
-    """画像生成用のシステム接頭辞を付与"""
+def _build_full_prompt(
+    user_prompt: str,
+    prompt_type: str = "illustration",
+    allowed_terms: Optional[list] = None,
+) -> str:
+    """画像生成用のシステム接頭辞を付与
+
+    allowed_terms には「画像内に入れて良い日本語の語句」のホワイトリストを渡す。
+    リストに無い文字・ラベル・数値はすべて画像から除外するよう AI に厳格指示する。
+    """
     style_hints = {
         "illustration": (
             "Style: choose the most fitting illustration style for the content "
@@ -81,7 +89,7 @@ def _build_full_prompt(user_prompt: str, prompt_type: str = "illustration") -> s
         ),
         "map": (
             "Style: aerial photograph / satellite imagery style map. "
-            "Show geographical features clearly with Japanese place name labels. "
+            "Show geographical features clearly. "
         ),
         "diagram": (
             "Style: clean conceptual diagram with arrows and 3-5 boxes. "
@@ -89,20 +97,38 @@ def _build_full_prompt(user_prompt: str, prompt_type: str = "illustration") -> s
         ),
         "chart": (
             "Style: clean chart (bar / pie / line graph) with 3-5 data elements. "
-            "Bold numbers, clear labels in Japanese. "
         ),
     }
     style = style_hints.get(prompt_type, style_hints["illustration"])
 
+    # 画像内テキストのホワイトリスト指示（最重要）
+    terms = [t for t in (allowed_terms or []) if isinstance(t, str) and t.strip()]
+    if terms:
+        terms_str = ", ".join(terms)
+        text_policy = (
+            "*** TEXT POLICY (CRITICAL — VIOLATION IS UNACCEPTABLE) ***\n"
+            f"- The ONLY Japanese text/labels/numbers allowed in this image are EXACTLY these: {terms_str}\n"
+            "- DO NOT invent or add ANY other text, labels, place names, numbers, captions, or annotations.\n"
+            "- DO NOT translate or paraphrase the allowed terms; render them character-for-character.\n"
+            "- DO NOT include English text of any kind.\n"
+            "- If unsure whether a piece of text is in the allowed list, OMIT it.\n"
+            "- DO NOT add any title text or heading at the top of the image.\n"
+        )
+    else:
+        text_policy = (
+            "*** TEXT POLICY (CRITICAL) ***\n"
+            "- NO text in this image. Purely visual representation only.\n"
+            "- DO NOT add any labels, numbers, place names, captions, or annotations.\n"
+            "- DO NOT include any Japanese or English text.\n"
+            "- DO NOT add any title text or heading.\n"
+        )
+
     common = (
-        "IMPORTANT REQUIREMENTS: "
-        "- All text, labels, numbers in the image MUST be in Japanese (日本語) only. "
-        "- Do NOT include any English text in the image. "
-        "- Do NOT add any title text or heading at the top of the image. "
-        "- 16:9 landscape aspect ratio for video presentation. "
-        "- Simple, clear, professional. Avoid clutter. "
+        "OTHER REQUIREMENTS:\n"
+        "- 16:9 landscape aspect ratio for video presentation.\n"
+        "- Simple, clear, professional. Avoid clutter.\n"
     )
-    return f"{style}{common}\n\nContent to visualize:\n{user_prompt}"
+    return f"{style}\n{text_policy}{common}\nContent to visualize:\n{user_prompt}"
 
 
 # ===== Gemini (nanobanana) =====
@@ -297,6 +323,7 @@ class ParallelImageGenerator:
         section = prompt_entry.get("section", "")
         excerpt = prompt_entry.get("excerpt", "")
         keypoint = prompt_entry.get("keypoint", "")
+        allowed_terms = prompt_entry.get("allowed_terms", [])
         filename = f"diagram_{idx:03d}.png"
         output_path = output_dir / filename
 
@@ -310,7 +337,7 @@ class ParallelImageGenerator:
                 "provider": self.provider,
             })
 
-            full_prompt = _build_full_prompt(prompt_text, prompt_type)
+            full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms)
             loop = asyncio.get_running_loop()
 
             try:
@@ -337,6 +364,7 @@ class ParallelImageGenerator:
                 "section": section,
                 "excerpt": excerpt,
                 "keypoint": keypoint,
+                "allowed_terms": allowed_terms,
                 "type": prompt_type,
                 "prompt": prompt_text,
                 "provider": self.provider,
