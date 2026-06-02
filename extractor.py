@@ -85,7 +85,7 @@ def extract_visual_points(
         index: 順序（1始まり）
         excerpt: 原稿からの抜粋（1〜3文、原文ママ）
         section: 対応するセクション名
-        type: illustration | map | diagram | chart のいずれか
+        type: illustration | realphoto | map | diagram | chart のいずれか
         keypoint: その抜粋の核心フレーズ（原文ママ、10〜30文字）
         allowed_terms: 画像内テキストとして使用可能な日本語のリスト（原文に登場する語のみ）
     """
@@ -146,7 +146,9 @@ def extract_visual_points(
 5. 抜粋は1〜3文程度（長すぎず短すぎず、視覚化に必要な情報を含む）
 6. 重要な数値・固有名詞・地名・概念・人物・出来事を優先
 7. typeは内容に最適なものを選ぶ:
-   - illustration: 人物・物・シーン・出来事の描写
+   - illustration: 人物・物・シーン・出来事のイラスト的描写
+   - realphoto: 都市・建物・施設・インフラ・事件・戦争・人々の生活など「実写写真」が映えるシーン
+     （例:「天然ガス施設」「政府庁舎」「工場」「住民のデモ」「夜の都市」など物理的な実景）
    - map: 地名・場所・地理的位置関係
    - diagram: 仕組み・概念・フロー・構造
    - chart: 数値比較・統計・割合・推移
@@ -224,7 +226,7 @@ JSON配列のみで返すこと:
     for i, e in enumerate(excerpts[:target_count]):
         e["index"] = i + 1
         # type のデフォルト値
-        if e.get("type") not in ("illustration", "map", "diagram", "chart"):
+        if e.get("type") not in ("illustration", "realphoto", "map", "diagram", "chart"):
             e["type"] = "illustration"
         # 必須フィールドの補完
         e.setdefault("section", "")

@@ -120,6 +120,15 @@ def _build_full_prompt(
             "Style: choose the most fitting illustration style for the content "
             "(watercolor, flat, line art, paper-cut, 3D rendered, comic, or minimal). "
         ),
+        "realphoto": (
+            "Style: PHOTOREALISTIC photograph, documentary / photojournalism quality. "
+            "Looks like a real photo taken with a professional camera: natural lighting, "
+            "realistic textures, depth of field, true-to-life colors. "
+            "Cinematic composition suitable for a documentary video. "
+            "Depict the actual physical scene (city, building, facility, infrastructure, "
+            "event, war scene, or people's daily life) realistically. "
+            "NOT an illustration, NOT a cartoon, NOT a flat graphic — a real photograph. "
+        ),
         "map": (
             "Style: aerial photograph / satellite imagery style map. "
             "Show geographical features clearly. "

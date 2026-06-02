@@ -60,6 +60,8 @@ def generate_prompts_batch(
 6. **シンプルでわかりやすい**仕上がり（情報過多にしない）
 7. 内容に応じてイラストのタッチを変える:
    - illustration: 水彩風 / フラット / 線画 / 切り絵 / 3D風 / コミック風 / ミニマルから最適なものを選ぶ
+   - realphoto: **実写風の写真**（photorealistic photograph, documentary quality）。都市・建物・施設・
+     インフラ・事件・戦争・人々の生活など物理的シーンをリアルな写真として描く。イラストにしないこと
    - map: 航空写真風（aerial / satellite imagery style）。**地名ラベルは allowed_terms にあるもののみ**、なければラベルなし
    - diagram: 概念図・フロー図（矢印とボックス、3〜5要素まで）
    - chart: 棒グラフ・円グラフ・推移グラフ（要素は3〜5個まで、数値は **allowed_terms にあるもののみ**）
