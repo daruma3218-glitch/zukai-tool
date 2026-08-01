@@ -63,6 +63,15 @@ def login_required(f):
     return decorated
 
 
+@app.route("/version")
+def version():
+    """Render が実際にどの版を動かしているかの軽量診断（認証不要・秘密情報なし）。"""
+    return jsonify({
+        "service": "zukai-tool",
+        "git_commit": os.environ.get("RENDER_GIT_COMMIT", ""),
+    })
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if not APP_PASSWORD:
@@ -136,7 +145,8 @@ def _add_log(job_id: str, category: str, message: str, detail: str = ""):
 def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          user_instructions: str, concurrency: int,
                          provider: str = PROVIDER_NANOBANANA,
-                         openai_quality: str = "medium"):
+                         openai_quality: str = "medium",
+                         worldview_preset: str = ""):
     job_dir = OUTPUT_DIR / job_id
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
@@ -159,6 +169,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             output_dir=job_dir,
             target_count=target_count,
             user_instructions=user_instructions,
+            worldview_preset=worldview_preset,
             concurrency=concurrency,
             provider=provider,
             openai_quality=openai_quality,
@@ -265,6 +276,7 @@ def start_job():
     concurrency = max(1, min(concurrency, 24))
 
     user_instructions = request.form.get("user_instructions", "").strip()
+    worldview_preset = request.form.get("worldview_preset", "").strip()
 
     # ジョブ作成
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -288,7 +300,7 @@ def start_job():
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality),
+        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset),
         daemon=True,
     )
     thread.start()

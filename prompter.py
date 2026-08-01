@@ -6,6 +6,7 @@
 """
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
@@ -14,8 +15,25 @@ import anthropic
 from utils import claude_query, parse_json_array
 
 
-CLAUDE_MODEL = "claude-sonnet-4-6"
+# プロンプト生成は品質最優先で Opus 5（センテンスつくーると同方針）。
+# 環境変数 PROMPTER_MODEL で変更可（例: claude-sonnet-4-6 で従来に戻す）。
+CLAUDE_MODEL = os.environ.get("PROMPTER_MODEL", "").strip() or "claude-opus-5"
 BATCH_SIZE = 10  # 1 リクエストあたりのプロンプト数（並列バッチ）
+
+# 世界観プリセット（①）: さゆみさんの手直し実績で最多だった
+# 「人物が日本人風・背景が日本・¥表記」への対策。UIのプリセット選択で適用する。
+WORLDVIEW_PRESETS = {
+    "roshia": """
+【ロシア解体新書 世界観（常設・全プロンプトに適用）】
+- 人物: ロシア/東欧系の外見にする（英語プロンプトに "Russian / Eastern European (slavic) features" を明記）。
+  日本人風の顔立ち・日本の学生服・日本のサラリーマン描写は禁止
+- 背景・街並み: ロシア・旧ソ連圏の景観にする（"Russian setting", "Soviet-era architecture",
+  "Moscow cityscape" 等を明記）。日本の街並み・日本家屋・東京の風景は禁止
+- 通貨: ルーブルにする（"ruble banknotes", "₽ symbol"）。円記号 ¥ ・日本円紙幣は禁止
+  （excerpt に「円」が明示されている場合のみ例外）
+- 該当する英語表現をプロンプト本文に必ず書き切ること（暗黙にしない）
+""",
+}
 
 
 def _build_user_block(user_instructions: str) -> str:
@@ -32,15 +50,18 @@ def generate_prompts_batch(
     excerpts_batch: list,
     title: str,
     user_instructions: str = "",
+    worldview_preset: str = "",
 ) -> list:
     """1 バッチ（10 件程度）の視覚化ポイントを英文プロンプト化"""
     user_block = _build_user_block(user_instructions)
+    worldview_block = WORLDVIEW_PRESETS.get((worldview_preset or "").strip(), "")
     excerpts_json = json.dumps(excerpts_batch, ensure_ascii=False, indent=2)
 
     system = (
         "You are a visual director who converts Japanese manuscript excerpts "
         "into precise English image prompts for an image generation AI. "
-        "Each prompt MUST faithfully represent its source excerpt. "
+        "Each prompt MUST faithfully represent its source excerpt, and ONLY that excerpt — "
+        "never mix content from the other items in the batch. "
         "Return only a JSON array. No markdown, no commentary."
     )
 
@@ -49,7 +70,7 @@ def generate_prompts_batch(
 
 視覚化ポイント:
 {excerpts_json}
-{user_block}
+{user_block}{worldview_block}
 
 【必須ルール】
 1. プロンプトは英語で記述（画像生成モデル向け）
@@ -68,6 +89,14 @@ def generate_prompts_batch(
 8. カラフル可（パステル・ビビッド・モノトーンなど自由）
 9. **excerpt と allowed_terms に登場しない情報は絶対にプロンプトに含めない**（推測・補完・常識補足はすべて禁止）
 10. 各プロンプトは互いに**異なるビジュアル**にする（同じ構図の連発禁止）
+11. **シーン混入の禁止**: 各プロンプトは**その項目（index）の excerpt だけ**から作る。
+    バッチ内の他の項目は「別のシーン」であり文脈ではない。他項目の人物・地名・数値・
+    キーワードを混ぜたら不合格
+12. **フロー・矢印の順序を明示**（diagram / フローを含む画像すべて）:
+    - excerpt に書かれた因果・時系列の順序どおりに要素を並べ、**矢印の始点と終点を
+      英語で書き切る**こと（例: "left-to-right flow: A → B → C", "arrow FROM the factory
+      TO the store"）。「AがBになる」なら矢印は必ず A→B（逆向きは不合格）
+    - 順序が excerpt から読み取れない場合は、矢印を使わない構図（並置・対比）にする
 
 【画像内テキストの記述例】
 - allowed_terms = ["東京", "100億円"] の場合:
@@ -135,6 +164,7 @@ def generate_all_prompts(
     excerpts: list,
     title: str,
     user_instructions: str = "",
+    worldview_preset: str = "",
     max_workers: int = 5,
     log: Optional[Callable] = None,
 ) -> list:
@@ -146,14 +176,17 @@ def generate_all_prompts(
     for i in range(0, len(excerpts), BATCH_SIZE):
         batches.append(excerpts[i:i + BATCH_SIZE])
 
-    log("prompter", f"{len(excerpts)} 件を {len(batches)} バッチに分割（同時 {max_workers} 並列）")
+    log("prompter", f"{len(excerpts)} 件を {len(batches)} バッチに分割（同時 {max_workers} 並列 / モデル {CLAUDE_MODEL}）")
+    if (worldview_preset or "").strip() in WORLDVIEW_PRESETS:
+        log("prompter", f"世界観プリセット適用: {worldview_preset}")
 
     all_results = [None] * len(excerpts)
     completed_batches = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_batch = {
-            executor.submit(generate_prompts_batch, client, batch, title, user_instructions): idx
+            executor.submit(generate_prompts_batch, client, batch, title,
+                            user_instructions, worldview_preset): idx
             for idx, batch in enumerate(batches)
         }
         for future in as_completed(future_to_batch):

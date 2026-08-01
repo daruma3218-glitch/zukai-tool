@@ -38,6 +38,7 @@ class DiagramPipeline:
         output_dir: Path,
         target_count: int = 50,
         user_instructions: str = "",
+        worldview_preset: str = "",
         concurrency: int = DEFAULT_CONCURRENCY,
         provider: str = PROVIDER_NANOBANANA,
         openai_quality: str = "medium",
@@ -49,6 +50,7 @@ class DiagramPipeline:
         self.output_dir = Path(output_dir)
         self.target_count = max(1, min(target_count, 200))
         self.user_instructions = user_instructions
+        self.worldview_preset = (worldview_preset or "").strip()
         self.concurrency = concurrency
         self.provider = provider if provider in VALID_PROVIDERS else PROVIDER_NANOBANANA
         self.openai_quality = openai_quality
@@ -187,6 +189,7 @@ class DiagramPipeline:
             excerpts,
             title=title,
             user_instructions=self.user_instructions,
+            worldview_preset=self.worldview_preset,
             max_workers=5,
             log=self._log,
         )
@@ -229,6 +232,7 @@ class DiagramPipeline:
             "keywords": keywords,
             "sections": sections,
             "user_instructions": self.user_instructions,
+            "worldview_preset": self.worldview_preset,
             "target_count": self.target_count,
             "concurrency": self.concurrency,
             "provider": self.provider,

@@ -16,7 +16,8 @@ import anthropic
 from utils import claude_query, parse_json_object, parse_json_array
 
 
-CLAUDE_MODEL = "claude-sonnet-4-6"
+# 抽出は Sonnet 5（旧 4-6 から更新。EXTRACTOR_MODEL で変更可）
+CLAUDE_MODEL = os.environ.get("EXTRACTOR_MODEL", "").strip() or "claude-sonnet-5"
 
 
 def analyze_manuscript(
@@ -157,6 +158,9 @@ def extract_visual_points(
 - keypoint は**抜粋内の単語のみで構成**された短いフレーズにすること（要約禁止、原文ママ）
 - allowed_terms は**抜粋内に実在する日本語の語句のみ**を列挙すること（固有名詞・地名・数値・年代など）
 - 抜粋に登場しない言葉は keypoint にも allowed_terms にも絶対に入れない
+- **前後の文（隣のシーン）の語句を混ぜない**: keypoint / allowed_terms はその excerpt の
+  文中の語だけから作る。excerpt の直前・直後にある別シーンの人物・地名・数値を持ち込まない
+  （隣シーンのキーワード混入は編集の手戻りが最も大きい不良）
 
 【出力JSON形式】
 JSON配列のみで返すこと（前置き・後書き・コードブロック禁止）:
