@@ -24,14 +24,17 @@ BATCH_SIZE = 10  # 1 リクエストあたりのプロンプト数（並列バ�
 # 「人物が日本人風・背景が日本・¥表記」への対策。UIのプリセット選択で適用する。
 WORLDVIEW_PRESETS = {
     "roshia": """
-【ロシア解体新書 世界観（常設・全プロンプトに適用）】
-- 人物: ロシア/東欧系の外見にする（英語プロンプトに "Russian / Eastern European (slavic) features" を明記）。
+【ロシア解体新書 世界観（常設・全プロンプトに強制適用）】
+※これは「画風・舞台のスタイル指定」であり情報の追加ではない。下の【必須ルール】9
+（excerpt外の情報禁止）の**例外**として、excerpt に書かれていなくても**全プロンプトに必ず適用**する。
+適用しなかったプロンプトは不合格。
+- 人物が登場する場合: ロシア/東欧系の外見（"Russian / Eastern European (slavic) features" を明記）。
   日本人風の顔立ち・日本の学生服・日本のサラリーマン描写は禁止
-- 背景・街並み: ロシア・旧ソ連圏の景観にする（"Russian setting", "Soviet-era architecture",
+- 背景・街並み・室内: ロシア・旧ソ連圏の景観（"Russian setting", "Soviet-era architecture",
   "Moscow cityscape" 等を明記）。日本の街並み・日本家屋・東京の風景は禁止
-- 通貨: ルーブルにする（"ruble banknotes", "₽ symbol"）。円記号 ¥ ・日本円紙幣は禁止
-  （excerpt に「円」が明示されている場合のみ例外）
-- 該当する英語表現をプロンプト本文に必ず書き切ること（暗黙にしない）
+- 通貨・金額表現: ルーブル（"ruble banknotes", "₽ symbol"）。円記号 ¥ ・日本円紙幣は禁止
+  （excerpt に「円」が明示されている場合のみ ¥ 可）。diagram / chart のアイコンにも適用
+- 各プロンプトの末尾に必ず "Russian setting." を含む1文でスタイルを書き切ること（暗黙にしない）
 """,
 }
 
@@ -62,6 +65,10 @@ def generate_prompts_batch(
         "into precise English image prompts for an image generation AI. "
         "Each prompt MUST faithfully represent its source excerpt, and ONLY that excerpt — "
         "never mix content from the other items in the batch. "
+        "If a standing worldview style block is provided, it is a MANDATORY style layer for "
+        "EVERY prompt (character appearance, setting, currency style): apply it even though "
+        "those style terms do not appear in the excerpt — style is not 'extra information' "
+        "and never conflicts with source fidelity. "
         "Return only a JSON array. No markdown, no commentary."
     )
 
@@ -87,7 +94,9 @@ def generate_prompts_batch(
    - diagram: 概念図・フロー図（矢印とボックス、3〜5要素まで）
    - chart: 棒グラフ・円グラフ・推移グラフ（要素は3〜5個まで、数値は **allowed_terms にあるもののみ**）
 8. カラフル可（パステル・ビビッド・モノトーンなど自由）
-9. **excerpt と allowed_terms に登場しない情報は絶対にプロンプトに含めない**（推測・補完・常識補足はすべて禁止）
+9. **excerpt と allowed_terms に登場しない情報は絶対にプロンプトに含めない**（推測・補完・常識補足はすべて禁止）。
+   ただし【世界観】ブロックがある場合、その**スタイル指定（人物の外見・舞台・通貨表現）だけは例外**で、
+   全プロンプトに必ず適用する（スタイルは「情報」ではない）
 10. 各プロンプトは互いに**異なるビジュアル**にする（同じ構図の連発禁止）
 11. **シーン混入の禁止**: 各プロンプトは**その項目（index）の excerpt だけ**から作る。
     バッチ内の他の項目は「別のシーン」であり文脈ではない。他項目の人物・地名・数値・
@@ -178,7 +187,9 @@ def generate_all_prompts(
 
     log("prompter", f"{len(excerpts)} 件を {len(batches)} バッチに分割（同時 {max_workers} 並列 / モデル {CLAUDE_MODEL}）")
     if (worldview_preset or "").strip() in WORLDVIEW_PRESETS:
-        log("prompter", f"世界観プリセット適用: {worldview_preset}")
+        log("prompter", f"世界観プリセット適用: {worldview_preset}（人物・背景・通貨を強制指定）")
+    else:
+        log("prompter", "世界観プリセット: なし（画面に選択欄が無い場合はページを再読み込み）")
 
     all_results = [None] * len(excerpts)
     completed_batches = 0

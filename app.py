@@ -18,6 +18,7 @@ from pathlib import Path
 from flask import (
     Flask,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -219,13 +220,16 @@ def index():
                 "target": manifest.get("target_count", job_state.get("target_count", 0)),
                 "date": d.name[:8] if len(d.name) >= 8 else "",
             })
-    return render_template(
+    resp = make_response(render_template(
         "upload.html",
         past_jobs=past_jobs[:30],
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
         has_openai=bool(os.environ.get("OPENAI_API_KEY")),
-    )
+    ))
+    # デプロイ後に古いフォーム（新しい入力欄が無い）が使われ続けるのを防ぐ
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/start", methods=["POST"])
