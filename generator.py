@@ -109,6 +109,7 @@ def _build_full_prompt(
     user_prompt: str,
     prompt_type: str = "illustration",
     allowed_terms: Optional[list] = None,
+    no_text: bool = False,
 ) -> str:
     """画像生成用のシステム接頭辞を付与
 
@@ -145,7 +146,17 @@ def _build_full_prompt(
 
     # 画像内テキストのホワイトリスト指示（最重要）
     terms = [t for t in (allowed_terms or []) if isinstance(t, str) and t.strip()]
-    if prompt_type == "realphoto":
+    if no_text:
+        # 文字なし版（テロップ用）: allowed_terms や実写風の看板ルールより優先して全文字を禁止
+        text_policy = (
+            "*** TEXT POLICY (CRITICAL — TELOP MODE: ABSOLUTELY NO TEXT) ***\n"
+            "- This image must contain NO readable text of ANY kind, in ANY language:\n"
+            "  no labels, numbers, captions, titles, annotations, or watermarks.\n"
+            "- Do NOT render the allowed terms either — text is fully disabled for this job.\n"
+            "- For realistic photos: avoid signage-heavy compositions; any incidental signage,\n"
+            "  billboards, or street signs must be too small, angled, or blurred to read (illegible).\n"
+        )
+    elif prompt_type == "realphoto":
         # 実写写真は「現地のリアルな看板・標識」が映える。日本語ラベルは載せない。
         text_policy = (
             "*** TEXT POLICY for a REALISTIC PHOTO (CRITICAL) ***\n"
@@ -382,6 +393,7 @@ class ParallelImageGenerator:
         excerpt = prompt_entry.get("excerpt", "")
         keypoint = prompt_entry.get("keypoint", "")
         allowed_terms = prompt_entry.get("allowed_terms", [])
+        no_text = bool(prompt_entry.get("no_text"))
         filename = f"diagram_{idx:03d}.png"
         output_path = output_dir / filename
 
@@ -395,7 +407,8 @@ class ParallelImageGenerator:
                 "provider": self.provider,
             })
 
-            full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms)
+            full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms,
+                                             no_text=no_text)
             loop = asyncio.get_running_loop()
 
             try:

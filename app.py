@@ -147,7 +147,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          user_instructions: str, concurrency: int,
                          provider: str = PROVIDER_NANOBANANA,
                          openai_quality: str = "medium",
-                         worldview_preset: str = ""):
+                         worldview_preset: str = "",
+                         no_text_mode: bool = False):
     job_dir = OUTPUT_DIR / job_id
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
@@ -171,6 +172,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             target_count=target_count,
             user_instructions=user_instructions,
             worldview_preset=worldview_preset,
+            no_text_mode=no_text_mode,
             concurrency=concurrency,
             provider=provider,
             openai_quality=openai_quality,
@@ -281,6 +283,7 @@ def start_job():
 
     user_instructions = request.form.get("user_instructions", "").strip()
     worldview_preset = request.form.get("worldview_preset", "").strip()
+    no_text_mode = request.form.get("no_text_mode") == "on"
 
     # ジョブ作成
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -304,7 +307,7 @@ def start_job():
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset),
+        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset, no_text_mode),
         daemon=True,
     )
     thread.start()

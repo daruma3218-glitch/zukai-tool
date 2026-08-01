@@ -39,6 +39,16 @@ WORLDVIEW_PRESETS = {
 }
 
 
+NO_TEXT_BLOCK = """
+【文字なし版（テロップ用・強制適用）】
+このジョブは動画側でテロップを載せるため、**画像内の文字を全て禁止**する。
+- ルール2・3の allowed_terms 例外は**無効**（allowed_terms に語があっても画像内に入れない）
+- 全プロンプトに "No text in image. Purely visual, no labels, no numbers, no captions,
+  no readable signage." を必ず含める
+- 実写風でも、看板・標識の文字が読めない構図・ぼかしにする（"incidental signage must be illegible"）
+"""
+
+
 def _build_user_block(user_instructions: str) -> str:
     if not user_instructions.strip():
         return ""
@@ -54,10 +64,13 @@ def generate_prompts_batch(
     title: str,
     user_instructions: str = "",
     worldview_preset: str = "",
+    no_text_mode: bool = False,
 ) -> list:
     """1 バッチ（10 件程度）の視覚化ポイントを英文プロンプト化"""
     user_block = _build_user_block(user_instructions)
     worldview_block = WORLDVIEW_PRESETS.get((worldview_preset or "").strip(), "")
+    if no_text_mode:
+        worldview_block = worldview_block + NO_TEXT_BLOCK
     excerpts_json = json.dumps(excerpts_batch, ensure_ascii=False, indent=2)
 
     system = (
@@ -145,6 +158,8 @@ JSON配列のみで返すこと（マークダウン禁止）:
             p.setdefault("type", ex.get("type", "illustration"))
             p.setdefault("keypoint", ex.get("keypoint", ""))
             p["allowed_terms"] = ex.get("allowed_terms", [])  # 必ず元データを使う
+            if no_text_mode:
+                p["no_text"] = True  # generator 側の最終テキスト方針にも波及させる
             merged.append(p)
         else:
             # フォールバック: 簡易プロンプトを生成（テキストなし安全モード）
@@ -164,6 +179,7 @@ JSON配列のみで返すこと（マークダウン禁止）:
                 "type": t,
                 "keypoint": ex.get("keypoint", ""),
                 "allowed_terms": ex.get("allowed_terms", []),
+                **({"no_text": True} if no_text_mode else {}),
             })
     return merged
 
@@ -174,6 +190,7 @@ def generate_all_prompts(
     title: str,
     user_instructions: str = "",
     worldview_preset: str = "",
+    no_text_mode: bool = False,
     max_workers: int = 5,
     log: Optional[Callable] = None,
 ) -> list:
@@ -190,6 +207,8 @@ def generate_all_prompts(
         log("prompter", f"世界観プリセット適用: {worldview_preset}（人物・背景・通貨を強制指定）")
     else:
         log("prompter", "世界観プリセット: なし（画面に選択欄が無い場合はページを再読み込み）")
+    if no_text_mode:
+        log("prompter", "文字なし版（テロップ用）: ON — 画像内テキストを全面禁止")
 
     all_results = [None] * len(excerpts)
     completed_batches = 0
@@ -197,7 +216,7 @@ def generate_all_prompts(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_batch = {
             executor.submit(generate_prompts_batch, client, batch, title,
-                            user_instructions, worldview_preset): idx
+                            user_instructions, worldview_preset, no_text_mode): idx
             for idx, batch in enumerate(batches)
         }
         for future in as_completed(future_to_batch):
