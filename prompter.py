@@ -95,7 +95,10 @@ def generate_prompts_batch(
 【必須ルール】
 1. プロンプトは英語で記述（画像生成モデル向け）
 2. **画像内テキストの厳格制約**: もし画像内に日本語テキストを入れる場合、**allowed_terms に登場する語句のみ**使うこと。それ以外の地名・人名・数値・補足ラベルは**絶対に追加しない**。
-3. allowed_terms が空または曖昧な場合は、**画像内にテキストを一切入れない**（"no text in image", "purely visual, no labels" と明記）
+3. allowed_terms が**空の場合でも**、excerpt 内に実在する固有名詞・数値・年代があれば、
+   その中から**1〜3語を画像内ラベルとして必ず使う**（excerpt に無い語は絶対禁止）。
+   使った語は出力 JSON の "used_labels" に原文ママで列挙すること。
+   excerpt にも適切な語が無い場合のみ、画像内テキストなし（"no text in image" と明記）
 4. 画像にタイトル文字は不要（"no title text", "no heading" を明記）
 5. **16:9 横長**（"16:9 aspect ratio, landscape orientation"）
 6. **シンプルでわかりやすい**仕上がり（情報過多にしない）
@@ -136,7 +139,8 @@ JSON配列のみで返すこと（マークダウン禁止）:
     "excerpt": "元の抜粋（そのまま）",
     "type": "元のtype（そのまま）",
     "keypoint": "元のkeypoint（そのまま）",
-    "allowed_terms": (元のallowed_termsをそのまま)
+    "allowed_terms": (元のallowed_termsをそのまま),
+    "used_labels": ["画像内ラベルに使った語（excerpt内の原文ママのみ・無ければ空配列）"]
   }}
 ]
 
@@ -157,7 +161,15 @@ JSON配列のみで返すこと（マークダウン禁止）:
             p.setdefault("excerpt", ex.get("excerpt", ""))
             p.setdefault("type", ex.get("type", "illustration"))
             p.setdefault("keypoint", ex.get("keypoint", ""))
-            p["allowed_terms"] = ex.get("allowed_terms", [])  # 必ず元データを使う
+            ex_terms = ex.get("allowed_terms", [])
+            if not ex_terms:
+                # 安全網: 抽出段で allowed_terms が欠けても（大量件数時の出力切り詰め等）、
+                # プロンプト側が excerpt から選んだラベルを機械検証して採用する。
+                # excerpt の部分文字列であることを検証するのでハルシネーションは混入しない。
+                exc = ex.get("excerpt", "") or ""
+                ex_terms = [s for s in (p.get("used_labels") or [])
+                            if isinstance(s, str) and s.strip() and s in exc][:3]
+            p["allowed_terms"] = ex_terms  # 元データ優先 + 検証済みラベルで補完
             if no_text_mode:
                 p["no_text"] = True  # generator 側の最終テキスト方針にも波及させる
             merged.append(p)
