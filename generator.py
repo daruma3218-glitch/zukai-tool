@@ -137,9 +137,13 @@ def _build_full_prompt(
         "diagram": (
             "Style: clean conceptual diagram with arrows and 3-5 boxes. "
             "Minimal lines, clear structure, easy to understand at a glance. "
+            "BACKGROUND (CRITICAL): plain solid light background (white or a single very light color). "
+            "NO scenery, NO cityscape, NO landscape, NO photos or illustrated backdrops behind the diagram. "
         ),
         "chart": (
             "Style: clean chart (bar / pie / line graph) with 3-5 data elements. "
+            "BACKGROUND (CRITICAL): plain solid light background (white or a single very light color). "
+            "NO scenery, NO cityscape, NO landscape, NO photos or illustrated backdrops behind the chart. "
         ),
     }
     style = style_hints.get(prompt_type, style_hints["illustration"])

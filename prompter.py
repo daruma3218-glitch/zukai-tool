@@ -34,7 +34,13 @@ WORLDVIEW_PRESETS = {
   "Moscow cityscape" 等を明記）。日本の街並み・日本家屋・東京の風景は禁止
 - 通貨・金額表現: ルーブル（"ruble banknotes", "₽ symbol"）。円記号 ¥ ・日本円紙幣は禁止
   （excerpt に「円」が明示されている場合のみ ¥ 可）。diagram / chart のアイコンにも適用
-- 各プロンプトの末尾に必ず "Russian setting." を含む1文でスタイルを書き切ること（暗黙にしない）
+【タイプ別の適用範囲（重要）】
+- illustration / realphoto / map: 上記すべてを適用し、プロンプト末尾に必ず
+  "Russian setting." を含む1文でスタイルを書き切る
+- diagram / chart: **背景は無地**（"plain solid light background" を明記）。
+  ロシアの景観・街並み・風景を図解の背景に入れることは**禁止**（読みやすさ優先）。
+  適用するのは通貨（₽・¥禁止）と、人物アイコンを描く場合の外見のみ。
+  末尾の1文は "Russian setting." ではなく "Clean plain background, no scenery." にする
 """,
 }
 
