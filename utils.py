@@ -43,7 +43,7 @@ def claude_query(
     query: str,
     system: str,
     max_tokens: int = 4096,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-5",
     max_retries: int = 3,
 ) -> str:
     """Claude API（Web 検索なし）でクエリを実行"""
@@ -54,6 +54,9 @@ def claude_query(
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": query}],
+                # Sonnet 5 は thinking 未指定だと思考が既定 ON になり、max_tokens を
+                # 思考と本文で分け合う。図解生成は出力が長いため 4.6 と同じ「思考なし」に固定する
+                thinking={"type": "disabled"},
             )
             if not response or not response.content:
                 if attempt == max_retries - 1:
