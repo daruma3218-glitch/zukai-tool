@@ -8,6 +8,14 @@ from pathlib import Path
 
 import anthropic
 
+# サブスクLLMゲートウェイ (2026-08-13): Render → 社長PCワーカー → Claude Code CLI
+# (サブスク枠・API課金ゼロ)。ワーカー不在なら数秒で従来 API へフォールバック。
+# SUPABASE_URL / SUPABASE_KEY 未設定 (= Render env に入れるまで) は完全に従来動作。
+try:
+    from subsk_gateway import gateway_generate as _gateway_generate
+except Exception:
+    _gateway_generate = None
+
 
 def load_env(project_root: Path) -> None:
     """.env ファイルから環境変数を読み込む
@@ -46,7 +54,21 @@ def claude_query(
     model: str = "claude-sonnet-5",
     max_retries: int = 3,
 ) -> str:
-    """Claude API（Web 検索なし）でクエリを実行"""
+    """Claude クエリ実行（Web 検索なし）。
+
+    経路: サブスクゲートウェイ (課金ゼロ) → 不在時のみ従来 API (課金)。
+    """
+    if _gateway_generate is not None:
+        try:
+            text = _gateway_generate(
+                kind="query", system=system, query=query,
+                max_tokens=max_tokens, model=model,
+            )
+            if text:
+                return text
+        except Exception as e:
+            print(f"  [subsk-gw] 例外 → API直呼びへ: {type(e).__name__}: {str(e)[:120]}", flush=True)
+
     for attempt in range(max_retries):
         try:
             response = client.messages.create(
