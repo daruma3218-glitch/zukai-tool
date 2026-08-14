@@ -12,7 +12,7 @@ import os
 import secrets
 import threading
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import (
@@ -34,8 +34,27 @@ from generator import PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS
 
 
 PROJECT_ROOT = Path(__file__).parent
-OUTPUT_DIR = PROJECT_ROOT / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def _resolve_output_root() -> Path:
+    """生成物の保存先ルート。Render Disk があればそちらを使う（再起動しても消えない）。
+
+    優先順: DATA_DIR 環境変数 → /data（Render Disk の標準マウント先）→ プロジェクト直下。
+    ディスク未接続の環境（ローカル等）では従来どおり動く。
+    """
+    env_dir = os.environ.get("DATA_DIR", "").strip()
+    if env_dir:
+        p = Path(env_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    p = Path("/data")
+    if p.exists():
+        return p
+    return PROJECT_ROOT
+
+
+OUTPUT_DIR = _resolve_output_root() / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # .env をロード
 load_env(PROJECT_ROOT)
@@ -43,6 +62,9 @@ load_env(PROJECT_ROOT)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20MB
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+# 放置してもログアウトされないように（家事等の合間の運用向け）。
+# ※Render 側で SECRET_KEY を設定しないと、再起動時に全セッションが無効化される点に注意
+app.permanent_session_lifetime = timedelta(hours=12)
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
@@ -101,6 +123,7 @@ def login():
     error = None
     if request.method == "POST":
         if request.form.get("password", "") == APP_PASSWORD:
+            session.permanent = True  # 12時間持続（ブラウザを閉じても維持）
             session["authenticated"] = True
             return redirect(url_for("index"))
         error = "パスワードが正しくありません"

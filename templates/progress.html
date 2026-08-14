@@ -321,6 +321,25 @@
       els.failedCount.textContent = failed;
     }
 
+    // ===== 完了通知（別タブ・他作業中でもデスクトップ通知を出す） =====
+    let _notified = false;
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();  // 初回だけ許可を確認
+    }
+    function notifyCompleted(state) {
+      if (_notified) return;
+      _notified = true;
+      document.title = "✅ 生成完了 - 図解つくーる";
+      try {
+        if ("Notification" in window && Notification.permission === "granted") {
+          const n = new Notification("図解つくーる ✅ 生成完了", {
+            body: `成功 ${state.succeeded ?? "?"} 枚。ZIPのダウンロードを忘れずに！`,
+          });
+          n.onclick = () => { window.focus(); n.close(); };
+        }
+      } catch (e) {}
+    }
+
     async function pollStatus() {
       try {
         const res = await fetch(`/api/status/${JOB_ID}`);
@@ -350,6 +369,7 @@
           stopped = true;
           els.actions.classList.remove('hidden');
           els.downloadBtn.href = `/download/${JOB_ID}`;
+          notifyCompleted(state);
         }
         if (state.status === 'error') {
           stopped = true;
