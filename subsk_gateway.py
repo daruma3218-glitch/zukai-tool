@@ -83,6 +83,29 @@ def _worker_alive() -> bool:
         return False
 
 
+WORKER_RETRY_WINDOW_SEC = 30   # 不在に見えても復帰をこの秒数まで待つ (ハートビート15秒毎×2周+余裕)
+WORKER_RETRY_POLL_SEC = 7.5
+
+
+def _worker_alive_with_retry() -> bool:
+    """ワーカー不在に見えても最大 WORKER_RETRY_WINDOW_SEC 秒は復帰を待ってから判定する。
+
+    ワーカーのハートビートはポーリング処理のネットワーク遅延で一時的に途切れる
+    ことがあり (2026-08-25/27 の API 課金の真因)、即断すると稼働中なのに
+    API 直呼び (課金) へ落ちる。本当に不在 (社長PC停止等) なら30秒余計に
+    待つだけで、従来どおり API へフォールバックする。
+    """
+    if _worker_alive():
+        return True
+    deadline = time.time() + WORKER_RETRY_WINDOW_SEC
+    while time.time() < deadline:
+        time.sleep(WORKER_RETRY_POLL_SEC)
+        if _worker_alive():
+            print("[subsk-gw] ワーカー一時不応答 → 復帰確認 (API直呼び回避)", flush=True)
+            return True
+    return False
+
+
 def gateway_generate(
     kind: str,
     system: str,
@@ -101,8 +124,8 @@ def gateway_generate(
     if _conf() is None:
         return None
     try:
-        if not _worker_alive():
-            print("[subsk-gw] ワーカー不在 → API直呼び(課金)", flush=True)
+        if not _worker_alive_with_retry():
+            print(f"[subsk-gw] ワーカー不在 ({WORKER_RETRY_WINDOW_SEC}秒再確認しても応答なし) → API直呼び(課金)", flush=True)
             return None
 
         req_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
