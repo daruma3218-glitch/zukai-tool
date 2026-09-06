@@ -28,6 +28,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 POLICY_VERSION = "2026-09-06-cli-only-v1"
+ROUTING_VERSION = "2026-09-07-workloads-v1"
+# Explicit stages only. A workload never overrides a caller's explicit model.
+WORKLOAD_PROFILES = {
+    "classification": {"model": "haiku", "effort": "low"},
+    "standard": {"model": "sonnet", "effort": "medium"},
+    **{name: {"model": "gpt-6-astra", "effort": "high"} for name in (
+        "research_selection", "manuscript_structure", "manuscript_rewrite",
+        "assets_plan", "assets_review", "system_design", "academy_design",
+        "publishing_design", "briefing_judgment", "channel_structure",
+        "material_synthesis", "sentence_planning")},
+}
 ASSISTANT_ROOM_ID = 433846285  # Verified by Chatwork GET /rooms on 2026-09-06.
 ATTEMPTS_PER_PROVIDER = 3
 RETRY_DELAYS = (5, 15)
@@ -135,7 +146,7 @@ def readiness():
             status[provider] = {"ready":True, **check_auth(provider)}
         except (CliFailure, OSError) as exc:
             status[provider] = {"ready":False, "reason":getattr(exc,"code","launch_failed")}
-    return {"policy_version":POLICY_VERSION, "api_fallback":False,
+    return {"policy_version":POLICY_VERSION, "routing_version":ROUTING_VERSION, "api_fallback":False,
             "ready":any(s["ready"] for s in status.values()), "providers":status}
 
 
@@ -459,6 +470,9 @@ def _model_for_codex(request):
         return requested
     configured = os.environ.get("SUBSK_CODEX_MODEL", "")
     if not configured:
+        tier = _model_tier(requested)
+        configured = {"low": "gpt-5.6-luna", "medium": "gpt-5.6-sol", "high": "gpt-6-astra"}.get(tier, "")
+    if not configured:
         try:
             import tomllib
             home=Path(os.environ.get("CODEX_HOME",str(Path.home()/".codex")))
@@ -468,8 +482,65 @@ def _model_for_codex(request):
     return configured if re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}",configured or "") else ""
 
 
+def _model_tier(model):
+    model = str(model).lower()
+    if any(word in model for word in ("haiku", "luna", "mini", "spark")):
+        return "low"
+    if any(word in model for word in ("opus", "astra", "fable")) or model.startswith(("o3", "o4")):
+        return "high"
+    if any(word in model for word in ("sonnet", "sol", "terra")):
+        return "medium"
+    return None
+
+
+def resolve_route(request, provider):
+    """Return the selected CLI model/effort, including the fallback route."""
+    workload = request.get("workload") or ""
+    if workload and workload not in WORKLOAD_PROFILES:
+        raise ValueError("Unknown subscription workload: " + workload)
+    profile = WORKLOAD_PROFILES.get(workload, {})
+    requested = str(request.get("model") or profile.get("model", "sonnet"))
+    fallback = request.get("fallback_model") if request.get("primary") != provider else None
+    if provider == "codex":
+        model = str(fallback or _model_for_codex({**request, "model": requested}))
+        effort = request.get("codex_effort") or request.get("effort") or profile.get("effort") or _model_tier(requested) or "high"
+        allowed = {"low", "medium", "high", "xhigh", "max"}
+    elif provider == "claude":
+        model = str(fallback or requested)
+        if model.startswith(("gpt-", "o3", "o4")):
+            model = os.environ.get("SUBSK_CLAUDE_MODEL") or {"low": "haiku", "high": "opus"}.get(_model_tier(model), "sonnet")
+        if not model.startswith("claude-"):
+            model = "opus" if "opus" in model else "haiku" if "haiku" in model else "sonnet"
+        # Keep existing Claude effort unless the caller explicitly selects a profile/effort.
+        effort = request.get("claude_effort") or request.get("effort") or profile.get("effort") or "high"
+        effort = "high" if effort == "xhigh" else effort
+        allowed = {"low", "medium", "high", "max"}
+    else:
+        raise ValueError("provider must be claude or codex")
+    if effort not in allowed:
+        raise ValueError("Unsupported reasoning effort: " + str(effort))
+    if model and not re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", model):
+        raise ValueError("Invalid model name")
+    return {"model": model, "effort": effort, "workload": workload, "routing_version": ROUTING_VERSION}
+
+
+def _desktop_claude_cli():
+    """Claude Desktop 同梱の claude.exe(2.1.251+ で claude-fable-5-1 等の完全IDが使える)。無ければ None"""
+    try:
+        import glob
+        base=Path(os.environ.get("APPDATA",str(Path.home()/"AppData"/"Roaming")))/"Claude"/"claude-code"
+        cands=sorted(glob.glob(str(base/"*"/"claude.exe")),key=lambda p:[int(x) for x in re.findall(r"\d+",Path(p).parent.name)])
+        return cands[-1] if cands else None
+    except Exception:
+        return None
+
+
 def _invoke(provider, request):
+    route = resolve_route(request, provider)
     env=clean_env()
+    # 2026-09-06: CLI の1ターン出力上限(既定 32,000 トークン)を引き上げる。素材レポート等の長い単一応答が
+    # "response exceeded the 32000 output token maximum" で落ちた(assets-8cb0fbbd ショート候補提案・32分浪費)
+    env.setdefault("CLAUDE_CODE_MAX_OUTPUT_TOKENS", os.environ.get("SUBSK_CLI_MAX_OUTPUT_TOKENS", "64000"))
     auth=check_auth(provider,env)
     cli=cli_path(provider)
     with tempfile.TemporaryDirectory(prefix="subsk-cli-") as raw:
@@ -488,8 +559,7 @@ def _invoke(provider, request):
         if request["use_search"]:
             prompt += "\n\n検索を使って根拠を確認し、参照した出典URLを本文に明記してください。"
         if provider=="claude":
-            model=request["model"]
-            alias="opus" if "opus" in model else "haiku" if "haiku" in model else "sonnet"
+            alias=route["model"]
             tools=[]
             if request["use_search"]:
                 tools.append("WebSearch")
@@ -498,7 +568,7 @@ def _invoke(provider, request):
                 prompt="Readツールで次の添付を読み取ってから回答してください:\n"+"\n".join(str(f) for f in files)+"\n\n"+prompt
             args=[cli,"-p","--safe-mode","--no-session-persistence","--setting-sources","",
                   "--output-format","stream-json","--verbose","--permission-mode","dontAsk",
-                  "--model",alias,"--effort",request.get("effort","high"),"--system-prompt-file",str(system),
+                  "--model",alias,"--effort",route["effort"],"--system-prompt-file",str(system),
                   "--tools",",".join(tools)]
             if tools:
                 args += ["--allowedTools",",".join(tools)]
@@ -507,8 +577,8 @@ def _invoke(provider, request):
                   "--disable","shell_tool","--disable","apps","--disable","plugins","--disable","multi_agent",
                   "-c",'model_provider="openai"',"-c",'forced_login_method="chatgpt"',
                   "-c",'web_search="live"' if request["use_search"] else 'web_search="disabled"',
-                  "-c",'model_reasoning_effort="high"',"--json"]
-            model=_model_for_codex(request)
+                  "-c",'model_reasoning_effort="'+route["effort"]+'"',"--json"]
+            model=route["model"]
             if model:
                 args += ["--model",model]
             for file in files:
@@ -527,14 +597,25 @@ def _invoke(provider, request):
                     "<system_instructions>\n"+request["system"]+"\n</system_instructions>\n\n"+prompt)
             args += ["-"]
         code,out,err=_run(args,env=env,cwd=str(cwd),stdin=prompt,timeout=request["timeout"])
+        if provider=="claude" and code and "does not support this model" in (out+err) and _desktop_claude_cli():
+            # 古い npm 版 CLI が完全なモデルIDを知らない → Desktop 同梱の新しい CLI で1回だけ再実行
+            args[0]=_desktop_claude_cli()
+            code,out,err=_run(args,env=env,cwd=str(cwd),stdin=prompt,timeout=request["timeout"])
+        if code:
+            _record(request,outcome="cli_error",provider=provider,code=code,stderr_tail=(err or out)[-300:])
         if "takes precedence over your claude.ai login" in err:
             raise CliFailure("billing_route_rejected")
+        if code and "output token maximum" in (out+err):
+            # 2026-09-06: 出力上限超過は再試行しても同じ(毎回30分以上浪費) → 同じプロバイダでは再試行しない
+            raise CliFailure("output_too_long")
         if code:
             raise CliFailure(_failure_code(code,out,err))
         text,payload = _parse_claude(out) if provider=="claude" else _parse_codex(out)
         if request.get("protocol_tools"):
             _parse_protocol(text,request["protocol_tools"])
-        payload.update({"_provider":provider,"_authentication":auth["authentication"],"_policy_version":POLICY_VERSION})
+        payload.update({"_provider":provider,"_authentication":auth["authentication"],"_policy_version":POLICY_VERSION,
+                        "_requested_model":request["model"], "_model":route["model"], "_effort":route["effort"],
+                        "_workload":route["workload"], "_routing_version":ROUTING_VERSION})
         return text,payload
 
 
@@ -542,7 +623,10 @@ def run_local_request(request):
     primary=request.get("primary","claude")
     if primary not in {"claude","codex"}:
         raise ValueError("primary must be claude or codex")
+    # Validate configuration before retries or failure notifications.
+    routes = {provider: resolve_route(request, provider) for provider in ("claude", "codex")}
     attempts=[]
+    request_started=time.monotonic()
     for provider in (primary,"codex" if primary=="claude" else "claude"):
         for index in range(ATTEMPTS_PER_PROVIDER):
             if index:
@@ -552,14 +636,16 @@ def run_local_request(request):
                 text,payload=_invoke(provider,request)
             except Exception as exc:
                 reason=getattr(exc,"code","local_execution_error")
-                item={"provider":provider,"attempt":index+1,"reason":reason}
+                item={"provider":provider,"attempt":index+1,"reason":reason, **routes[provider]}
                 attempts.append(item)
                 _record(request,outcome="retry_failed",**item)
-                if reason in {"cli_missing","unsupported_attachment","attachment_too_long","billing_route_rejected"}:
+                if reason in {"cli_missing","unsupported_attachment","attachment_too_long","billing_route_rejected","output_too_long",
+                              "usage_limit", "timeout"}:
                     break
             else:
                 _record(request,outcome="completed",provider=provider,attempt=index+1,
-                        elapsed_s=round(time.monotonic()-started,1),usage=payload.get("usage",{}))
+                        elapsed_s=round(time.monotonic()-started,1),total_elapsed_s=round(time.monotonic()-request_started,1),
+                        requested_model=request.get("model"), **routes[provider], usage=payload.get("usage",{}))
                 payload["_attempts"]=attempts
                 return text,payload
     _terminal(request,attempts,"both_cli_unavailable")
@@ -642,14 +728,25 @@ def _gateway_generate(request):
         _terminal(request,attempts,"gateway_unavailable")
 
 
-def generate(system,query,*,model="sonnet",primary=None,use_search=False,timeout=900,
-             tool="workflow",label="",channel="",job_id="",attachments=None,effort="high",max_tokens=4096,protocol_tools=None):
-    start_notification_pump()
+def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900,
+             tool="workflow",label="",channel="",job_id="",attachments=None,effort=None,max_tokens=4096,protocol_tools=None,
+             workload="",fallback_model=None):
+    if primary is not None and primary not in {"claude", "codex"}:
+        raise ValueError("primary must be claude or codex")
+    if workload and workload not in WORKLOAD_PROFILES:
+        raise ValueError("Unknown subscription workload: " + workload)
+    model=model or WORKLOAD_PROFILES.get(workload, {}).get("model", "sonnet")
     request={"id":uuid.uuid4().hex,"job_id":job_id or JOB_ID.get(),"system":flatten(system),"query":flatten(query),
              "model":model,"primary":primary or ("codex" if str(model).startswith(("gpt-","o3","o4")) else "claude"),
              "use_search":bool(use_search),"timeout":max(30,int(timeout or 900)),"tool":tool,"label":label,
              "channel":channel,"attachments":attachments or [],"effort":effort,"max_tokens":max_tokens,
-             "protocol_tools":protocol_tools or []}
+             "protocol_tools":protocol_tools or [], "workload":workload, "fallback_model":fallback_model,
+             "routing_version":ROUTING_VERSION}
+    for provider in ("claude", "codex"):
+        request[provider+"_effort"]=resolve_route(request, provider)["effort"]
+    # Older workers require a non-null --effort. New workers use the provider-specific fields.
+    request["effort"]=request["effort"] or request[request["primary"]+"_effort"]
+    start_notification_pump()
     if cli_path("claude") or cli_path("codex"):
         return run_local_request(request)
     if _gateway_conf():
@@ -717,8 +814,9 @@ def messages_create(*,tool="workflow",label="",channel="",job_id="",**kwargs):
                    '\n応答形式はJSONオブジェクトのみ: {"content":[{"type":"text","text":"返答"}]}'
                    ' または {"content":[{"type":"tool_use","id":"一意ID","name":"ツール名","input":{}}]}。'
                    '\n実行していない操作を完了したと答えないでください。')
-    text,payload=generate(system,messages,model=kwargs.get("model","sonnet"),
+    text,payload=generate(system,messages,model=kwargs.get("model"),primary=kwargs.get("primary"),
                           use_search=web,timeout=kwargs.get("timeout") or 900,
+                          workload=kwargs.get("workload", ""),effort=kwargs.get("effort"),fallback_model=kwargs.get("fallback_model"),
                           tool=tool,label=label,channel=channel,job_id=job_id,attachments=attachments,max_tokens=kwargs.get("max_tokens",4096),protocol_tools=custom)
     usage=payload.get("usage",{})
     content=[SimpleNamespace(**b) for b in _parse_protocol(text,custom)] if custom else [SimpleNamespace(type="text",text=text)]
@@ -763,7 +861,7 @@ class SubscriptionClient:
         self.tool=tool
         self.channel=channel
         self.job_id=kwargs.get("job_id") or JOB_ID.get()
-        self.options={key:kwargs[key] for key in ("timeout",) if key in kwargs}
+        self.options={key:kwargs[key] for key in ("timeout", "workload", "effort", "fallback_model", "primary") if key in kwargs}
         self.messages=self
     def _request_kwargs(self,kwargs):
         return {"tool":self.tool,"channel":self.channel,"job_id":self.job_id,
