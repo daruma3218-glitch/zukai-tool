@@ -289,8 +289,7 @@ def start_job():
 
     # API キー確認（プロバイダ別）
     missing = []
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        missing.append("ANTHROPIC_API_KEY")
+    pass  # Subscription CLI does not require an Anthropic API key.
     if provider == PROVIDER_NANOBANANA and not os.environ.get("GEMINI_API_KEY"):
         missing.append("GEMINI_API_KEY")
     if provider == PROVIDER_GPT_IMAGE and not os.environ.get("OPENAI_API_KEY"):

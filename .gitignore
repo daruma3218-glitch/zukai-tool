@@ -7,3 +7,5 @@ output/*/
 .venv/
 venv/
 *.log
+
+.subscription-state/

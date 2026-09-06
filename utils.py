@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """共通ユーティリティ - JSON パースと Claude API 呼び出し"""
 
+try:
+    from . import subscription_runtime as _subscription
+except ImportError:
+    import subscription_runtime as _subscription
+
+
 import json
 import os
 import time
@@ -39,11 +45,7 @@ def load_env(project_root: Path) -> None:
 
 
 def get_anthropic_client() -> anthropic.Anthropic:
-    """Anthropic クライアントを取得（API キー未設定時はエラー）"""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key or api_key == "your_api_key_here":
-        raise RuntimeError("ANTHROPIC_API_KEY が設定されていません。.env を確認してください。")
-    return anthropic.Anthropic(api_key=api_key)
+    return _subscription.SubscriptionClient(tool='zukai')
 
 
 def claude_query(
@@ -54,49 +56,7 @@ def claude_query(
     model: str = "claude-sonnet-5",
     max_retries: int = 3,
 ) -> str:
-    """Claude クエリ実行（Web 検索なし）。
-
-    経路: サブスクゲートウェイ (課金ゼロ) → 不在時のみ従来 API (課金)。
-    """
-    if _gateway_generate is not None:
-        try:
-            text = _gateway_generate(
-                kind="query", system=system, query=query,
-                max_tokens=max_tokens, model=model,
-            )
-            if text:
-                return text
-        except Exception as e:
-            print(f"  [subsk-gw] 例外 → API直呼びへ: {type(e).__name__}: {str(e)[:120]}", flush=True)
-
-    for attempt in range(max_retries):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": query}],
-                # Sonnet 5 は thinking 未指定だと思考が既定 ON になり、max_tokens を
-                # 思考と本文で分け合う。図解生成は出力が長いため 4.6 と同じ「思考なし」に固定する
-                thinking={"type": "disabled"},
-            )
-            if not response or not response.content:
-                if attempt == max_retries - 1:
-                    return ""
-                time.sleep(3)
-                continue
-            text_parts = [getattr(b, "text", "") for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_parts)
-        except anthropic.RateLimitError:
-            wait = 15 * (attempt + 1)
-            print(f"  [RATE LIMIT] {wait}s 待機します...", flush=True)
-            time.sleep(wait)
-        except Exception as e:
-            print(f"  [ERROR] Claude API: {e}", flush=True)
-            if attempt == max_retries - 1:
-                return ""
-            time.sleep(3)
-    return ""
+    return _subscription.generate(system, query, tool='zukai', model=model, max_tokens=max_tokens)[0]
 
 
 def parse_json_array(text: str) -> list:

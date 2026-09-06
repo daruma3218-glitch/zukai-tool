@@ -28,6 +28,12 @@
 """
 from __future__ import annotations
 
+try:
+    from . import subscription_runtime as _subscription
+except ImportError:
+    import subscription_runtime as _subscription
+
+
 import json
 import os
 import time
@@ -115,72 +121,5 @@ def gateway_generate(
     model: str = "claude-sonnet-5",
     tool: str = "zukai",
 ) -> str | None:
-    """ワーカー経由 (サブスク枠) でテキスト生成。
-
-    Returns:
-        str  … 生成テキスト (API課金なし)
-        None … ワーカー不在/無効/タイムアウト。呼び出し側は従来の API 直呼びへ。
-    """
-    if _conf() is None:
-        return None
-    try:
-        if not _worker_alive_with_retry():
-            print(f"[subsk-gw] ワーカー不在 ({WORKER_RETRY_WINDOW_SEC}秒再確認しても応答なし) → API直呼び(課金)", flush=True)
-            return None
-
-        req_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        payload = {
-            "id": req_id,
-            "tool": tool,
-            "kind": kind,                 # "research" (web検索あり) | "query" (なし)
-            "model": model,
-            "system": system,
-            "query": query,
-            "max_tokens": max_tokens,
-            "max_uses": max_uses,
-            "channel": "russia",  # 図解つくーるはロシア解体新書専用 (2026-08-13 社長確認)
-            "created": time.time(),
-        }
-        status, body = _storage(
-            "POST", f"/storage/v1/object/{BUCKET}/req/{req_id}.json",
-            payload, headers={"x-upsert": "true"},
-        )
-        if status != 200:
-            print(f"[subsk-gw] リクエスト投函失敗 ({status}) → API直呼び(課金)", flush=True)
-            return None
-
-        deadline = time.time() + DEFAULT_TIMEOUT_SEC
-        res_path = f"/storage/v1/object/{BUCKET}/res/{req_id}.json"
-        while time.time() < deadline:
-            time.sleep(POLL_INTERVAL_SEC)
-            status, body = _storage("GET", res_path, timeout=15.0)
-            if status != 200:
-                continue
-            try:
-                res = json.loads(body.decode("utf-8"))
-            except json.JSONDecodeError:
-                continue
-            # 後片付け (best effort)
-            try:
-                _storage("DELETE", res_path, timeout=10.0)
-            except Exception:
-                pass
-            if res.get("ok") and res.get("text"):
-                print(
-                    f"[subsk-gw] ワーカー処理完了 ({len(res['text'])}字, "
-                    f"{res.get('elapsed', '?')}秒, API課金なし)", flush=True,
-                )
-                return res["text"]
-            print(f"[subsk-gw] ワーカー側エラー → API直呼び(課金): {str(res.get('error'))[:150]}", flush=True)
-            return None
-
-        # タイムアウト: リクエストを取り下げてからフォールバック (ゾンビ処理防止)
-        try:
-            _storage("DELETE", f"/storage/v1/object/{BUCKET}/req/{req_id}.json", timeout=10.0)
-        except Exception:
-            pass
-        print(f"[subsk-gw] {DEFAULT_TIMEOUT_SEC}秒待っても応答なし → API直呼び(課金)", flush=True)
-        return None
-    except Exception as e:
-        print(f"[subsk-gw] 例外 → API直呼び(課金): {type(e).__name__}: {str(e)[:120]}", flush=True)
-        return None
+    return _subscription.generate(system, query, model=model, use_search=(kind=="research"),
+        tool=tool, channel="", timeout=1800, max_tokens=max_tokens)[0]
