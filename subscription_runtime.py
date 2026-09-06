@@ -692,7 +692,7 @@ def _parse_protocol(text,tools):
         raise CliFailure("invalid_tool_protocol") from None
 
 
-def messages_create(*,tool="workflow",label="",channel="",**kwargs):
+def messages_create(*,tool="workflow",label="",channel="",job_id="",**kwargs):
     messages=kwargs.get("messages",[])
     attachments=[]
     for message in messages:
@@ -719,7 +719,7 @@ def messages_create(*,tool="workflow",label="",channel="",**kwargs):
                    '\n実行していない操作を完了したと答えないでください。')
     text,payload=generate(system,messages,model=kwargs.get("model","sonnet"),
                           use_search=web,timeout=kwargs.get("timeout") or 900,
-                          tool=tool,label=label,channel=channel,attachments=attachments,max_tokens=kwargs.get("max_tokens",4096),protocol_tools=custom)
+                          tool=tool,label=label,channel=channel,job_id=job_id,attachments=attachments,max_tokens=kwargs.get("max_tokens",4096),protocol_tools=custom)
     usage=payload.get("usage",{})
     content=[SimpleNamespace(**b) for b in _parse_protocol(text,custom)] if custom else [SimpleNamespace(type="text",text=text)]
     return Response(id="cli-"+uuid.uuid4().hex,content=content,
@@ -762,11 +762,19 @@ class SubscriptionClient:
     def __init__(self,*args,tool="workflow",channel="",**kwargs):
         self.tool=tool
         self.channel=channel
+        self.job_id=kwargs.get("job_id") or JOB_ID.get()
+        self.options={key:kwargs[key] for key in ("timeout",) if key in kwargs}
         self.messages=self
+    def _request_kwargs(self,kwargs):
+        return {"tool":self.tool,"channel":self.channel,"job_id":self.job_id,
+                **self.options,**kwargs}
+    def with_options(self,**kwargs):
+        return type(self)(tool=self.tool,channel=self.channel,job_id=self.job_id,
+                          **{**self.options,**kwargs})
     def create(self,**kwargs):
-        return messages_create(tool=self.tool,channel=self.channel,**kwargs)
+        return messages_create(**self._request_kwargs(kwargs))
     def stream(self,**kwargs):
-        return _Stream({"tool":self.tool,"channel":self.channel,**kwargs})
+        return _Stream(self._request_kwargs(kwargs))
     def close(self):
         pass
     def __enter__(self):
@@ -777,9 +785,9 @@ class SubscriptionClient:
 
 class AsyncSubscriptionClient(SubscriptionClient):
     async def create(self,**kwargs):
-        return await asyncio.to_thread(messages_create,tool=self.tool,channel=self.channel,**kwargs)
+        return await asyncio.to_thread(messages_create,**self._request_kwargs(kwargs))
     def stream(self,**kwargs):
-        return _Stream({"tool":self.tool,"channel":self.channel,**kwargs},async_mode=True)
+        return _Stream(self._request_kwargs(kwargs),async_mode=True)
     async def close(self):
         pass
     async def __aenter__(self):
