@@ -16,5 +16,9 @@ def test_key_attribution_requires_login_and_never_returns_secret():
         assert response.headers["Cache-Control"] == "no-store"
         assert response.get_json()["key_suffix"] == "ABCD"
         assert "fake-diagram-key-ABCD" not in response.get_data(as_text=True)
+        page = client.get("/settings/api-usage")
+        assert page.status_code == 200
+        assert "…ABCD" in page.get_data(as_text=True)
+        assert "fake-diagram-key-ABCD" not in page.get_data(as_text=True)
     with patch.object(appmod, "APP_PASSWORD", ""):
         assert appmod.app.test_client().get("/api/key-attribution").status_code == 403

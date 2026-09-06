@@ -86,6 +86,7 @@ def login_required(f):
     return decorated
 
 
+@app.route("/settings/api-usage")
 @app.route("/api/key-attribution")
 @login_required
 def key_attribution():
@@ -93,11 +94,15 @@ def key_attribution():
     if not APP_PASSWORD:
         return jsonify({"error": "診断にはアプリのログイン設定が必要です。"}), 403
     key = os.environ.get("GEMINI_API_KEY", "").strip()
-    response = jsonify({
+    data = {
         "service": "zukai-tool", "provider": "gemini", "configured": bool(key),
         "key_suffix": key[-4:] if len(key) > 4 else "",
         "source_env": "GEMINI_API_KEY" if key else None,
-    })
+    }
+    if request.path == "/settings/api-usage":
+        response = make_response(render_template("api_usage.html", audit=data))
+    else:
+        response = jsonify(data)
     response.headers["Cache-Control"] = "no-store"
     return response
 
