@@ -86,6 +86,22 @@ def login_required(f):
     return decorated
 
 
+@app.route("/api/key-attribution")
+@login_required
+def key_attribution():
+    """ログイン後の課金先診断。キー本体は返さない。"""
+    if not APP_PASSWORD:
+        return jsonify({"error": "診断にはアプリのログイン設定が必要です。"}), 403
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    response = jsonify({
+        "service": "zukai-tool", "provider": "gemini", "configured": bool(key),
+        "key_suffix": key[-4:] if len(key) > 4 else "",
+        "source_env": "GEMINI_API_KEY" if key else None,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/version")
 def version():
     """Render が実際にどの版を動かしているかの軽量診断（認証不要・秘密情報なし）。"""
