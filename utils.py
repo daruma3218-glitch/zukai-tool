@@ -15,8 +15,7 @@ from pathlib import Path
 import anthropic
 
 # サブスクLLMゲートウェイ (2026-08-13): Render → 社長PCワーカー → Claude Code CLI
-# (サブスク枠・API課金ゼロ)。ワーカー不在なら数秒で従来 API へフォールバック。
-# SUPABASE_URL / SUPABASE_KEY 未設定 (= Render env に入れるまで) は完全に従来動作。
+# ワーカー不在・認証失敗時は停止する。従量LLM APIへは切り替えない。
 try:
     from subsk_gateway import gateway_generate as _gateway_generate
 except Exception:
@@ -55,8 +54,11 @@ def claude_query(
     max_tokens: int = 4096,
     model: str = "claude-sonnet-5",
     max_retries: int = 3,
+    workload: str = "assets_plan",
+    effort: str = "high",
 ) -> str:
-    return _subscription.generate(system, query, tool='zukai', model=model, max_tokens=max_tokens)[0]
+    return _subscription.generate(system, query, tool='zukai', model=model, max_tokens=max_tokens,
+                                  workload=workload, effort=effort, timeout=900)[0]
 
 
 def parse_json_array(text: str) -> list:

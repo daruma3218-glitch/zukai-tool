@@ -28,16 +28,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 POLICY_VERSION = "2026-09-06-cli-only-v1"
-ROUTING_VERSION = "2026-09-07-workloads-v1"
+ROUTING_VERSION = "2026-09-07-editorial-v2"
 # Explicit stages only. A workload never overrides a caller's explicit model.
 WORKLOAD_PROFILES = {
     "classification": {"model": "haiku", "effort": "low"},
     "standard": {"model": "sonnet", "effort": "medium"},
+    "claude_review": {"model": "claude-fable-5-1", "effort": "high"},
     **{name: {"model": "gpt-6-astra", "effort": "high"} for name in (
         "research_selection", "manuscript_structure", "manuscript_rewrite",
         "assets_plan", "assets_review", "system_design", "academy_design",
         "publishing_design", "briefing_judgment", "channel_structure",
-        "material_synthesis", "sentence_planning")},
+        "material_synthesis", "material_review", "sentence_planning",
+        "manuscript_draft", "manuscript_integration", "diagram_selection")},
 }
 ASSISTANT_ROOM_ID = 433846285  # Verified by Chatwork GET /rooms on 2026-09-06.
 ATTEMPTS_PER_PROVIDER = 3
@@ -88,10 +90,10 @@ def clean_env(source=None):
 
 
 def _run(command, *, env, cwd=None, stdin="", timeout=60):
-    """Kill the complete child tree on Windows so timed-out CLI calls cannot linger."""
+    """Kill the child process group/tree so timed-out CLI calls cannot linger."""
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, env=env, cwd=cwd,
-                               creationflags=_CREATE_NO_WINDOW)
+                               creationflags=_CREATE_NO_WINDOW, start_new_session=os.name != "nt")
     try:
         out, err = process.communicate(stdin.encode("utf-8"), timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -99,7 +101,11 @@ def _run(command, *, env, cwd=None, stdin="", timeout=60):
             subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                            capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
         else:
-            process.kill()
+            import signal
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         process.communicate()
         raise CliFailure("timeout") from None
     return process.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
@@ -620,6 +626,8 @@ def _invoke(provider, request):
 
 
 def run_local_request(request):
+    if not isinstance(request.get("allow_fallback", True), bool):
+        raise ValueError("allow_fallback must be a boolean")
     primary=request.get("primary","claude")
     if primary not in {"claude","codex"}:
         raise ValueError("primary must be claude or codex")
@@ -627,7 +635,8 @@ def run_local_request(request):
     routes = {provider: resolve_route(request, provider) for provider in ("claude", "codex")}
     attempts=[]
     request_started=time.monotonic()
-    for provider in (primary,"codex" if primary=="claude" else "claude"):
+    providers = (primary,"codex" if primary=="claude" else "claude") if request.get("allow_fallback", True) else (primary,)
+    for provider in providers:
         for index in range(ATTEMPTS_PER_PROVIDER):
             if index:
                 time.sleep(RETRY_DELAYS[index-1])
@@ -648,7 +657,7 @@ def run_local_request(request):
                         requested_model=request.get("model"), **routes[provider], usage=payload.get("usage",{}))
                 payload["_attempts"]=attempts
                 return text,payload
-    _terminal(request,attempts,"both_cli_unavailable")
+    _terminal(request,attempts,"both_cli_unavailable" if len(providers)==2 else "primary_cli_unavailable")
 
 
 def _gateway_conf():
@@ -681,7 +690,9 @@ def _gateway_generate(request):
             time.sleep(RETRY_DELAYS[index-1])
         try:
             code,hb=_storage("GET","hb/worker.json")
-            if code==200 and time.time()-float(hb.get("ts",0))<60 and hb.get("policy_version")==POLICY_VERSION:
+            if (code==200 and time.time()-float(hb.get("ts",0))<60
+                    and hb.get("policy_version")==POLICY_VERSION
+                    and hb.get("routing_version")==ROUTING_VERSION):
                 break
         except (OSError,ValueError,CliFailure):
             pass
@@ -718,7 +729,14 @@ def _gateway_generate(request):
             if code!=200:
                 continue
             if result.get("ok") and result.get("text"):
-                return result["text"],result.get("payload",{"_provider":result.get("provider","worker")})
+                completed = result.get("payload") or {}
+                if (completed.get("_authentication") != "subscription"
+                        or completed.get("_provider") not in {"claude", "codex"}
+                        or completed.get("_routing_version") != ROUTING_VERSION
+                        or (not request.get("allow_fallback", True)
+                            and completed.get("_provider") != request["primary"])):
+                    _terminal(request,attempts,"billing_route_rejected")
+                return result["text"],completed
             _terminal(request,result.get("attempts",[]),result.get("reason","worker_failed"),
                       already_notified=bool(result.get("notification_queued")))
         _terminal(request,attempts,"worker_response_timeout")
@@ -730,7 +748,9 @@ def _gateway_generate(request):
 
 def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900,
              tool="workflow",label="",channel="",job_id="",attachments=None,effort=None,max_tokens=4096,protocol_tools=None,
-             workload="",fallback_model=None):
+              workload="",fallback_model=None,allow_fallback=True):
+    if not isinstance(allow_fallback, bool):
+        raise ValueError("allow_fallback must be a boolean")
     if primary is not None and primary not in {"claude", "codex"}:
         raise ValueError("primary must be claude or codex")
     if workload and workload not in WORKLOAD_PROFILES:
@@ -741,7 +761,7 @@ def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900
              "use_search":bool(use_search),"timeout":max(30,int(timeout or 900)),"tool":tool,"label":label,
              "channel":channel,"attachments":attachments or [],"effort":effort,"max_tokens":max_tokens,
              "protocol_tools":protocol_tools or [], "workload":workload, "fallback_model":fallback_model,
-             "routing_version":ROUTING_VERSION}
+              "routing_version":ROUTING_VERSION,"allow_fallback":allow_fallback}
     for provider in ("claude", "codex"):
         request[provider+"_effort"]=resolve_route(request, provider)["effort"]
     # Older workers require a non-null --effort. New workers use the provider-specific fields.
@@ -816,7 +836,8 @@ def messages_create(*,tool="workflow",label="",channel="",job_id="",**kwargs):
                    '\n実行していない操作を完了したと答えないでください。')
     text,payload=generate(system,messages,model=kwargs.get("model"),primary=kwargs.get("primary"),
                           use_search=web,timeout=kwargs.get("timeout") or 900,
-                          workload=kwargs.get("workload", ""),effort=kwargs.get("effort"),fallback_model=kwargs.get("fallback_model"),
+                           workload=kwargs.get("workload", ""),effort=kwargs.get("effort"),fallback_model=kwargs.get("fallback_model"),
+                          allow_fallback=kwargs.get("allow_fallback", True),
                           tool=tool,label=label,channel=channel,job_id=job_id,attachments=attachments,max_tokens=kwargs.get("max_tokens",4096),protocol_tools=custom)
     usage=payload.get("usage",{})
     content=[SimpleNamespace(**b) for b in _parse_protocol(text,custom)] if custom else [SimpleNamespace(type="text",text=text)]
@@ -861,7 +882,7 @@ class SubscriptionClient:
         self.tool=tool
         self.channel=channel
         self.job_id=kwargs.get("job_id") or JOB_ID.get()
-        self.options={key:kwargs[key] for key in ("timeout", "workload", "effort", "fallback_model", "primary") if key in kwargs}
+        self.options={key:kwargs[key] for key in ("timeout", "workload", "effort", "fallback_model", "primary", "allow_fallback") if key in kwargs}
         self.messages=self
     def _request_kwargs(self,kwargs):
         return {"tool":self.tool,"channel":self.channel,"job_id":self.job_id,

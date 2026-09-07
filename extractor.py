@@ -16,8 +16,8 @@ import anthropic
 from utils import claude_query, parse_json_object, parse_json_array
 
 
-# 抽出は Sonnet 5（旧 4-6 から更新。EXTRACTOR_MODEL で変更可）
-CLAUDE_MODEL = os.environ.get("EXTRACTOR_MODEL", "").strip() or "claude-sonnet-5"
+# 原稿全体の文脈と図解する箇所をASTRAで判定する。
+CLAUDE_MODEL = os.environ.get("EXTRACTOR_MODEL", "").strip() or "gpt-6-astra"
 
 
 def analyze_manuscript(
@@ -33,10 +33,8 @@ def analyze_manuscript(
         "渡された原稿を分析して、メインテーマ・キーワード・セクション構成を抽出します。"
         "結果は必ずJSONオブジェクトのみで返してください。前置きや説明は不要です。"
     )
-    # 原稿の冒頭・末尾のみで全体像を把握（長文対策）
-    head = manuscript_text[:8000]
-    tail = manuscript_text[-2000:] if len(manuscript_text) > 10000 else ""
-    sample = head + ("\n...\n" + tail if tail else "")
+    # 中間章の論点を落とさないよう、原稿全体を判定入力にする。
+    sample = manuscript_text
 
     query = f"""以下の原稿を分析して、JSON形式で返してください。
 
@@ -52,7 +50,7 @@ def analyze_manuscript(
 
 JSONのみ返すこと。"""
 
-    result = claude_query(client, query, system, max_tokens=2048, model=CLAUDE_MODEL)
+    result = claude_query(client, query, system, max_tokens=2048, model=CLAUDE_MODEL, workload="diagram_selection")
     data = parse_json_object(result)
 
     if not data:
@@ -189,7 +187,7 @@ JSON配列のみで返すこと（前置き・後書き・コードブロック�
 合計**{target_count}個**返すこと。それ未満は無効です。"""
 
     log("extractor", f"視覚化ポイントを抽出中（目標 {target_count} 個）...")
-    result = claude_query(client, query, system, max_tokens=16000, model=CLAUDE_MODEL)
+    result = claude_query(client, query, system, max_tokens=16000, model=CLAUDE_MODEL, workload="diagram_selection")
     excerpts = parse_json_array(result)
     log("extractor", f"1回目の抽出: {len(excerpts)} 個")
 
@@ -222,7 +220,7 @@ JSON配列のみで返すこと:
   {{"index": {len(excerpts) + 1}, "excerpt": "...", "section": "...", "type": "...", "keypoint": "..."}}
 ]"""
         log("extractor", f"補充リクエスト（残り {remaining} 個）...")
-        result2 = claude_query(client, supplement_query, system, max_tokens=10000, model=CLAUDE_MODEL)
+        result2 = claude_query(client, supplement_query, system, max_tokens=10000, model=CLAUDE_MODEL, workload="diagram_selection")
         extra = parse_json_array(result2)
         log("extractor", f"補充結果: {len(extra)} 個追加")
         if not extra:

@@ -15,9 +15,9 @@ import anthropic
 from utils import claude_query, parse_json_array
 
 
-# プロンプト生成は品質最優先で Opus 5（センテンスつくーると同方針）。
+# プロンプト・図解設計はASTRA（センテンスつくーると同方針）。
 # 環境変数 PROMPTER_MODEL で変更可（例: claude-sonnet-4-6 で従来に戻す）。
-CLAUDE_MODEL = os.environ.get("PROMPTER_MODEL", "").strip() or "claude-opus-5"
+CLAUDE_MODEL = os.environ.get("PROMPTER_MODEL", "").strip() or "gpt-6-astra"
 BATCH_SIZE = 10  # 1 リクエストあたりのプロンプト数（並列バッチ）
 
 # 世界観プリセット（①）: さゆみさんの手直し実績で最多だった

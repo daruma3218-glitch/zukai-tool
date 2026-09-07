@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""メインパイプライン: 3 フェーズを順次実行
+"""メインパイプライン: 4 フェーズを順次実行
 
-Phase 1: 原稿分析 + 視覚化ポイント抽出（Claude）
-Phase 2: 抜粋 → 英文プロンプト（Claude、並列バッチ）
-Phase 3: 英文プロンプト → 画像（Gemini、asyncio 並列）
+Phase 1: 原稿分析 + 視覚化ポイント抽出（ASTRA CLI）
+Phase 2: 抜粋 → 英文プロンプト（ASTRA CLI、並列バッチ）
+Phase 3: 英文プロンプト → 画像（既存画像モデル、asyncio 並列）
+Phase 4: 完成画像と対応する抜粋の内容検査（ASTRA CLI）
 """
 
 import json
@@ -20,6 +21,7 @@ from utils import (
 )
 from extractor import analyze_manuscript, extract_visual_points
 from prompter import generate_all_prompts
+from verifier import verify_images
 from generator import (
     run_parallel_generation,
     DEFAULT_CONCURRENCY,
@@ -137,7 +139,7 @@ class DiagramPipeline:
 
         # Phase 1: 原稿分析
         self._progress(1, "原稿を分析中...", 3)
-        self._log("analyze", "Claude で原稿の全体構造を分析しています...")
+        self._log("analyze", "ASTRAで原稿の全体構造を分析しています...")
         analysis = analyze_manuscript(client, self.manuscript_text, log=self._log)
         title = analysis.get("title", "無題")
         sections = analysis.get("sections", [])
@@ -185,7 +187,7 @@ class DiagramPipeline:
 
         # Phase 2: 英文プロンプト生成（並列バッチ）
         self._progress(2, "英文プロンプトを並列生成中...", 30)
-        self._log("prompter", "Claude で英文プロンプトを並列生成しています...")
+        self._log("prompter", "ASTRAで図の内容と画像指示を設計しています...")
         prompts = generate_all_prompts(
             client,
             excerpts,
@@ -228,6 +230,15 @@ class DiagramPipeline:
             f"画像生成完了: 成功 {success_count} 枚 / 失敗 {fail_count} 枚",
         )
 
+        self._progress(4, "完成画像と原稿の抜粋を照合中...", 90)
+        def on_review(item, review):
+            item["content_review"] = review
+            self._on_item_event({**item, "status": "ok"})
+        content_review = verify_images(results, self.images_dir, job_id=self.output_dir.name, on_review=on_review)
+        save_json(self.output_dir / "content_review.json", content_review)
+        review_counts = content_review["counts"]
+        self._log("review", f"内容検査: 合格 {review_counts['pass']} / 要修正 {review_counts['needs_fix']} / 未確認 {review_counts['unverified']}")
+
         # マニフェスト保存
         manifest = {
             "title": title,
@@ -244,9 +255,10 @@ class DiagramPipeline:
             "succeeded": success_count,
             "failed": fail_count,
             "items": results,
+            "content_review": content_review,
             "completed_at": datetime.now().isoformat(),
         }
         save_json(self.output_dir / "manifest.json", manifest)
 
-        self._progress(4, f"完了: {success_count}/{len(prompts)} 枚生成", 100)
+        self._progress(4, f"完了: {success_count}/{len(prompts)}枚生成・内容の要修正 {review_counts['needs_fix']}枚／未確認 {review_counts['unverified']}枚", 100)
         return manifest

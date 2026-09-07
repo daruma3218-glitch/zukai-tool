@@ -110,9 +110,16 @@ def key_attribution():
 @app.route("/version")
 def version():
     """Render が実際にどの版を動かしているかの軽量診断（認証不要・秘密情報なし）。"""
+    from extractor import CLAUDE_MODEL as EXTRACTOR_MODEL
+    from prompter import CLAUDE_MODEL as PROMPTER_MODEL
+    from verifier import VERIFY_MODEL
+    import subscription_runtime
     return jsonify({
         "service": "zukai-tool",
         "git_commit": os.environ.get("RENDER_GIT_COMMIT", ""),
+        "routing_version": subscription_runtime.ROUTING_VERSION,
+        "editorial_models": {"selection": EXTRACTOR_MODEL, "design": PROMPTER_MODEL, "image_review": VERIFY_MODEL},
+        "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
     })
 
 
@@ -125,10 +132,13 @@ def api_subsk_health():
     """
     try:
         from subsk_gateway import _conf, _worker_alive
+        import subscription_runtime
         enabled = _conf() is not None
         return jsonify({
             "gateway_enabled": enabled,
             "worker_alive": _worker_alive() if enabled else False,
+            "routing_version": subscription_runtime.ROUTING_VERSION,
+            "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
         })
     except Exception as e:
         return jsonify({"gateway_enabled": False, "worker_alive": False,

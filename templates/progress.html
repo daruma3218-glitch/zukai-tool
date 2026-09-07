@@ -231,6 +231,10 @@
       const section = escapeHtml(item.section || '');
       const keypoint = escapeHtml(item.keypoint || item.excerpt?.substring(0, 30) || `図 ${idx}`);
       const excerpt = escapeHtml(item.excerpt || '');
+      const review = item.content_review;
+      const reviewLabels = { pass: '内容検査：合格', needs_fix: '内容検査：要修正', unverified: '内容検査：未確認' };
+      const reviewLabel = reviewLabels[review?.status] || '内容検査：未確認';
+      const reviewClass = review?.status === 'pass' ? 'text-green-700' : 'text-amber-700';
 
       let inner = '';
       if (status === 'ok' && filename) {
@@ -242,6 +246,8 @@
           <div class="px-2 py-1.5 bg-white">
             <p class="text-[10px] text-gray-400 truncate">${section}</p>
             <p class="text-xs text-gray-800 truncate font-medium">${keypoint}</p>
+            <p class="text-[10px] ${reviewClass}">${reviewLabel}</p>
+            ${review?.reason ? `<p class="text-[10px] text-gray-600">${escapeHtml(review.reason)}</p>` : ''}
           </div>`;
       } else if (status === 'generating') {
         inner = `
@@ -277,7 +283,7 @@
 
       // フッター: 番号
       return `
-        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border border-gray-200 bg-white" data-status="${status}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
+        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border border-gray-200 bg-white" data-status="${status}" data-review="${escapeHtml(JSON.stringify(item.content_review || null))}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
           <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${String(idx).padStart(3, '0')}</span>
           ${inner}
         </div>`;
@@ -304,7 +310,7 @@
         if (!card) {
           // 新規追加
           grid.insertAdjacentHTML('beforeend', renderItem(item));
-        } else if (prevStatus !== item.status) {
+        } else if (prevStatus !== item.status || card.getAttribute('data-review') !== JSON.stringify(item.content_review || null)) {
           card.outerHTML = renderItem(item);
         }
       });
