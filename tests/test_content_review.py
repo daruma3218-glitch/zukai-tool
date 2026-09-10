@@ -29,9 +29,22 @@ def test_only_approved_excerpt_and_image_go_to_codex(tmp_path):
     assert '貿易' in query and '100から80' in query
     assert 'MUST_NOT_SEND' not in query
     assert call.call_args.kwargs['primary']=='codex'
-    assert call.call_args.kwargs['allow_fallback'] is False
+    # 2026-09-10: Codex優先のまま、Codex不能時はClaude CLI(サブスク)で代替する。従量APIは使わない。
+    assert call.call_args.kwargs['allow_fallback'] is True
+    assert call.call_args.kwargs['fallback_model'] is None
     assert call.call_args.kwargs['model']=='gpt-6-astra'
     assert len(call.call_args.kwargs['attachments'])==1
+
+
+def test_claude_insurance_result_is_accepted_and_route_recorded(tmp_path):
+    root,rows=inputs(tmp_path)
+    answer=json.dumps([{'index':1,'status':'needs_fix','reason':'数値が逆'}])
+    meta={'_provider':'claude','_model':'opus','_authentication':'subscription','_effort':'high','_routing_version':'v'}
+    with mock.patch.object(verifier.runtime,'generate',return_value=(answer,meta)):
+        report=verifier.verify_images(rows,root)
+    assert report['counts']['needs_fix']==1
+    assert report['routes'][0]['_provider']=='claude'
+    assert report['api_fallback'] is False
 
 
 def test_duplicate_and_missing_verdicts_remain_unverified(tmp_path):

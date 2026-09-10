@@ -44,6 +44,10 @@ WORKLOAD_PROFILES = {
 ASSISTANT_ROOM_ID = 433846285  # Verified by Chatwork GET /rooms on 2026-09-06.
 ATTEMPTS_PER_PROVIDER = 3
 RETRY_DELAYS = (5, 15)
+# 2026-09-10 社長指示: 利用上限(usage limit / rate limit / 429)は同じCLIで待機してから再試行する。
+# 図解検査 20260910_065100 では Codex の上限応答が約97秒後に解けており、即停止だと1バッチ分が未確認になった。
+# 待機後も継続できなければ、呼出側が許可している場合だけ他方のサブスクCLIへ移る。従量APIへは切り替えない。
+USAGE_LIMIT_DELAYS = (30, 90)
 BUCKET = "subsk-gateway"
 JOB_ID = contextvars.ContextVar("subscription_job_id", default="")
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -410,6 +414,30 @@ def flatten(value):
     raise ValueError("Unsupported message format")
 
 
+def _failure_detail(out, err):
+    """失敗理由が分かる行だけを短く返す(routing.jsonl の診断用。通知本文には載せない)。"""
+    keywords = ("usage limit", "rate limit", "quota", "hit your limit", "429", "unauthorized", "authentication",
+                "not logged in", "login required", "billing", "credit balance", "api key", "error")
+    for line in (out+"\n"+err).splitlines():
+        message = line.strip()
+        if not message:
+            continue
+        if message.startswith("{"):
+            try:
+                event = json.loads(message)
+            except ValueError:
+                event = None
+            if isinstance(event, dict):
+                if event.get("type") in {"error", "turn.failed"} or event.get("is_error") is True:
+                    error = event.get("error") or event.get("message") or event.get("result") or ""
+                    message = error.get("message", "") if isinstance(error, dict) else str(error)
+                else:
+                    continue
+        if any(word in message.lower() for word in keywords):
+            return message[:200]
+    return ""
+
+
 def _failure_code(code, out, err):
     combined = (out+"\n"+err).lower()
     if any(s in combined for s in ("usage limit","rate limit","quota","hit your limit","429")):
@@ -608,7 +636,8 @@ def _invoke(provider, request):
             args[0]=_desktop_claude_cli()
             code,out,err=_run(args,env=env,cwd=str(cwd),stdin=prompt,timeout=request["timeout"])
         if code:
-            _record(request,outcome="cli_error",provider=provider,code=code,stderr_tail=(err or out)[-300:])
+            _record(request,outcome="cli_error",provider=provider,code=code,stderr_tail=(err or out)[-300:],
+                    detail=_failure_detail(out,err))
         if "takes precedence over your claude.ai login" in err:
             raise CliFailure("billing_route_rejected")
         if code and "output token maximum" in (out+err):
@@ -639,7 +668,9 @@ def run_local_request(request):
     for provider in providers:
         for index in range(ATTEMPTS_PER_PROVIDER):
             if index:
-                time.sleep(RETRY_DELAYS[index-1])
+                # 直前が利用上限なら長め(30秒/90秒)に待つ。一時的な 429 はこの間に解けることが多い。
+                delays=USAGE_LIMIT_DELAYS if attempts and attempts[-1].get("reason")=="usage_limit" else RETRY_DELAYS
+                time.sleep(delays[index-1])
             started=time.monotonic()
             try:
                 text,payload=_invoke(provider,request)
@@ -649,7 +680,7 @@ def run_local_request(request):
                 attempts.append(item)
                 _record(request,outcome="retry_failed",**item)
                 if reason in {"cli_missing","unsupported_attachment","attachment_too_long","billing_route_rejected","output_too_long",
-                              "usage_limit", "timeout"}:
+                              "timeout"}:
                     break
             else:
                 _record(request,outcome="completed",provider=provider,attempt=index+1,
@@ -707,7 +738,7 @@ def _gateway_generate(request):
         if code not in {200,201}:
             raise CliFailure("queue_write_failed")
         # Worker retries both CLIs. Never time out before that retry budget has elapsed.
-        deadline=time.monotonic()+6*(request["timeout"]+30)+2*sum(RETRY_DELAYS)+600
+        deadline=time.monotonic()+6*(request["timeout"]+30)+2*max(sum(RETRY_DELAYS),sum(USAGE_LIMIT_DELAYS))+600
         last_health=time.monotonic()
         missed_health=0
         while time.monotonic()<deadline:

@@ -1,4 +1,8 @@
-"""承認済みの画像・対応する抜粋・章名だけをASTRA CLIで検査する。"""
+"""承認済みの画像・対応する抜粋・章名だけをサブスクCLIで検査する。
+
+Codex(ASTRA)を優先し、Codexが利用上限・障害で使えない時はClaude CLI(サブスク認証)で代替する(2026-09-10 社長指示)。
+従量課金のLLM APIへは切り替えない。実際に検査したCLI・モデルは report["routes"] に残す。
+"""
 import base64
 import json
 import os
@@ -8,6 +12,8 @@ import subscription_runtime as runtime
 from utils import parse_json_array
 
 VERIFY_MODEL = os.environ.get("VERIFY_MODEL", "").strip() or "gpt-6-astra"
+# Codex不能時にClaude CLIで使うモデル。未指定なら共通CLIの既定(ASTRA相当→Opus / high)。
+VERIFY_FALLBACK_MODEL = os.environ.get("VERIFY_FALLBACK_MODEL", "").strip() or None
 BATCH_SIZE = 4
 
 
@@ -46,7 +52,7 @@ def verify_images(items, images_dir, *, job_id="", on_review=None):
                     "抜粋だけでは確かめられない事実を正しいと断定しないでください。"
                     "返答はJSON配列のみ。各項目はindex、status(pass/needs_fix/unverified)、reason(日本語)。",
                     "添付と原稿抜粋の対応:\n" + json.dumps(inputs, ensure_ascii=False),
-                    model=VERIFY_MODEL, primary="codex", allow_fallback=False,
+                    model=VERIFY_MODEL, primary="codex", allow_fallback=True, fallback_model=VERIFY_FALLBACK_MODEL,
                     workload="assets_review", effort="high", timeout=300, max_tokens=4000,
                     attachments=attachments, tool="zukai", label="content_review", job_id=job_id,
                 )
