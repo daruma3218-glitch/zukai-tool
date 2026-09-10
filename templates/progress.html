@@ -109,11 +109,11 @@
         </div>
       </div>
 
-      <!-- 完了時のアクション -->
+      <!-- 1枚でも保存できたら利用できるアクション -->
       <div id="actions" class="hidden mt-5 flex flex-wrap gap-3">
         <a id="downloadBtn" href="" class="inline-flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-medium rounded-xl hover:from-purple-700 hover:to-pink-700 transition shadow-md">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
-          ZIP でダウンロード
+          <span id="downloadLabel">ZIP でダウンロード</span>
         </a>
         <a href="/" class="inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition">
           + 新しいジョブを作成
@@ -169,7 +169,10 @@
           <p id="modalTitle" class="text-sm font-semibold text-gray-900 truncate"></p>
           <p id="modalSection" class="text-xs text-gray-500 mt-0.5"></p>
         </div>
-        <button onclick="closeModal()" class="text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+        <div class="flex items-center gap-4">
+          <a id="modalDownload" href="" download class="text-sm text-purple-600 hover:underline">この画像をダウンロード</a>
+          <button onclick="closeModal()" class="text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+        </div>
       </div>
       <div class="bg-gray-100 flex items-center justify-center p-4">
         <img id="modalImg" src="" class="max-w-full max-h-[70vh] object-contain rounded-lg shadow">
@@ -185,6 +188,8 @@
     const JOB_ID = "{{ job_id }}";
     let logsSince = 0;
     let stopped = false;
+    let jobStatus = 'running';
+    let availableImages = 0;
     let knownItems = {}; // index -> item
 
     const els = {
@@ -204,6 +209,7 @@
       logsContainer: document.getElementById('logsContainer'),
       actions: document.getElementById('actions'),
       downloadBtn: document.getElementById('downloadBtn'),
+      downloadLabel: document.getElementById('downloadLabel'),
     };
 
     function escapeHtml(s) {
@@ -231,10 +237,6 @@
       const section = escapeHtml(item.section || '');
       const keypoint = escapeHtml(item.keypoint || item.excerpt?.substring(0, 30) || `図 ${idx}`);
       const excerpt = escapeHtml(item.excerpt || '');
-      const review = item.content_review;
-      const reviewLabels = { pass: '内容検査：合格', needs_fix: '内容検査：要修正', unverified: '内容検査：未確認' };
-      const reviewLabel = reviewLabels[review?.status] || '内容検査：未確認';
-      const reviewClass = review?.status === 'pass' ? 'text-green-700' : 'text-amber-700';
 
       let inner = '';
       if (status === 'ok' && filename) {
@@ -246,8 +248,6 @@
           <div class="px-2 py-1.5 bg-white">
             <p class="text-[10px] text-gray-400 truncate">${section}</p>
             <p class="text-xs text-gray-800 truncate font-medium">${keypoint}</p>
-            <p class="text-[10px] ${reviewClass}">${reviewLabel}</p>
-            ${review?.reason ? `<p class="text-[10px] text-gray-600">${escapeHtml(review.reason)}</p>` : ''}
           </div>`;
       } else if (status === 'generating') {
         inner = `
@@ -283,7 +283,7 @@
 
       // フッター: 番号
       return `
-        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border border-gray-200 bg-white" data-status="${status}" data-review="${escapeHtml(JSON.stringify(item.content_review || null))}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
+        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border border-gray-200 bg-white" data-status="${status}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
           <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${String(idx).padStart(3, '0')}</span>
           ${inner}
         </div>`;
@@ -310,7 +310,7 @@
         if (!card) {
           // 新規追加
           grid.insertAdjacentHTML('beforeend', renderItem(item));
-        } else if (prevStatus !== item.status || card.getAttribute('data-review') !== JSON.stringify(item.content_review || null)) {
+        } else if (prevStatus !== item.status || card.getAttribute('data-filename') !== (item.filename || '')) {
           card.outerHTML = renderItem(item);
         }
       });
@@ -325,6 +325,14 @@
       els.completedCount.textContent = completed;
       els.generatingCount.textContent = generating;
       els.failedCount.textContent = failed;
+    }
+
+    function updateDownload() {
+      els.actions.classList.toggle('hidden', availableImages === 0);
+      els.downloadBtn.href = `/download/${JOB_ID}`;
+      els.downloadLabel.textContent = jobStatus === 'completed'
+        ? `ZIP でダウンロード（${availableImages}枚）`
+        : `完成済み ${availableImages}枚をZIPでダウンロード`;
     }
 
     // ===== 完了通知（別タブ・他作業中でもデスクトップ通知を出す） =====
@@ -351,10 +359,12 @@
         const res = await fetch(`/api/status/${JOB_ID}`);
         if (!res.ok) return;
         const state = await res.json();
+        jobStatus = state.status;
+        updateDownload();
 
         // ヘッダ更新
         els.jobMessage.textContent = state.message || '...';
-        els.phaseNum.textContent = state.phase || 0;
+        els.phaseNum.textContent = Math.min(state.phase || 0, 3);
         els.overallBar.style.width = `${state.percent || 0}%`;
         els.overallPercent.textContent = `${state.percent || 0}%`;
         if (state.target_count) els.targetCountVal.textContent = state.target_count;
@@ -373,8 +383,6 @@
 
         if (state.status === 'completed') {
           stopped = true;
-          els.actions.classList.remove('hidden');
-          els.downloadBtn.href = `/download/${JOB_ID}`;
           notifyCompleted(state);
         }
         if (state.status === 'error') {
@@ -391,6 +399,8 @@
         if (!res.ok) return;
         const data = await res.json();
         const items = data.items || [];
+        availableImages = data.available_images ?? items.filter(i => i.status === 'ok' && i.filename).length;
+        updateDownload();
         if (items.length > 0) {
           rebuildGrid(items);
           updateSummary(items);
@@ -450,6 +460,7 @@
       const filename = card.getAttribute('data-filename');
       if (!filename) return;
       document.getElementById('modalImg').src = `/results/${JOB_ID}/images/${filename}`;
+      document.getElementById('modalDownload').href = `/results/${JOB_ID}/images/${filename}`;
       document.getElementById('modalTitle').textContent = card.getAttribute('data-keypoint') || `図 ${idx}`;
       document.getElementById('modalSection').textContent = card.getAttribute('data-section') || '';
       document.getElementById('modalExcerpt').textContent = card.getAttribute('data-excerpt') || '';

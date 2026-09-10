@@ -12,6 +12,7 @@ asyncio + Semaphore で同時 N 枚を並列生成する。
 import asyncio
 import base64
 import os
+import tempfile
 import time
 from io import BytesIO
 from pathlib import Path
@@ -58,6 +59,20 @@ def _detect_background_color(img: "Image.Image") -> tuple:
     return Counter(samples).most_common(1)[0][0]
 
 
+def _save_png(image: "Image.Image", output_path: Path) -> None:
+    """書き込み中の画像が途中ZIPやプレビューに入らないよう、完成後に公開する。"""
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=f".{output_path.name}.",
+                                         suffix=".tmp", delete=False) as temp:
+            temp_path = Path(temp.name)
+        image.save(temp_path, format="PNG")
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _save_as_16_9(image_bytes: bytes, output_path: Path) -> None:
     """画像バイト列を 16:9 で保存する（レターボックス方式）。
 
@@ -75,7 +90,7 @@ def _save_as_16_9(image_bytes: bytes, output_path: Path) -> None:
     current = w / h if h else 1.0
 
     if abs(current - TARGET_RATIO) < 0.01:
-        img.save(output_path, format="PNG")
+        _save_png(img, output_path)
         return
 
     bg = _detect_background_color(img)
@@ -97,7 +112,7 @@ def _save_as_16_9(image_bytes: bytes, output_path: Path) -> None:
     else:
         canvas.paste(img, (offset_x, offset_y))
 
-    canvas.save(output_path, format="PNG")
+    _save_png(canvas, output_path)
 
 # プロバイダ識別子
 PROVIDER_NANOBANANA = "nanobanana"

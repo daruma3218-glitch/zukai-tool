@@ -6,10 +6,10 @@
 """
 
 import functools
-import io
 import json
 import os
 import secrets
+import tempfile
 import threading
 import zipfile
 from datetime import datetime, timedelta
@@ -28,7 +28,7 @@ from flask import (
     url_for,
 )
 
-from utils import load_env, load_json
+from utils import load_env, load_json, save_json
 from pipeline import DiagramPipeline
 from generator import PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS
 
@@ -112,13 +112,15 @@ def version():
     """Render が実際にどの版を動かしているかの軽量診断（認証不要・秘密情報なし）。"""
     from extractor import CLAUDE_MODEL as EXTRACTOR_MODEL
     from prompter import CLAUDE_MODEL as PROMPTER_MODEL
-    from verifier import VERIFY_MODEL
     import subscription_runtime
     return jsonify({
         "service": "zukai-tool",
         "git_commit": os.environ.get("RENDER_GIT_COMMIT", ""),
         "routing_version": subscription_runtime.ROUTING_VERSION,
-        "editorial_models": {"selection": EXTRACTOR_MODEL, "design": PROMPTER_MODEL, "image_review": VERIFY_MODEL},
+        "editorial_models": {"selection": EXTRACTOR_MODEL, "design": PROMPTER_MODEL},
+        "image_review_enabled": False,
+        "pipeline_phases": 3,
+        "partial_download_enabled": True,
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
     })
 
@@ -168,6 +170,13 @@ def logout():
 
 
 # ====== ジョブ管理 ======
+@app.after_request
+def prevent_stale_progress(response):
+    if request.path.startswith(("/api/", "/progress/")) or request.path == "/version":
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _set_job_state(job_id: str, **kwargs):
     with _jobs_lock:
         state = _jobs.setdefault(job_id, {})
@@ -175,25 +184,19 @@ def _set_job_state(job_id: str, **kwargs):
         state["updated_at"] = datetime.now().isoformat()
         # ファイルにも保存
         try:
-            (OUTPUT_DIR / job_id / "job.json").write_text(
-                json.dumps(state, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            save_json(OUTPUT_DIR / job_id / "job.json", state)
         except Exception:
             pass
 
 
 def _get_job_state(job_id: str) -> dict:
+    # 複数のGunicornワーカーと再起動後も、保存済みの最新状態を優先する。
+    state = load_json(OUTPUT_DIR / job_id / "job.json", {})
+    if state:
+        return state
     with _jobs_lock:
         if job_id in _jobs:
             return dict(_jobs[job_id])
-    # ファイルから復元
-    job_path = OUTPUT_DIR / job_id / "job.json"
-    if job_path.exists():
-        try:
-            return json.loads(job_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
     return {}
 
 
@@ -207,13 +210,53 @@ def _add_log(job_id: str, category: str, message: str, detail: str = ""):
     with _jobs_lock:
         logs = _job_logs.setdefault(job_id, [])
         logs.append(entry)
-    try:
-        (OUTPUT_DIR / job_id / "logs.json").write_text(
-            json.dumps(_job_logs[job_id], ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
+        try:
+            save_json(OUTPUT_DIR / job_id / "logs.json", logs)
+        except OSError:
+            pass
+
+
+def _completed_images(result_dir: Path) -> list[Path]:
+    """保存が完了した画像だけを列挙する。書き込み途中の.tmpは含めない。"""
+    images_dir = result_dir / "images"
+    if not images_dir.is_dir():
+        return []
+    return sorted(path for path in images_dir.iterdir()
+                  if path.is_file() and not path.is_symlink()
+                  and path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                  and path.stat().st_size > 0)
+
+
+def _image_snapshot(result_dir: Path, images=None) -> dict:
+    """状態保存が途切れた旧ジョブも、残っている画像から表示・DLを復元する。"""
+    images = _completed_images(result_dir) if images is None else images
+    snapshot = load_json(result_dir / "images_progress.json", {})
+    items = snapshot.get("items") or load_json(result_dir / "manifest.json", {}).get("items") or []
+    if not items:
+        items = load_json(result_dir / "prompts.json", {}).get("items", [])
+    items = [dict(item) for item in items]
+    available = {path.name for path in images}
+    for item in items:
+        if item.get("filename") in available:
+            item["status"] = "ok"
+        elif item.get("status") == "ok" or item.get("success"):
+            item["status"] = "failed"
+    by_index = {item.get("index"): item for item in items}
+    known = {item.get("filename") for item in items}
+    for path in images:
+        if path.name in known:
+            continue
+        suffix = path.stem.rsplit("_", 1)[-1]
+        idx = int(suffix) if suffix.isdigit() else max(by_index, default=0) + 1
+        item = by_index.get(idx)
+        if item is None:
+            item = {"index": idx}
+            items.append(item)
+            by_index[idx] = item
+        item.update(filename=path.name, status="ok", success=True)
+    snapshot["items"] = sorted(items, key=lambda item: item.get("index", 0))
+    snapshot["available_images"] = len(images)
+    return snapshot
 
 
 def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
@@ -257,7 +300,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
         _set_job_state(
             job_id,
             status="completed",
-            phase=4,
+            phase=3,
             message=f"完了: 成功 {manifest['succeeded']} / {manifest['target_count']} 枚",
             percent=100,
             title=manifest.get("title", ""),
@@ -405,7 +448,7 @@ def api_status(job_id):
 @login_required
 def api_items(job_id):
     """画像の生成状況スナップショット"""
-    snapshot = load_json(OUTPUT_DIR / job_id / "images_progress.json", {"items": []})
+    snapshot = _image_snapshot(OUTPUT_DIR / job_id)
     return jsonify(snapshot)
 
 
@@ -444,35 +487,45 @@ def download_zip(job_id):
     if not result_dir.exists():
         return "結果が見つかりません", 404
 
+    images = _completed_images(result_dir)
+    if not images:
+        return "ダウンロードできる画像はまだありません。生成が終わるまでお待ちください。", 409
+
     manifest = load_json(result_dir / "manifest.json", {})
+    if not manifest:
+        snapshot = _image_snapshot(result_dir, images)
+        manifest = {
+            "title": load_json(result_dir / "analysis.json", {}).get("title", job_id),
+            "partial": True,
+            "succeeded": len(images),
+            "items": snapshot["items"],
+        }
     title = manifest.get("title", job_id)
     safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:50] or job_id
 
-    # ZIP メモリ作成
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        # 画像のみを zip に入れる
-        images_dir = result_dir / "images"
-        if images_dir.exists():
-            for img in sorted(images_dir.iterdir()):
-                if img.is_file() and img.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-                    zf.write(img, f"images/{img.name}")
-        # マニフェストも入れる
-        manifest_path = result_dir / "manifest.json"
-        if manifest_path.exists():
-            zf.write(manifest_path, "manifest.json")
-        # 原稿も入れる
-        ms_path = result_dir / "manuscript.txt"
-        if ms_path.exists():
-            zf.write(ms_path, "manuscript.txt")
+    # 画像は圧縮済みなので再圧縮せず、一時ファイルから配信してメモリ消費を抑える。
+    archive = tempfile.TemporaryFile(mode="w+b")
+    try:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
+            for img in images:
+                zf.write(img, f"images/{img.name}")
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2),
+                        compress_type=zipfile.ZIP_DEFLATED)
+            ms_path = result_dir / "manuscript.txt"
+            if ms_path.exists():
+                zf.write(ms_path, "manuscript.txt", compress_type=zipfile.ZIP_DEFLATED)
 
-    zip_buffer.seek(0)
-    return send_file(
-        zip_buffer,
-        mimetype="application/zip",
-        as_attachment=True,
-        download_name=f"{safe_title}_{job_id}.zip",
-    )
+        size = archive.tell()
+        archive.seek(0)
+        response = send_file(archive, mimetype="application/zip", as_attachment=True,
+                             download_name=f"{safe_title}_{job_id}.zip")
+        response.content_length = size
+        response.headers["Cache-Control"] = "no-store"
+        response.call_on_close(archive.close)
+        return response
+    except Exception:
+        archive.close()
+        raise
 
 
 if __name__ == "__main__":

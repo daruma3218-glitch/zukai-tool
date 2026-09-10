@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""メインパイプライン: 4 フェーズを順次実行
+"""メインパイプライン: 3 フェーズを順次実行
 
 Phase 1: 原稿分析 + 視覚化ポイント抽出（ASTRA CLI）
 Phase 2: 抜粋 → 英文プロンプト（ASTRA CLI、並列バッチ）
 Phase 3: 英文プロンプト → 画像（既存画像モデル、asyncio 並列）
-Phase 4: 完成画像と対応する抜粋の内容検査（ASTRA CLI）
 """
 
-import json
 import os
 import threading
 from datetime import datetime
@@ -17,11 +15,9 @@ from typing import Callable, Optional
 from utils import (
     get_anthropic_client,
     save_json,
-    load_json,
 )
 from extractor import analyze_manuscript, extract_visual_points
 from prompter import generate_all_prompts
-from verifier import verify_images
 from generator import (
     run_parallel_generation,
     DEFAULT_CONCURRENCY,
@@ -97,6 +93,12 @@ class DiagramPipeline:
         # ファイルにも進捗スナップショットを保存
         self._dump_progress_snapshot()
 
+        if info.get("status") in ("ok", "failed"):
+            with self._items_lock:
+                total = len(self._items)
+                finished = sum(item.get("status") in ("ok", "failed") for item in self._items.values())
+            self._progress(3, f"画像を生成中: {finished}/{total}枚処理済み", 50 + int(49 * finished / max(total, 1)))
+
         try:
             self.item_callback(info)
         except Exception:
@@ -105,19 +107,14 @@ class DiagramPipeline:
     def _dump_progress_snapshot(self):
         """images_progress.json に最新スナップショットを書き出す"""
         with self._items_lock:
-            items = list(self._items.values())
-        items.sort(key=lambda x: x.get("index", 0))
-        snapshot = {
-            "items": items,
-            "updated_at": datetime.now().isoformat(),
-        }
-        try:
-            (self.output_dir / "images_progress.json").write_text(
-                json.dumps(snapshot, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
+            snapshot = {
+                "items": sorted(self._items.values(), key=lambda x: x.get("index", 0)),
+                "updated_at": datetime.now().isoformat(),
+            }
+            try:
+                save_json(self.output_dir / "images_progress.json", snapshot)
+            except OSError as exc:
+                self._log("warn", "画像の進捗を保存できませんでした", str(exc))
 
     # ---- メインフロー ----
     def run(self) -> dict:
@@ -230,15 +227,6 @@ class DiagramPipeline:
             f"画像生成完了: 成功 {success_count} 枚 / 失敗 {fail_count} 枚",
         )
 
-        self._progress(4, "完成画像と原稿の抜粋を照合中...", 90)
-        def on_review(item, review):
-            item["content_review"] = review
-            self._on_item_event({**item, "status": "ok"})
-        content_review = verify_images(results, self.images_dir, job_id=self.output_dir.name, on_review=on_review)
-        save_json(self.output_dir / "content_review.json", content_review)
-        review_counts = content_review["counts"]
-        self._log("review", f"内容検査: 合格 {review_counts['pass']} / 要修正 {review_counts['needs_fix']} / 未確認 {review_counts['unverified']}")
-
         # マニフェスト保存
         manifest = {
             "title": title,
@@ -255,10 +243,9 @@ class DiagramPipeline:
             "succeeded": success_count,
             "failed": fail_count,
             "items": results,
-            "content_review": content_review,
             "completed_at": datetime.now().isoformat(),
         }
         save_json(self.output_dir / "manifest.json", manifest)
 
-        self._progress(4, f"完了: {success_count}/{len(prompts)}枚生成・内容の要修正 {review_counts['needs_fix']}枚／未確認 {review_counts['unverified']}枚", 100)
+        self._progress(3, f"完了: {success_count}/{len(prompts)}枚生成（失敗 {fail_count}枚）", 100)
         return manifest

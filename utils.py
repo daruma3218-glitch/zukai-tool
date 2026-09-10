@@ -9,6 +9,7 @@ except ImportError:
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -140,12 +141,18 @@ def parse_json_object(text: str) -> dict:
 
 
 def save_json(path: Path, data) -> None:
-    """JSON ファイルを保存（ディレクトリも作成）"""
+    """同じディレクトリで書き終えてから置換し、読取側に途中のJSONを見せない。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as temp:
+            temp_path = Path(temp.name)
+            json.dump(data, temp, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def load_json(path: Path, default=None):
