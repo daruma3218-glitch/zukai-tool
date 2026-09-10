@@ -221,7 +221,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          provider: str = PROVIDER_NANOBANANA,
                          openai_quality: str = "medium",
                          worldview_preset: str = "",
-                         no_text_mode: bool = False):
+                         no_text_mode: bool = False,
+                         content_review: bool = False):
     job_dir = OUTPUT_DIR / job_id
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
@@ -249,6 +250,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             concurrency=concurrency,
             provider=provider,
             openai_quality=openai_quality,
+            content_review=content_review,
             progress_callback=on_progress,
             log_callback=on_log,
             item_callback=on_item,
@@ -257,7 +259,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
         _set_job_state(
             job_id,
             status="completed",
-            phase=4,
+            phase=4 if content_review else 3,
             message=f"完了: 成功 {manifest['succeeded']} / {manifest['target_count']} 枚",
             percent=100,
             title=manifest.get("title", ""),
@@ -356,6 +358,8 @@ def start_job():
     user_instructions = request.form.get("user_instructions", "").strip()
     worldview_preset = request.form.get("worldview_preset", "").strip()
     no_text_mode = request.form.get("no_text_mode") == "on"
+    # 完成画像と原稿の照合（内容検査）。時間がかかるため既定はオフ（チェック時のみ実行）
+    content_review = request.form.get("content_review") == "on"
 
     # ジョブ作成
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -375,11 +379,13 @@ def start_job():
         concurrency=concurrency,
         provider=provider,
         openai_quality=openai_quality if provider == PROVIDER_GPT_IMAGE else None,
+        content_review=content_review,
+        phase_total=4 if content_review else 3,
     )
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset, no_text_mode),
+        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset, no_text_mode, content_review),
         daemon=True,
     )
     thread.start()

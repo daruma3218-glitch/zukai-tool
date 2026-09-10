@@ -67,3 +67,70 @@ def test_review_persists_to_progress_snapshot(tmp_path):
     pipe._on_item_event({'index':1,'status':'ok','content_review':review})
     saved=json.loads((tmp_path/'job/images_progress.json').read_text(encoding='utf-8'))
     assert saved['items'][0]['content_review']==review
+
+
+def _pipeline_fixture(tmp_path, **kw):
+    pipe = pipeline.DiagramPipeline('fixture', tmp_path / 'job', **kw)
+    results = [{'index': 1, 'filename': '1.png', 'success': True, 'excerpt': 'x', 'section': 's'}]
+    return pipe, results
+
+
+def test_content_review_is_off_by_default(tmp_path):
+    pipe, _ = _pipeline_fixture(tmp_path)
+    assert pipe.content_review is False
+
+
+def test_review_skipped_when_disabled_never_calls_verifier(tmp_path):
+    pipe, results = _pipeline_fixture(tmp_path, content_review=False)
+    with mock.patch.object(pipeline, 'verify_images') as verify:
+        assert pipe.content_review is False
+        # run() 内の分岐と同じ判定: オフなら verifier に触れない
+        review = pipe._run_content_review(results) if pipe.content_review else None
+    verify.assert_not_called()
+    assert review is None
+    assert not (tmp_path / 'job/content_review.json').exists()
+
+
+def test_review_runs_when_enabled(tmp_path):
+    pipe, results = _pipeline_fixture(tmp_path, content_review=True)
+    report = {'counts': {'pass': 1, 'needs_fix': 0, 'unverified': 0}, 'items': []}
+    with mock.patch.object(pipeline, 'verify_images', return_value=report) as verify:
+        review = pipe._run_content_review(results)
+    verify.assert_called_once()
+    assert review == report
+    assert (tmp_path / 'job/content_review.json').exists()
+
+
+def test_review_failure_does_not_abort_pipeline(tmp_path):
+    """照合が途中で落ちても例外を外に出さない（完了・DL を止めない）。"""
+    pipe, results = _pipeline_fixture(tmp_path, content_review=True)
+    logs = []
+    pipe.log_callback = lambda cat, msg, detail='': logs.append((cat, msg, detail))
+    with mock.patch.object(pipeline, 'verify_images', side_effect=RuntimeError('cli timeout')):
+        review = pipe._run_content_review(results)
+    assert review is None
+    assert any(cat == 'review' and '中断' in msg for cat, msg, _ in logs)
+
+
+def test_run_without_review_completes_at_phase3_and_writes_manifest(tmp_path, monkeypatch):
+    """既定（照合オフ）で run() が Phase 3 で 100% になり、verifier を呼ばずに manifest を書く。"""
+    monkeypatch.setenv('GEMINI_API_KEY', 'dummy')
+    progress = []
+    pipe = pipeline.DiagramPipeline(
+        'x' * 200, tmp_path / 'job', target_count=5,
+        progress_callback=lambda ph, msg, pct: progress.append((ph, pct)),
+    )
+    prompts = [{'index': 1, 'excerpt': 'e', 'section': 's', 'prompt': 'p'}]
+    results = [{'index': 1, 'filename': '1.png', 'success': True}]
+    with mock.patch.object(pipeline, 'get_anthropic_client', return_value=None), \
+         mock.patch.object(pipeline, 'analyze_manuscript', return_value={'title': 'T', 'sections': [], 'keywords': []}), \
+         mock.patch.object(pipeline, 'extract_visual_points', return_value=[{'index': 1, 'excerpt': 'e', 'section': 's'}]), \
+         mock.patch.object(pipeline, 'generate_all_prompts', return_value=prompts), \
+         mock.patch.object(pipeline, 'run_parallel_generation', return_value=results), \
+         mock.patch.object(pipeline, 'verify_images') as verify:
+        manifest = pipe.run()
+    verify.assert_not_called()
+    assert manifest['content_review'] is None
+    assert manifest['content_review_enabled'] is False
+    assert progress[-1] == (3, 100)
+    assert (tmp_path / 'job/manifest.json').exists()

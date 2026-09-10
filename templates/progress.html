@@ -75,7 +75,7 @@
       <div class="mb-4">
         <div class="flex items-center justify-between mb-2">
           <div class="flex gap-3 text-xs text-gray-500">
-            <span>Phase <span id="phaseNum" class="font-semibold text-gray-900">0</span>/3</span>
+            <span>Phase <span id="phaseNum" class="font-semibold text-gray-900">0</span>/<span id="phaseTotal">3</span></span>
             <span class="text-gray-300">|</span>
             <span class="font-semibold text-purple-600" id="overallPercent">0%</span>
           </div>
@@ -192,6 +192,7 @@
       jobMessage: document.getElementById('jobMessage'),
       statusBadge: document.getElementById('statusBadge'),
       phaseNum: document.getElementById('phaseNum'),
+      phaseTotal: document.getElementById('phaseTotal'),
       overallBar: document.getElementById('overallBar'),
       overallPercent: document.getElementById('overallPercent'),
       targetCountVal: document.getElementById('targetCountVal'),
@@ -231,9 +232,10 @@
       const section = escapeHtml(item.section || '');
       const keypoint = escapeHtml(item.keypoint || item.excerpt?.substring(0, 30) || `図 ${idx}`);
       const excerpt = escapeHtml(item.excerpt || '');
+      // 内容検査は任意機能。検査結果が無い画像にはラベルを出さない（既定オフのため）
       const review = item.content_review;
       const reviewLabels = { pass: '内容検査：合格', needs_fix: '内容検査：要修正', unverified: '内容検査：未確認' };
-      const reviewLabel = reviewLabels[review?.status] || '内容検査：未確認';
+      const reviewLabel = review ? (reviewLabels[review.status] || '内容検査：未確認') : '';
       const reviewClass = review?.status === 'pass' ? 'text-green-700' : 'text-amber-700';
 
       let inner = '';
@@ -246,7 +248,7 @@
           <div class="px-2 py-1.5 bg-white">
             <p class="text-[10px] text-gray-400 truncate">${section}</p>
             <p class="text-xs text-gray-800 truncate font-medium">${keypoint}</p>
-            <p class="text-[10px] ${reviewClass}">${reviewLabel}</p>
+            ${reviewLabel ? `<p class="text-[10px] ${reviewClass}">${reviewLabel}</p>` : ''}
             ${review?.reason ? `<p class="text-[10px] text-gray-600">${escapeHtml(review.reason)}</p>` : ''}
           </div>`;
       } else if (status === 'generating') {
@@ -355,6 +357,7 @@
         // ヘッダ更新
         els.jobMessage.textContent = state.message || '...';
         els.phaseNum.textContent = state.phase || 0;
+        els.phaseTotal.textContent = state.phase_total || (state.content_review ? 4 : 3);
         els.overallBar.style.width = `${state.percent || 0}%`;
         els.overallPercent.textContent = `${state.percent || 0}%`;
         if (state.target_count) els.targetCountVal.textContent = state.target_count;

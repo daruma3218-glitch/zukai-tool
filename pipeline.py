@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""メインパイプライン: 4 フェーズを順次実行
+"""メインパイプライン: 3 フェーズ（+ 任意の内容検査）を順次実行
 
 Phase 1: 原稿分析 + 視覚化ポイント抽出（ASTRA CLI）
 Phase 2: 抜粋 → 英文プロンプト（ASTRA CLI、並列バッチ）
 Phase 3: 英文プロンプト → 画像（既存画像モデル、asyncio 並列）
 Phase 4: 完成画像と対応する抜粋の内容検査（ASTRA CLI）
+         ※ content_review=True のときだけ実行（既定はオフ。時間がかかるため任意）
 """
 
 import json
@@ -45,6 +46,7 @@ class DiagramPipeline:
         concurrency: int = DEFAULT_CONCURRENCY,
         provider: str = PROVIDER_NANOBANANA,
         openai_quality: str = "medium",
+        content_review: bool = False,
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
         item_callback: Optional[Callable] = None,
@@ -58,6 +60,7 @@ class DiagramPipeline:
         self.concurrency = concurrency
         self.provider = provider if provider in VALID_PROVIDERS else PROVIDER_NANOBANANA
         self.openai_quality = openai_quality
+        self.content_review = bool(content_review)
         self.progress_callback = progress_callback or (lambda phase, msg, pct: None)
         self.log_callback = log_callback or (lambda *a, **kw: None)
         self.item_callback = item_callback or (lambda info: None)
@@ -230,14 +233,11 @@ class DiagramPipeline:
             f"画像生成完了: 成功 {success_count} 枚 / 失敗 {fail_count} 枚",
         )
 
-        self._progress(4, "完成画像と原稿の抜粋を照合中...", 90)
-        def on_review(item, review):
-            item["content_review"] = review
-            self._on_item_event({**item, "status": "ok"})
-        content_review = verify_images(results, self.images_dir, job_id=self.output_dir.name, on_review=on_review)
-        save_json(self.output_dir / "content_review.json", content_review)
-        review_counts = content_review["counts"]
-        self._log("review", f"内容検査: 合格 {review_counts['pass']} / 要修正 {review_counts['needs_fix']} / 未確認 {review_counts['unverified']}")
+        # Phase 4（任意）: 完成画像と原稿抜粋の内容検査
+        # 既定はオフ。オンでも検査の失敗で完了・ZIP ダウンロードを止めない。
+        content_review = None
+        if self.content_review:
+            content_review = self._run_content_review(results)
 
         # マニフェスト保存
         manifest = {
@@ -252,6 +252,7 @@ class DiagramPipeline:
             "concurrency": self.concurrency,
             "provider": self.provider,
             "openai_quality": self.openai_quality if self.provider == PROVIDER_GPT_IMAGE else None,
+            "content_review_enabled": self.content_review,
             "succeeded": success_count,
             "failed": fail_count,
             "items": results,
@@ -260,5 +261,34 @@ class DiagramPipeline:
         }
         save_json(self.output_dir / "manifest.json", manifest)
 
-        self._progress(4, f"完了: {success_count}/{len(prompts)}枚生成・内容の要修正 {review_counts['needs_fix']}枚／未確認 {review_counts['unverified']}枚", 100)
+        done_msg = f"完了: {success_count}/{len(prompts)}枚生成"
+        if content_review:
+            review_counts = content_review["counts"]
+            done_msg += f"・内容の要修正 {review_counts['needs_fix']}枚／未確認 {review_counts['unverified']}枚"
+            self._progress(4, done_msg, 100)
+        else:
+            self._progress(3, done_msg, 100)
         return manifest
+
+    def _run_content_review(self, results: list) -> Optional[dict]:
+        """Phase 4: 内容検査。失敗しても None を返すだけで、パイプライン全体は完了させる。"""
+        self._progress(4, "完成画像と原稿の抜粋を照合中...", 90)
+
+        def on_review(item, review):
+            item["content_review"] = review
+            self._on_item_event({**item, "status": "ok"})
+
+        try:
+            content_review = verify_images(
+                results, self.images_dir, job_id=self.output_dir.name, on_review=on_review,
+            )
+        except Exception as e:  # 検査は補助機能。画像は揃っているので完了を優先する
+            self._log("review", "内容検査を中断しました（画像は生成済みのためそのまま完了します）", str(e)[:300])
+            return None
+        save_json(self.output_dir / "content_review.json", content_review)
+        review_counts = content_review["counts"]
+        self._log(
+            "review",
+            f"内容検査: 合格 {review_counts['pass']} / 要修正 {review_counts['needs_fix']} / 未確認 {review_counts['unverified']}",
+        )
+        return content_review

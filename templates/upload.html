@@ -209,6 +209,20 @@
             </div>
           </div>
 
+          <!-- 内容検査（任意・既定オフ） -->
+          <div class="bg-white rounded-xl border border-gray-200 p-4">
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" name="content_review" class="mt-1 h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500">
+              <span>
+                <span class="block text-sm font-medium text-gray-700">完成画像と原稿の照合（内容検査）を行う</span>
+                <span class="block text-xs text-gray-400 mt-0.5">
+                  生成後に各画像を原稿の抜粋と照合し「合格 / 要修正 / 未確認」を付けます。
+                  数十分かかることがあるため既定はオフです。オフでも画像生成とZIPダウンロードには影響しません。
+                </span>
+              </span>
+            </label>
+          </div>
+
           <!-- パラメータ（生成枚数 + 並列度） -->
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div class="bg-white rounded-xl border border-gray-200 p-4">
