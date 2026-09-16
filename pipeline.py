@@ -41,6 +41,7 @@ class DiagramPipeline:
         concurrency: int = DEFAULT_CONCURRENCY,
         provider: str = PROVIDER_NANOBANANA,
         openai_quality: str = "medium",
+        openai_model: Optional[str] = None,
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
         item_callback: Optional[Callable] = None,
@@ -54,6 +55,7 @@ class DiagramPipeline:
         self.concurrency = concurrency
         self.provider = provider if provider in VALID_PROVIDERS else PROVIDER_NANOBANANA
         self.openai_quality = openai_quality
+        self.openai_model = (openai_model or "").strip() or None
         self.progress_callback = progress_callback or (lambda phase, msg, pct: None)
         self.log_callback = log_callback or (lambda *a, **kw: None)
         self.item_callback = item_callback or (lambda info: None)
@@ -215,6 +217,7 @@ class DiagramPipeline:
             gemini_api_key=gemini_key,
             openai_api_key=openai_key,
             openai_quality=self.openai_quality,
+            openai_model=self.openai_model,
             concurrency=self.concurrency,
             progress_callback=self._on_item_event,
         )
@@ -240,6 +243,7 @@ class DiagramPipeline:
             "concurrency": self.concurrency,
             "provider": self.provider,
             "openai_quality": self.openai_quality if self.provider == PROVIDER_GPT_IMAGE else None,
+            "openai_model": self.openai_model,
             "succeeded": success_count,
             "failed": fail_count,
             "items": results,

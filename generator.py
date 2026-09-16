@@ -29,6 +29,25 @@ from PIL import Image
 # ===== モデル設定 =====
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-image-preview"
 DEFAULT_OPENAI_MODEL = "gpt-image-2"
+# UI で選べる OpenAI 画像モデル（順序=表示順）。2026-09-08 公開の gpt-image-2.5 系を追加。
+OPENAI_IMAGE_MODEL_CHOICES = [
+    ("gpt-image-2", "gpt-image-2（標準）"),
+    ("gpt-image-2.5-flare", "gpt-image-2.5 Flare（高品質・低遅延）"),
+    ("gpt-image-2.5-sunburst", "gpt-image-2.5 Sunburst（編集制御向け・プレミアム）"),
+]
+VALID_OPENAI_IMAGE_MODELS = {m for m, _ in OPENAI_IMAGE_MODEL_CHOICES}
+
+
+def resolve_openai_image_model(*candidates) -> str:
+    """候補から最初の有効なモデルIDを返す。無ければ環境変数 OPENAI_IMAGE_MODEL → 既定。"""
+    for c in candidates:
+        c = (c or "").strip() if isinstance(c, str) else ""
+        if c in VALID_OPENAI_IMAGE_MODELS:
+            return c
+    env = os.environ.get("OPENAI_IMAGE_MODEL", "").strip()
+    return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_OPENAI_MODEL
+
+
 DEFAULT_CONCURRENCY = 12
 MAX_RETRIES = 3
 

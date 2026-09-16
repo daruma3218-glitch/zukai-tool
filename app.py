@@ -30,7 +30,8 @@ from flask import (
 
 from utils import load_env, load_json, save_json
 from pipeline import DiagramPipeline
-from generator import PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS
+from generator import (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS,
+                       OPENAI_IMAGE_MODEL_CHOICES, resolve_openai_image_model)
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -116,6 +117,7 @@ def version():
     return jsonify({
         "service": "zukai-tool",
         "git_commit": os.environ.get("RENDER_GIT_COMMIT", ""),
+        "openai_image_models": [m for m, _ in OPENAI_IMAGE_MODEL_CHOICES],
         "routing_version": subscription_runtime.ROUTING_VERSION,
         "editorial_models": {"selection": EXTRACTOR_MODEL, "design": PROMPTER_MODEL},
         "image_review_enabled": False,
@@ -264,7 +266,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          provider: str = PROVIDER_NANOBANANA,
                          openai_quality: str = "medium",
                          worldview_preset: str = "",
-                         no_text_mode: bool = False):
+                         no_text_mode: bool = False,
+                         openai_model: str = ""):
     job_dir = OUTPUT_DIR / job_id
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
@@ -292,6 +295,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             concurrency=concurrency,
             provider=provider,
             openai_quality=openai_quality,
+            openai_model=openai_model or None,
             progress_callback=on_progress,
             log_callback=on_log,
             item_callback=on_item,
@@ -340,6 +344,7 @@ def index():
             })
     resp = make_response(render_template(
         "upload.html",
+        openai_image_models=[{"id": m, "label": l} for m, l in OPENAI_IMAGE_MODEL_CHOICES],
         past_jobs=past_jobs[:30],
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
@@ -360,6 +365,7 @@ def start_job():
     openai_quality = request.form.get("openai_quality", "medium")
     if openai_quality not in ("low", "medium", "high"):
         openai_quality = "medium"
+    openai_model = resolve_openai_image_model(request.form.get("openai_model"))
 
     # API キー確認（プロバイダ別）
     missing = []
@@ -418,11 +424,12 @@ def start_job():
         concurrency=concurrency,
         provider=provider,
         openai_quality=openai_quality if provider == PROVIDER_GPT_IMAGE else None,
+        openai_model=openai_model if provider == PROVIDER_GPT_IMAGE else None,
     )
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset, no_text_mode),
+        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset, no_text_mode, openai_model),
         daemon=True,
     )
     thread.start()
