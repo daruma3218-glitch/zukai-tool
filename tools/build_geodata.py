@@ -10,6 +10,11 @@
 
 元データは nvkelso/natural-earth-vector の固定コミットのファイルで、SHA-256 を照合してから変換する。
 国ごと（ISO A3）に図形をまとめ、線を間引き（Douglas-Peucker）、座標は小数第3位（約100m）に丸める。
+
+日本の立場版では、さらに南樺太（北緯50度以南の樺太と付属の島）と千島列島（得撫島〜占守島）を
+ロシアから外し、「帰属未定」（XUN）として別に持つ（2026-09-24）。日本政府はこの地域の帰属を
+未定としており、教科書・地図帳もどの国の色も塗らない（1969年の文部省通達）。Natural Earth の
+日本の立場版はここをロシアに含めているため、ロシアを塗ると一緒に塗られてしまう。
 """
 import hashlib
 import json
@@ -26,6 +31,57 @@ SOURCES = {
                 "tolerance": 0.0, "label": "Natural Earth 1:50m Admin 0 Countries (de facto)"},
 }
 OUT = Path(__file__).resolve().parents[1] / "geodata" / "countries.json"
+
+UNDETERMINED = {"a3": "XUN", "ja": "帰属未定", "en": "Undetermined (South Sakhalin and the Kuril Islands)"}
+SAKHALIN_BOX = (141.0, 45.5, 145.5, 54.6)   # 樺太と付属の島（大陸の海岸は図形が大きいので入らない）
+SAKHALIN_BOUNDARY_LAT = 50.0                # 北緯50度以南が南樺太
+KURIL_BOX = (149.0, 45.3, 157.0, 51.0)      # 得撫島〜占守島（北方四島は日本、カムチャツカ本土は入らない）
+
+
+def _bbox(ring):
+    xs = [p[0] for p in ring]
+    ys = [p[1] for p in ring]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _within(bbox, box):
+    return bbox[0] >= box[0] and bbox[1] >= box[1] and bbox[2] <= box[2] and bbox[3] <= box[3]
+
+
+def clip_by_latitude(ring, lat, keep_south):
+    """緯線で輪を切り、南側（または北側）だけを返す（Sutherland-Hodgman）。残らなければ None。"""
+    points = ring[:-1] if ring and ring[0] == ring[-1] else list(ring)
+    inside = (lambda p: p[1] <= lat) if keep_south else (lambda p: p[1] >= lat)
+    out = []
+    for i, cur in enumerate(points):
+        prev = points[i - 1]
+        if inside(cur) != inside(prev):
+            t = (lat - prev[1]) / (cur[1] - prev[1])
+            out.append([prev[0] + t * (cur[0] - prev[0]), lat])
+        if inside(cur):
+            out.append(list(cur))
+    if len(out) < 3:
+        return None
+    return out + [out[0]]
+
+
+def split_undetermined(polys):
+    """ロシアの図形を (ロシアに残す, 帰属未定) に分ける。polys は [[外周, 穴...], ...]。"""
+    russia, undetermined = [], []
+    for poly in polys:
+        bbox = _bbox(poly[0])
+        if _within(bbox, KURIL_BOX):
+            undetermined.append(poly)
+        elif _within(bbox, SAKHALIN_BOX) and bbox[3] <= SAKHALIN_BOUNDARY_LAT:
+            undetermined.append(poly)
+        elif _within(bbox, SAKHALIN_BOX) and bbox[1] < SAKHALIN_BOUNDARY_LAT:
+            for keep_south, target in ((True, undetermined), (False, russia)):
+                rings = [clip_by_latitude(ring, SAKHALIN_BOUNDARY_LAT, keep_south) for ring in poly]
+                if rings[0]:
+                    target.append([rings[0]] + [r for r in rings[1:] if r])
+        else:
+            russia.append(poly)
+    return russia, undetermined
 
 
 def a3_of(props):
@@ -91,16 +147,20 @@ def main(argv):
         entry = countries.setdefault(a3, {"a3": a3, "ja": "", "en": "", "polys": [], "_best": -1.0})
         area = 0.0
         for poly in polys:
-            rings = [[[round(x, 3), round(y, 3)] for x, y in simplify(ring, source["tolerance"])] for ring in poly]
-            entry["polys"].append(rings)
-            points += sum(len(r) for r in rings)
+            entry["polys"].append([simplify(ring, source["tolerance"]) for ring in poly])
             area += ring_area(poly[0])
         if area > entry["_best"]:  # 同じ国コードの属領より本土の名前を使う
             entry.update(_best=area, ja=props.get("NAME_JA") or props.get("NAME") or a3,
                          en=props.get("NAME") or a3)
+    if kind == "jpn" and "RUS" in countries:
+        countries["RUS"]["polys"], undetermined = split_undetermined(countries["RUS"]["polys"])
+        countries["XUN"] = dict(UNDETERMINED, polys=undetermined, undetermined=True, _best=0.0)
     features = []
     for entry in countries.values():
         entry.pop("_best")
+        entry["polys"] = [[[[round(x, 3), round(y, 3)] for x, y, *_ in ring] for ring in poly]
+                          for poly in entry["polys"]]
+        points += sum(len(ring) for poly in entry["polys"] for ring in poly)
         features.append(entry)
     features.sort(key=lambda e: e["a3"])
     OUT.parent.mkdir(parents=True, exist_ok=True)

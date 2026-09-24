@@ -181,3 +181,37 @@ def test_arrow_with_unknown_end_is_skipped():
 def test_renderer_can_be_disabled(monkeypatch, value):
     monkeypatch.setenv("ZUKAI_MAP_RENDERER", value)
     assert m.enabled() is False
+
+
+# ===== 南樺太・千島列島は「帰属未定」（日本政府の立場・教科書の地図と同じく、どの国の色も塗らない） =====
+def _owner(lon, lat):
+    owners = [a3 for a3, c in m.load_countries().items() if any(m._inside(lon, lat, p[0]) for p in c["polys"])]
+    return owners
+
+
+def test_south_sakhalin_and_kurils_are_undetermined_not_russia():
+    assert _owner(142.6, 47.5) == ["XUN"]      # 南樺太（北緯50度以南）
+    assert _owner(142.8, 52.0) == ["RUS"]      # 北樺太はロシア
+    countries = m.load_countries()
+    kurils = [b for b in countries["XUN"]["bboxes"] if b[0] >= 149.0]
+    assert len(kurils) >= 10                    # 得撫島〜占守島
+    assert not [b for b in countries["RUS"]["bboxes"]
+                if b[0] >= 149.0 and b[2] <= 157.0 and b[1] >= 45.3 and b[3] <= 51.0]
+    assert _owner(147.86, 44.97) == ["JPN"] or _owner(147.9, 45.05) == ["JPN"]  # 択捉島は日本のまま
+    assert countries["XUN"]["undetermined"] is True
+
+
+def test_highlighting_russia_leaves_south_sakhalin_unpainted():
+    image, info = render({"focus": ["JPN"], "highlight": [{"a3": "RUS", "tone": "main"}, {"a3": "JPN", "tone": "warn"}],
+                          "pins": [{"name": "札幌", "country": "JPN", "lon": 141.35, "lat": 43.06},
+                                   {"name": "ユジノサハリンスク", "country": "RUS", "lon": 142.74, "lat": 46.96},
+                                   {"name": "オハ", "country": "RUS", "lon": 142.95, "lat": 53.58}]},
+                         "札幌とユジノサハリンスクとオハ", no_text=True)
+    assert info["pins"] == ["札幌", "ユジノサハリンスク", "オハ"]  # 帰属未定の地名もロシア指定のまま描ける
+    assert near(pixel_at(image, info, 142.6, 47.5), m.LAND)             # 南樺太は塗らない
+    assert near(pixel_at(image, info, 142.8, 52.0), m.TONES["main"])    # 北樺太はロシアの色
+    assert near(pixel_at(image, info, 142.9, 43.5), m.TONES["warn"])    # 北海道は日本の色
+
+
+def test_undetermined_area_is_not_picked_from_text():
+    assert "XUN" not in m.countries_in_text("帰属未定の南樺太と千島列島、ロシア", m.load_countries())

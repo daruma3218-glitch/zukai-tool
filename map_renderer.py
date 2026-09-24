@@ -56,6 +56,7 @@ SHORT_NAMES = {"CHN": "中国", "KOR": "韓国", "PRK": "北朝鮮", "TWN": "台
                "CYN": "北キプロス"}
 MAX_FOCUS, MAX_HIGHLIGHT, MAX_PINS, MAX_ARROWS = 8, 12, 6, 4
 PIN_TOLERANCE_DEG = 0.6
+UNDETERMINED_A3 = "XUN"  # 南樺太・千島列島（日本政府の立場では帰属未定。どの国の色も塗らない）
 
 
 def enabled() -> bool:
@@ -125,6 +126,7 @@ def load_countries() -> dict:
             "areas": areas,
             "main_area": areas[main_index],
             "label": _label_point(polys[main_index]),
+            "undetermined": bool(feature.get("undetermined")),
         }
     return countries
 
@@ -241,6 +243,8 @@ def countries_in_text(text: str, countries: dict) -> list:
     """文中の国名（短い名前・正式名）を、長い名前を優先して出てきた順に拾う。"""
     names = []
     for country in countries.values():
+        if country.get("undetermined"):
+            continue  # 帰属未定の地域は国ではないので、文中の語から選ばない
         for name in {country["ja"], country["ja_formal"]}:
             if len(name) >= 2:
                 names.append((name, country["a3"]))
@@ -263,11 +267,7 @@ def countries_in_text(text: str, countries: dict) -> list:
     return ordered
 
 
-def _pin_is_plausible(pin: dict, countries: dict) -> bool:
-    country = countries.get(pin.get("country") or "")
-    if not country:
-        return True  # 国の指定が無いピンは、画面内にあるかだけを後で確かめる
-    lon, lat = pin["lon"], pin["lat"]
+def _near_country(lon: float, lat: float, country: dict) -> bool:
     for poly, bbox in zip(country["polys"], country["bboxes"]):
         x0, y0, x1, y1 = bbox
         if not (x0 - PIN_TOLERANCE_DEG <= lon <= x1 + PIN_TOLERANCE_DEG
@@ -278,6 +278,19 @@ def _pin_is_plausible(pin: dict, countries: dict) -> bool:
         if any(abs(px - lon) <= PIN_TOLERANCE_DEG and abs(py - lat) <= PIN_TOLERANCE_DEG for px, py in poly[0]):
             return True
     return False
+
+
+def _pin_is_plausible(pin: dict, countries: dict) -> bool:
+    code = pin.get("country") or ""
+    country = countries.get(code)
+    if not country:
+        return True  # 国の指定が無いピンは、画面内にあるかだけを後で確かめる
+    lon, lat = pin["lon"], pin["lat"]
+    if _near_country(lon, lat, country):
+        return True
+    # 南樺太・千島列島（帰属未定）の地名は、ロシアや日本として指定されていても位置は正しい
+    undetermined = countries.get(UNDETERMINED_A3)
+    return code in ("RUS", "JPN") and bool(undetermined) and _near_country(lon, lat, undetermined)
 
 
 def normalize_spec(spec, excerpt: str = "", allowed_terms=None) -> tuple:
