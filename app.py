@@ -392,6 +392,7 @@ def index():
     resp = make_response(render_template(
         "upload.html",
         openai_image_models=[{"id": m, "label": l} for m, l in OPENAI_IMAGE_MODEL_CHOICES],
+        default_openai_model=resolve_openai_image_model(),
         past_jobs=past_jobs[:30],
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),

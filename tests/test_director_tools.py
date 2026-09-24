@@ -312,3 +312,14 @@ def test_version_reports_director_tools(client):
     version = client.get("/version").json
     assert version["director_tools"]["adoption"] is True
     assert version["edit_image_model"] == "gpt-image-2.5-sunburst"
+
+
+@pytest.mark.parametrize("env, expected", [(None, "gpt-image-2.5-flare"), ("gpt-image-2", "gpt-image-2")])
+def test_upload_form_preselects_the_default_image_model(client, monkeypatch, env, expected):
+    # 画面の初期選択も環境変数 OPENAI_IMAGE_MODEL に従う（従来モデルへ戻す切替が画面にも効く）
+    if env:
+        monkeypatch.setenv("OPENAI_IMAGE_MODEL", env)
+    else:
+        monkeypatch.delenv("OPENAI_IMAGE_MODEL", raising=False)
+    html = client.get("/").get_data(as_text=True)
+    assert f'<option value="{expected}" selected>' in html
