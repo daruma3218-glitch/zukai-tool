@@ -560,11 +560,16 @@ def resolve_route(request, provider):
 
 def _desktop_claude_cli():
     """Claude Desktop 同梱の claude.exe(2.1.251+ で claude-fable-5-1 等の完全IDが使える)。無ければ None"""
+    # 2026-09-24: MSIX 版 Desktop が自動更新する CLI の実体は %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code。
+    # パッケージ内のプロセスには %APPDATA%\Claude\claude-code として見えるが、タスクスケジューラ起動の常駐(subsk-worker 等)には見えず、
+    # npm 版が知らない完全なモデルID(claude-opus-5-5)の再実行が空振りした → 両方を探し、版番号が最大のものを使う。
     try:
         import glob
-        base=Path(os.environ.get("APPDATA",str(Path.home()/"AppData"/"Roaming")))/"Claude"/"claude-code"
-        cands=sorted(glob.glob(str(base/"*"/"claude.exe")),key=lambda p:[int(x) for x in re.findall(r"\d+",Path(p).parent.name)])
-        return cands[-1] if cands else None
+        roaming=Path(os.environ.get("APPDATA") or str(Path.home()/"AppData"/"Roaming"))
+        local=Path(os.environ.get("LOCALAPPDATA") or str(Path.home()/"AppData"/"Local"))
+        cands=glob.glob(str(roaming/"Claude"/"claude-code"/"*"/"claude.exe"))
+        cands+=glob.glob(str(local/"Packages"/"Claude_*"/"LocalCache"/"Roaming"/"Claude"/"claude-code"/"*"/"claude.exe"))
+        return max(cands,key=lambda p:[int(x) for x in re.findall(r"\d+",Path(p).parent.name)]) if cands else None
     except Exception:
         return None
 
