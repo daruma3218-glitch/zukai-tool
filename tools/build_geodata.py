@@ -12,7 +12,8 @@
 国ごと（ISO A3）に図形をまとめ、線を間引き（Douglas-Peucker）、座標は小数第3位（約100m）に丸める。
 
 日本の立場版では、さらに南樺太（北緯50度以南の樺太と付属の島）と千島列島（得撫島〜占守島）を
-ロシアから外し、「帰属未定」（XUN）として別に持つ（2026-09-24）。日本政府はこの地域の帰属を
+ロシアから外し、「帰属未定」として別に持つ（2026-09-24）。南樺太は XSS、千島列島は XKR と分け、
+話に合わせて片方だけを強調できるようにする（日露戦争で割譲されたのは南樺太だけ、など）。日本政府はこの地域の帰属を
 未定としており、教科書・地図帳もどの国の色も塗らない（1969年の文部省通達）。Natural Earth の
 日本の立場版はここをロシアに含めているため、ロシアを塗ると一緒に塗られてしまう。
 """
@@ -32,7 +33,10 @@ SOURCES = {
 }
 OUT = Path(__file__).resolve().parents[1] / "geodata" / "countries.json"
 
-UNDETERMINED = {"a3": "XUN", "ja": "帰属未定", "en": "Undetermined (South Sakhalin and the Kuril Islands)"}
+UNDETERMINED = {
+    "XSS": {"a3": "XSS", "ja": "南樺太", "en": "South Sakhalin (undetermined)"},
+    "XKR": {"a3": "XKR", "ja": "千島列島", "en": "Kuril Islands, Urup to Shumshu (undetermined)"},
+}
 SAKHALIN_BOX = (141.0, 45.5, 145.5, 54.6)   # 樺太と付属の島（大陸の海岸は図形が大きいので入らない）
 SAKHALIN_BOUNDARY_LAT = 50.0                # 北緯50度以南が南樺太
 KURIL_BOX = (149.0, 45.3, 157.0, 51.0)      # 得撫島〜占守島（北方四島は日本、カムチャツカ本土は入らない）
@@ -66,22 +70,22 @@ def clip_by_latitude(ring, lat, keep_south):
 
 
 def split_undetermined(polys):
-    """ロシアの図形を (ロシアに残す, 帰属未定) に分ける。polys は [[外周, 穴...], ...]。"""
-    russia, undetermined = [], []
+    """ロシアの図形を (ロシアに残す, 南樺太, 千島列島) に分ける。polys は [[外周, 穴...], ...]。"""
+    russia, south_sakhalin, kurils = [], [], []
     for poly in polys:
         bbox = _bbox(poly[0])
         if _within(bbox, KURIL_BOX):
-            undetermined.append(poly)
+            kurils.append(poly)
         elif _within(bbox, SAKHALIN_BOX) and bbox[3] <= SAKHALIN_BOUNDARY_LAT:
-            undetermined.append(poly)
+            south_sakhalin.append(poly)
         elif _within(bbox, SAKHALIN_BOX) and bbox[1] < SAKHALIN_BOUNDARY_LAT:
-            for keep_south, target in ((True, undetermined), (False, russia)):
+            for keep_south, target in ((True, south_sakhalin), (False, russia)):
                 rings = [clip_by_latitude(ring, SAKHALIN_BOUNDARY_LAT, keep_south) for ring in poly]
                 if rings[0]:
                     target.append([rings[0]] + [r for r in rings[1:] if r])
         else:
             russia.append(poly)
-    return russia, undetermined
+    return russia, south_sakhalin, kurils
 
 
 def a3_of(props):
@@ -153,8 +157,9 @@ def main(argv):
             entry.update(_best=area, ja=props.get("NAME_JA") or props.get("NAME") or a3,
                          en=props.get("NAME") or a3)
     if kind == "jpn" and "RUS" in countries:
-        countries["RUS"]["polys"], undetermined = split_undetermined(countries["RUS"]["polys"])
-        countries["XUN"] = dict(UNDETERMINED, polys=undetermined, undetermined=True, _best=0.0)
+        countries["RUS"]["polys"], south_sakhalin, kurils = split_undetermined(countries["RUS"]["polys"])
+        for code, polys in (("XSS", south_sakhalin), ("XKR", kurils)):
+            countries[code] = dict(UNDETERMINED[code], polys=polys, undetermined=True, _best=0.0)
     features = []
     for entry in countries.values():
         entry.pop("_best")

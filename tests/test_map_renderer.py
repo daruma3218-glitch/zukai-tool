@@ -190,15 +190,16 @@ def _owner(lon, lat):
 
 
 def test_south_sakhalin_and_kurils_are_undetermined_not_russia():
-    assert _owner(142.6, 47.5) == ["XUN"]      # 南樺太（北緯50度以南）
+    assert _owner(142.6, 47.5) == ["XSS"]      # 南樺太（北緯50度以南）
     assert _owner(142.8, 52.0) == ["RUS"]      # 北樺太はロシア
     countries = m.load_countries()
-    kurils = [b for b in countries["XUN"]["bboxes"] if b[0] >= 149.0]
-    assert len(kurils) >= 10                    # 得撫島〜占守島
+    assert len(countries["XKR"]["polys"]) >= 10  # 千島列島（得撫島〜占守島）
+    assert all(b[0] >= 149.0 for b in countries["XKR"]["bboxes"])
     assert not [b for b in countries["RUS"]["bboxes"]
                 if b[0] >= 149.0 and b[2] <= 157.0 and b[1] >= 45.3 and b[3] <= 51.0]
     assert _owner(147.86, 44.97) == ["JPN"] or _owner(147.9, 45.05) == ["JPN"]  # 択捉島は日本のまま
-    assert countries["XUN"]["undetermined"] is True
+    assert countries["XSS"]["undetermined"] is True and countries["XKR"]["undetermined"] is True
+    assert (countries["XSS"]["ja"], countries["XKR"]["ja"]) == ("南樺太", "千島列島")
 
 
 def test_highlighting_russia_leaves_south_sakhalin_unpainted():
@@ -213,5 +214,43 @@ def test_highlighting_russia_leaves_south_sakhalin_unpainted():
     assert near(pixel_at(image, info, 142.9, 43.5), m.TONES["warn"])    # 北海道は日本の色
 
 
-def test_undetermined_area_is_not_picked_from_text():
-    assert "XUN" not in m.countries_in_text("帰属未定の南樺太と千島列島、ロシア", m.load_countries())
+def test_south_sakhalin_can_be_highlighted_without_the_kurils():
+    # 日露戦争で割譲されたのは南樺太だけ。南樺太を強調しても千島列島は塗らない
+    image, info = render({"focus": ["JPN"], "highlight": [{"a3": "XSS", "tone": "attention"}],
+                          "pins": [{"name": "南樺太", "country": "RUS", "lon": 142.7, "lat": 47.0},
+                                   {"name": "旅順", "country": "CHN", "lon": 121.26, "lat": 38.81}]},
+                         "旅順と南樺太", no_text=True)
+    assert info["pins"] == ["旅順"]  # 「南樺太」のピンは国名ラベルにまとめ、南樺太は画面に収める
+    sakhalin = max(m.load_countries()["XSS"]["polys"], key=lambda poly: m._ring_area(poly[0]))
+    assert near(pixel_at(image, info, *m._label_point(sakhalin)), m.TONES["attention"])
+    urup = max(m.load_countries()["XKR"]["polys"], key=lambda poly: m._ring_area(poly[0]))
+    lon, lat = m._label_point(urup)
+    assert near(pixel_at(image, info, lon, lat), m.LAND, tol=40)
+
+
+def test_sea_route_without_countries_is_drawn_from_pins():
+    # 「黒海から地中海へ」のように国名が無い箇所も、海のピンと矢印で地図にする
+    image, info = render({"pins": [{"name": "黒海", "lon": 34.0, "lat": 43.3},
+                                    {"name": "地中海", "lon": 18.0, "lat": 35.0}],
+                          "arrows": [{"from": "黒海", "to": "地中海", "tone": "main"}]},
+                         "再び黒海から地中海へ抜けるルート")
+    assert info["pins"] == ["黒海", "地中海"]
+    lon0, lon1 = info["view"]["lon"]
+    assert lon0 < 18.0 and lon1 > 34.0
+
+
+def test_pin_named_like_a_highlighted_country_is_merged_into_its_label():
+    spec, notes = m.normalize_spec({"highlight": [{"a3": "RUS", "tone": "main"}],
+                                    "pins": [{"name": "ロシア", "lon": 37.6, "lat": 55.7},
+                                             {"name": "バルカン半島", "lon": 21.0, "lat": 42.5}],
+                                    "arrows": [{"from": "ロシア", "to": "バルカン半島"}]},
+                                   "ロシアがバルカン半島へ")
+    assert [p["name"] for p in spec["pins"]] == ["バルカン半島"]
+    assert spec["arrows"] == [{"from": "RUS", "to": "バルカン半島", "tone": "warn"}]
+    assert any("国名ラベルにまとめました" in n for n in notes)
+
+
+def test_undetermined_areas_are_found_by_their_names_only():
+    found = m.countries_in_text("帰属未定の南樺太と、ロシア", m.load_countries())
+    assert found == ["XSS", "RUS"]
+    assert m.countries_in_text("帰属未定", m.load_countries()) == []

@@ -56,7 +56,7 @@ SHORT_NAMES = {"CHN": "中国", "KOR": "韓国", "PRK": "北朝鮮", "TWN": "台
                "CYN": "北キプロス"}
 MAX_FOCUS, MAX_HIGHLIGHT, MAX_PINS, MAX_ARROWS = 8, 12, 6, 4
 PIN_TOLERANCE_DEG = 0.6
-UNDETERMINED_A3 = "XUN"  # 南樺太・千島列島（日本政府の立場では帰属未定。どの国の色も塗らない）
+UNDETERMINED_CODES = ("XSS", "XKR")  # 南樺太・千島列島（日本政府の立場では帰属未定。どの国の色も塗らない）
 
 
 def enabled() -> bool:
@@ -243,8 +243,6 @@ def countries_in_text(text: str, countries: dict) -> list:
     """文中の国名（短い名前・正式名）を、長い名前を優先して出てきた順に拾う。"""
     names = []
     for country in countries.values():
-        if country.get("undetermined"):
-            continue  # 帰属未定の地域は国ではないので、文中の語から選ばない
         for name in {country["ja"], country["ja_formal"]}:
             if len(name) >= 2:
                 names.append((name, country["a3"]))
@@ -289,8 +287,8 @@ def _pin_is_plausible(pin: dict, countries: dict) -> bool:
     if _near_country(lon, lat, country):
         return True
     # 南樺太・千島列島（帰属未定）の地名は、ロシアや日本として指定されていても位置は正しい
-    undetermined = countries.get(UNDETERMINED_A3)
-    return code in ("RUS", "JPN") and bool(undetermined) and _near_country(lon, lat, undetermined)
+    return code in ("RUS", "JPN") and any(
+        countries.get(u) and _near_country(lon, lat, countries[u]) for u in UNDETERMINED_CODES)
 
 
 def normalize_spec(spec, excerpt: str = "", allowed_terms=None) -> tuple:
@@ -351,11 +349,18 @@ def normalize_spec(spec, excerpt: str = "", allowed_terms=None) -> tuple:
         elif code in countries:
             notes.append(f"国名の置き換え「{label}」は抜粋に無いため使いません")
 
+    # 強調した国と同じ名前のピン（例: ロシア）は国名ラベルと重なるので描かず、矢印はその国を指す
+    label_to_a3 = {overrides.get(h["a3"], countries[h["a3"]]["ja"]): h["a3"] for h in highlight}
     pins = []
     for pin in spec.get("pins") if isinstance(spec.get("pins"), list) else []:
         if not isinstance(pin, dict):
             continue
         name = str(pin.get("name", "")).strip()
+        if name and name in label_to_a3:
+            notes.append(f"ピン「{name}」は強調した国の名前と同じため、国名ラベルにまとめました")
+            if label_to_a3[name] not in focus and len(focus) < MAX_FOCUS:
+                focus.append(label_to_a3[name])  # ピンの代わりに、その国を画面に収める
+            continue
         lon, lat = pin.get("lon"), pin.get("lat")
         if not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)) \
                 or not (-180 <= lon <= 180 and LAT_MIN <= lat <= LAT_MAX):
@@ -379,7 +384,8 @@ def normalize_spec(spec, excerpt: str = "", allowed_terms=None) -> tuple:
         ends = []
         for key in ("from", "to"):
             value = str(arrow.get(key, "")).strip()
-            ends.append(value.upper() if value.upper() in countries else value if value in pin_names else None)
+            ends.append(value.upper() if value.upper() in countries else label_to_a3[value] if value in label_to_a3
+                        else value if value in pin_names else None)
         if None in ends or ends[0] == ends[1]:
             notes.append(f"矢印 {arrow.get('from')}→{arrow.get('to')} は始点か終点が不明なため描きません")
             continue
@@ -470,8 +476,8 @@ def render_map(spec, excerpt: str = "", allowed_terms=None, no_text: bool = Fals
     """map_spec から地図画像を作る。戻り値 (Image か None, info)。"""
     countries = load_countries()
     spec, notes = normalize_spec(spec, excerpt, allowed_terms)
-    if not spec["focus"] and not spec["bbox"]:
-        return None, {"notes": notes + ["地図にする国を決められませんでした（抜粋に国名がありません）"]}
+    if not spec["focus"] and not spec["bbox"] and not spec["pins"]:
+        return None, {"notes": notes + ["地図にする国を決められませんでした（抜粋に国名も地名のピンもありません）"]}
 
     if spec["bbox"]:
         lon0, lat0, lon1, lat1 = spec["bbox"]
