@@ -107,9 +107,31 @@ def _update(job_dir: Path, name: str, default, change):
         return result
 
 
+STALE_RUNNING_MINUTES = 15
+
+
+def _mark_stale(edits: list) -> bool:
+    """サーバーの再起動などで止まった手直しを「中断」にする（同時実行の枠を空けるため）。"""
+    changed = False
+    now = datetime.now()
+    for entry in edits:
+        if entry.get("status") != "running":
+            continue
+        try:
+            started = datetime.fromisoformat(entry.get("created_at", ""))
+        except ValueError:
+            started = now
+        if (now - started).total_seconds() > STALE_RUNNING_MINUTES * 60:
+            entry.update(status="failed", error="中断（サーバーの再起動などで止まりました。もう一度お試しください）")
+            changed = True
+    return changed
+
+
 def load_edits(job_dir: Path) -> list:
     data = _read(Path(job_dir) / EDITS_NAME, {"version": 1, "edits": []})
-    return data.get("edits", []) if isinstance(data, dict) else []
+    edits = data.get("edits", []) if isinstance(data, dict) else []
+    _mark_stale(edits)  # 表示用。ファイルへの書き戻しは次の更新時に行う
+    return edits
 
 
 def load_adoption(job_dir: Path) -> dict:
@@ -167,6 +189,7 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
 
     def reserve(data):
         edits = data.setdefault("edits", [])
+        _mark_stale(edits)
         running = [e for e in edits if e.get("status") == "running"]
         for e in running:  # 同じ依頼の二重送信は、進行中の1件を返して重複させない
             if e.get("source") == source and e.get("action") == action and e.get("instruction") == instruction:

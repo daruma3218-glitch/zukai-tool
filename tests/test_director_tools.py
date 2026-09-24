@@ -222,6 +222,19 @@ def test_duplicate_running_request_is_not_charged_twice(tmp_path, monkeypatch):
         image_edit.request_edit(root, "diagram_003.png", "remove_text")
 
 
+def test_edit_stuck_by_restart_is_released(tmp_path, monkeypatch):
+    root = job_with_images(tmp_path, "diagram_004.png")
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-only")
+    old = "2026-01-01T00:00:00"
+    utils.save_json(root / "edits.json", {"version": 1, "edits": [
+        {"id": f"s{n}", "source": "diagram_004.png", "output": f"diagram_004__e{n}.png", "action": "instruct",
+         "instruction": f"x{n}", "status": "running", "created_at": old} for n in (1, 2, 3)]})
+    assert all(e["status"] == "failed" and "中断" in e["error"] for e in image_edit.load_edits(root))
+    monkeypatch.setattr(image_edit.threading, "Thread", lambda **kw: mock.Mock())
+    entry = image_edit.request_edit(root, "diagram_004.png", "remove_text")  # 枠が空いて受け付けられる
+    assert entry["status"] == "running" and entry["output"] == "diagram_004__e4.png"
+
+
 @pytest.mark.parametrize("body", [{"source": "../job.json", "action": "flip"},
                                   {"source": "diagram_001.png", "action": "delete"},
                                   {"source": "diagram_001.png", "action": "instruct", "instruction": ""},
