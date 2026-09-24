@@ -67,6 +67,16 @@ def test_pin_outside_its_country_is_dropped_and_inside_pin_is_drawn():
     assert any("東京" in note and "範囲外" in note for note in info["notes"])
 
 
+def test_pins_frame_the_story_region_instead_of_all_of_russia():
+    _image, info = render({"focus": ["RUS"], "highlight": [{"a3": "RUS", "tone": "main"}],
+                           "pins": [{"name": "旅順", "country": "CHN", "lon": 121.26, "lat": 38.81},
+                                    {"name": "南樺太", "country": "RUS", "lon": 142.7, "lat": 47.0}]},
+                          "旅順と南樺太", no_text=True)
+    lon0, lon1 = info["view"]["lon"]
+    assert 100 < lon0 < 121.26 and 142.7 < lon1 < 170  # 北東アジアの範囲（ロシア全体ではない）
+    assert info["pins"] == ["旅順", "南樺太"]
+
+
 def test_coastal_pin_just_off_the_polygon_is_kept():
     # 旅順は海岸線ぎわ。多少のずれは許容して描く。
     _image, info = render({"focus": ["CHN"], "pins": [{"name": "旅順", "country": "CHN",
