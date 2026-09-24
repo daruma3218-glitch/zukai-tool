@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""図解つくーる - Flask Web アプリケーション
+"""図解スタジオ（旧 図解つくーる） - Flask Web アプリケーション
 
 シンプルな1機能アプリ:
   原稿アップロード → N 枚の図解画像を並列生成 → ZIP ダウンロード
@@ -620,7 +620,7 @@ director_routes.register(app, login_required, lambda: OUTPUT_DIR,
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3001))
     print("\n" + "=" * 50)
-    print("  図解つくーる 起動中...")
+    print("  図解スタジオ 起動中...")
     print(f"  http://localhost:{port}")
     print("=" * 50 + "\n")
     app.run(host="0.0.0.0", port=port, debug=False)
