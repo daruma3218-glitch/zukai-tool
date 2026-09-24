@@ -101,6 +101,8 @@ MAP_SPEC_BLOCK = """
 }
 - focus: 画面に収める国（ISO 3166-1 alpha-3、1〜8か国）。highlight: 強調する国と色
   （tone は main / compare / neutral / warn / attention）。
+- 話の舞台が大国の一部（極東、黒海沿岸など）の時は、その大国を focus に入れず highlight だけにし、
+  舞台の地点を pins で示す（画面は pins と周辺の国に合わせて決まる）。
 - label_overrides: 国名を抜粋にある呼び方（例: 清、ソ連）に置き換える時だけ。抜粋に実在する語のみ。
 - pins: 都市・地点（最大6）。name は抜粋に実在する語のみ。座標に確信がない地点は入れない。
 - arrows: 国コードか pins の name を結ぶ（最大4）。

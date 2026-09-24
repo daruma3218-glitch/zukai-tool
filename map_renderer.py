@@ -193,26 +193,39 @@ class View:
                 "lat": [round(self.lat0, 2), round(self.lat1, 2)]}
 
 
-def _make_view(bounds, frame, width, height) -> "View":
+def _make_view(bounds, frame, width, height, min_lon=6.0, min_lat=4.0) -> "View":
     lon0, lat0, lon1, lat1 = bounds
-    span_lon = max(lon1 - lon0, 6.0)
-    span_lat = max(lat1 - lat0, 4.0)
+    span_lon = max(lon1 - lon0, min_lon)
+    span_lat = max(lat1 - lat0, min_lat)
     cx, cy = (lon0 + lon1) / 2, (lat0 + lat1) / 2
     lon0, lon1 = cx - span_lon * 0.6, cx + span_lon * 0.6
     lat0, lat1 = max(cy - span_lat * 0.62, LAT_MIN), min(cy + span_lat * 0.62, LAT_MAX)
     return View(lon0, lon1, lat0, lat1, frame, width, height)
 
 
-def choose_view(a3_list, countries, width=WIDTH, height=HEIGHT) -> "View":
-    """強調国が収まる範囲。経度180度をまたぐ国（ロシアなど）は太平洋中心の図にする。"""
+GIANT_SPAN_DEG = 30.0  # これより大きい国（ロシア・中国など）は、ピンがある時は範囲決めに使わない
+
+
+def choose_view(a3_list, countries, width=WIDTH, height=HEIGHT, pins=None) -> "View":
+    """強調国が収まる範囲。経度180度をまたぐ国（ロシアなど）は太平洋中心の図にする。
+
+    ピン（話の舞台）がある時は、ロシアのような大国の全体ではなく、ピンと小さめの国が収まる範囲にする
+    （極東の話なら北東アジア、黒海の話なら黒海周辺）。大国はその範囲の中で強調して見せる。
+    """
+    points = [(p["lon"], p["lat"]) for p in pins or []]
     best = None
     for frame in ("atlantic", "pacific"):
         extents = [_country_extent(countries[a3], frame) for a3 in a3_list]
+        if points:
+            extents = [e for e in extents if e[2] - e[0] <= GIANT_SPAN_DEG and e[3] - e[1] <= GIANT_SPAN_DEG]
+            extents += [(lon + 360 if frame == "pacific" and lon < 0 else lon, lat) * 2 for lon, lat in points]
         bounds = (min(e[0] for e in extents), min(e[1] for e in extents),
                   max(e[2] for e in extents), max(e[3] for e in extents))
         span = bounds[2] - bounds[0]
         if best is None or span < best[0] - 1e-6:
             best = (span, frame, bounds)
+    if points:
+        return _make_view(best[2], best[1], width, height, min_lon=14.0, min_lat=8.0)
     return _make_view(best[2], best[1], width, height)
 
 
@@ -449,7 +462,7 @@ def render_map(spec, excerpt: str = "", allowed_terms=None, no_text: bool = Fals
         frame = "pacific" if lon1 > 180 else "atlantic"
         view = _make_view((lon0, lat0, lon1, lat1), frame, width, height)
     else:
-        view = choose_view(spec["focus"], countries, width, height)
+        view = choose_view(spec["focus"], countries, width, height, pins=spec["pins"])
 
     s = SUPERSAMPLE
     image = Image.new("RGB", (width * s, height * s), SEA)

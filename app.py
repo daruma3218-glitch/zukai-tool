@@ -341,16 +341,21 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             map_mode=map_mode,
         )
         manifest = pipeline.run()
+        planned = manifest.get("images_planned") or manifest.get("target_count", 0)
+        groups = manifest.get("groups") or planned
+        message = f"完了: 成功 {manifest['succeeded']} / {planned} 枚"
+        if groups != planned:
+            message += f"（{groups}箇所の候補）"
         _set_job_state(
             job_id,
             status="completed",
             phase=3,
-            message=f"完了: 成功 {manifest['succeeded']} / {manifest['target_count']} 枚",
+            message=message,
             percent=100,
             title=manifest.get("title", ""),
             succeeded=manifest.get("succeeded", 0),
             failed=manifest.get("failed", 0),
-            target_count=manifest.get("target_count", 0),
+            target_count=planned,
         )
         _add_log(job_id, "system", f"全フェーズ完了（成功 {manifest['succeeded']} / 失敗 {manifest['failed']}）")
     except Exception as e:

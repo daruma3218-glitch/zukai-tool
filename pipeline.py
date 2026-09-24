@@ -271,6 +271,7 @@ class DiagramPipeline:
             "candidate_mode": self.candidate_mode,
             "map_mode": self.map_mode,
             "groups": plan["groups"],
+            "images_planned": plan["images"],
             "ai_images": plan["ai_images"],
             "maps": plan["maps"],
             "succeeded": success_count,
