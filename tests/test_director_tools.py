@@ -270,10 +270,35 @@ def test_adopted_zip_contains_only_adopted_with_table(client, tmp_path):
     res = client.get("/download-adopted/20260924_120000")
     with zipfile.ZipFile(io.BytesIO(res.data)) as archive:
         names = archive.namelist()
-        assert "images/diagram_001_b__e1.png" in names and "images/diagram_001_a.png" not in names
+        assert "001_第1章.png" in names and not any("diagram_001_a" in n for n in names)
         rows = list(csv.reader(io.StringIO(archive.read("採用一覧.csv").decode("utf-8-sig"))))
-    assert rows[1][:5] == ["1", "diagram_001_b__e1.png", "b", "イメージ画像", "左右反転"]
+    assert rows[0][:3] == ["番号", "ファイル名", "元のファイル名"]
+    assert rows[1][:7] == ["1", "001_第1章.png", "diagram_001_b__e1.png", "1", "b", "イメージ画像", "左右反転"]
     res.close()
+
+
+def test_adopted_zip_numbers_in_manuscript_order_from_the_start_number(client, tmp_path):
+    root = job_with_images(tmp_path, "diagram_001_a.png", "diagram_002_b.png", "diagram_003_a.png")
+    utils.save_json(root / "images_progress.json", {"items": [
+        {"index": 1, "group": 1, "variant": "a", "variant_label": "図解", "status": "ok",
+         "filename": "diagram_001_a.png", "keypoint": "シベリア鉄道の建設", "section": "第1章"},
+        {"index": 4, "group": 2, "variant": "b", "variant_label": "地図", "status": "ok",
+         "filename": "diagram_002_b.png", "keypoint": "旅順・大連/租借権", "section": "第1章"},
+        {"index": 5, "group": 3, "variant": "a", "variant_label": "実写風", "status": "ok",
+         "filename": "diagram_003_a.png", "section": "第2章"}]})
+    for name in ("diagram_003_a.png", "diagram_001_a.png", "diagram_002_b.png"):  # 採用した順ではなく原稿の順に並べる
+        client.post("/api/adopt/20260924_120000", json={"filename": name})
+    res = client.get("/download-adopted/20260924_120000?start=105")
+    with zipfile.ZipFile(io.BytesIO(res.data)) as archive:
+        images = [n for n in archive.namelist() if n.endswith(".png")]
+        readme = archive.read("README.txt").decode("utf-8")
+    res.close()
+    assert images == ["105_シベリア鉄道の建設.png", "106_旅順・大連租借権.png", "107_第2章.png"]
+    assert "番号 105〜107" in readme
+    bad = client.get("/download-adopted/20260924_120000?start=abc")
+    with zipfile.ZipFile(io.BytesIO(bad.data)) as archive:
+        assert archive.namelist()[0].startswith("001_")
+    bad.close()
 
 
 def test_new_routes_require_login(tmp_path, monkeypatch):
@@ -350,3 +375,23 @@ def test_upload_page_shows_capacity_warning(client, tmp_path):
     (tmp_path / retention.STATE_NAME).write_text(json.dumps(
         {"at": "2026-01-01T00:00:00", "capacity_triggered": True, "warning": None}), encoding="utf-8")
     assert 'id="retentionNotice"' not in client.get("/").get_data(as_text=True)
+
+
+def test_status_reports_elapsed_seconds(client, tmp_path):
+    root = tmp_path / "20260924_120000"
+    root.mkdir()
+    utils.save_json(root / "job.json", {"status": "completed", "started_at": "2026-09-24T12:00:00",
+                                        "updated_at": "2026-09-24T12:09:35"})
+    assert client.get("/api/status/20260924_120000").json["elapsed_seconds"] == 575
+
+
+def test_upload_page_shows_last_run_and_folds_advanced_settings(client, tmp_path):
+    root = tmp_path / "20260924_120000"
+    root.mkdir()
+    utils.save_json(root / "job.json", {"status": "completed", "started_at": "2026-09-24T12:00:00",
+                                        "updated_at": "2026-09-24T12:09:35"})
+    utils.save_json(root / "manifest.json", {"groups": 10, "images_planned": 20, "succeeded": 19})
+    html = client.get("/").get_data(as_text=True)
+    assert "前回の実績: 10箇所・画像20枚で約10分" in html
+    assert html.index('id="mainSettings"') < html.index('id="advancedSettings"') < html.index('id="submitBtn"')
+    assert html.index('id="qualityRow"') < html.index('id="advancedSettings"')  # 画質はよく使う設定の側

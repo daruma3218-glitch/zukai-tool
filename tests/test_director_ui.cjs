@@ -7,7 +7,7 @@ const { test } = require('node:test');
 const html = fs.readFileSync(path.join(__dirname, '../templates/progress.html'), 'utf8');
 const source = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1].replace('    tick();', '');
 
-function page(itemsPayload, status = 'completed') {
+function page(itemsPayload, status = 'completed', statusPayload = null) {
   const elements = new Map();
   const element = id => {
     if (!elements.has(id)) {
@@ -28,7 +28,7 @@ function page(itemsPayload, status = 'completed') {
     document: { getElementById: element, addEventListener() {} },
     fetch: async url => ({ ok: true, json: async () => url.includes('/api/items/')
       ? itemsPayload
-      : { status, succeeded: 2, phase: 3, percent: 100 } }),
+      : (statusPayload || { status, succeeded: 2, phase: 3, percent: 100 }) }),
   });
   vm.runInContext(source, context);
   return { element, run: command => vm.runInContext(command, context) };
@@ -95,4 +95,37 @@ test('1案のジョブは従来どおりの格子で、採用が無ければ採�
   assert.equal(p.element('adoptedBtn').classList.contains('hidden'), true);
   assert.equal(p.element('adoptHint').classList.contains('hidden'), false);
   assert.equal(p.element('retentionNote').classList.contains('hidden'), true);
+});
+
+
+test('4つの段階: 抽出中は②が進行中で①は完了、経過時間も出す', async () => {
+  const p = page(candidates, 'running', { status: 'running', phase: 1, percent: 12,
+    message: '視覚化ポイントを 10 個抽出中...', elapsed_seconds: 75 });
+  await p.run('pollStatus()');
+  assert.match(p.element('step1').className, /green/);
+  assert.match(p.element('step2').className, /purple/);
+  assert.match(p.element('step3').className, /gray/);
+  assert.equal(p.element('elapsedNote').textContent, '経過 1分15秒');
+});
+
+test('4つの段階: 完了で全部済み、止まった時はその段階を赤で示す', async () => {
+  const done = page(candidates, 'completed', { status: 'completed', phase: 3, percent: 100, elapsed_seconds: 575 });
+  await done.run('pollStatus()');
+  [1, 2, 3, 4].forEach(n => assert.match(done.element(`step${n}`).className, /green/));
+  assert.equal(done.element('elapsedNote').textContent, '所要 9分35秒');
+  const failed = page(candidates, 'error', { status: 'error', phase: 2, percent: 30, elapsed_seconds: 200 });
+  await failed.run('pollStatus()');
+  assert.match(failed.element('step3').className, /red/);
+});
+
+test('採用の内訳と、番号の開始つきの採用分ZIP', async () => {
+  const p = page({ ...candidates, adopted: ['diagram_001_b.png', 'diagram_001_a__e1.png'] });
+  await p.run('pollItems()');
+  assert.equal(p.element('adoptTools').classList.contains('hidden'), false);
+  assert.equal(p.element('adoptSummary').textContent,
+    '採用 2枚（地図 1・図解 1）／ 採用が決まった箇所 1 / 1');
+  assert.match(p.element('adoptedBtn').href, /\?start=1$/);
+  p.element('adoptStart').value = '105';
+  await p.run('updateDownload()');
+  assert.match(p.element('adoptedBtn').href, /\?start=105$/);
 });

@@ -71,11 +71,19 @@
         </div>
       </div>
 
+      <!-- 4つの段階 -->
+      <ol id="stepper" class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-xs">
+        <li id="step1" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">① 原稿の分析</li>
+        <li id="step2" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">② 図にする箇所の抽出</li>
+        <li id="step3" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">③ 候補の設計</li>
+        <li id="step4" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">④ 画像づくり</li>
+      </ol>
+
       <!-- 全体進捗バー -->
       <div class="mb-4">
         <div class="flex items-center justify-between mb-2">
           <div class="flex gap-3 text-xs text-gray-500">
-            <span>Phase <span id="phaseNum" class="font-semibold text-gray-900">0</span>/3</span>
+            <span id="elapsedNote">経過 --</span>
             <span class="text-gray-300">|</span>
             <span class="font-semibold text-purple-600" id="overallPercent">0%</span>
           </div>
@@ -122,15 +130,21 @@
           + 新しいジョブを作成
         </a>
       </div>
+      <div id="adoptTools" class="hidden mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-600">
+        <label class="inline-flex items-center gap-1.5">採用分ZIPの番号の開始
+          <input id="adoptStart" type="number" min="1" max="99999" value="1" class="w-20 px-2 py-1 border border-gray-300 rounded-md text-xs">
+        </label>
+        <span id="adoptSummary"></span>
+      </div>
       <p id="adoptHint" class="hidden mt-2 text-xs text-gray-500">画像の右上の ☆ を押すと「採用」になり、採用した画像だけをZIPで取り出せます（章・抜粋との対応表つき）。</p>
       <p id="retentionNote" class="hidden mt-2 text-xs text-gray-500"></p>
     </div>
 
-    <!-- メイン: グリッド + サイドログ -->
-    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+    <!-- メイン: グリッド（横幅いっぱい）+ 畳んだ記録 -->
+    <div class="space-y-6">
 
       <!-- 画像グリッド -->
-      <div class="lg:col-span-3">
+      <div>
         <div class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
           <div class="flex items-center justify-between mb-4">
             <h2 class="text-sm font-semibold text-gray-900">図解グリッド</h2>
@@ -150,17 +164,18 @@
         </div>
       </div>
 
-      <!-- アクティビティログ -->
-      <div class="lg:col-span-1">
-        <div class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm sticky top-20">
-          <h2 class="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
+      <!-- 詳しい記録（ふだんは畳む） -->
+      <div>
+        <details id="logDetails" class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
+          <summary class="text-sm font-semibold text-gray-900 cursor-pointer select-none flex items-center gap-2">
             <svg class="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 9v.776"/></svg>
-            アクティビティ
-          </h2>
-          <div id="logsContainer" class="space-y-2 max-h-[600px] overflow-y-auto scroll-y text-xs">
+            詳しい記録 <span class="text-xs font-normal text-gray-400">（技術的な内容・ふだんは見なくて大丈夫）</span>
+            <span id="logAlert" class="hidden text-[10px] px-1.5 py-0.5 rounded-full bg-yellow-100 text-yellow-800 font-medium"></span>
+          </summary>
+          <div id="logsContainer" class="mt-3 space-y-2 max-h-[600px] overflow-y-auto scroll-y text-xs">
             <p class="text-gray-400 text-center py-6">起動を待機しています...</p>
           </div>
-        </div>
+        </details>
       </div>
 
     </div>
@@ -216,12 +231,18 @@
     let lastStructure = '';       // 画像の並び（候補の組）が変わった時だけ全体を描き直す
     let modalState = null;        // {idx, source, shown}
     let editPollTimer = null;
+    let warnCount = 0;          // 記録の注意・エラーの件数
 
     const els = {
       jobTitle: document.getElementById('jobTitle'),
       jobMessage: document.getElementById('jobMessage'),
       statusBadge: document.getElementById('statusBadge'),
-      phaseNum: document.getElementById('phaseNum'),
+      elapsedNote: document.getElementById('elapsedNote'),
+      steps: [1, 2, 3, 4].map(n => document.getElementById(`step${n}`)),
+      adoptTools: document.getElementById('adoptTools'),
+      adoptStart: document.getElementById('adoptStart'),
+      adoptSummary: document.getElementById('adoptSummary'),
+      logAlert: document.getElementById('logAlert'),
       overallBar: document.getElementById('overallBar'),
       overallPercent: document.getElementById('overallPercent'),
       targetCountVal: document.getElementById('targetCountVal'),
@@ -418,9 +439,37 @@
         : `完成済み ${availableImages}枚をZIPでダウンロード`;
       const adoptedCount = adoptedSet.size;
       els.adoptedBtn.classList.toggle('hidden', adoptedCount === 0);
-      els.adoptedBtn.href = `/download-adopted/${JOB_ID}`;
+      const start = Math.min(Math.max(parseInt(els.adoptStart.value, 10) || 1, 1), 99999);
+      els.adoptedBtn.href = `/download-adopted/${JOB_ID}?start=${start}`;
       els.adoptedLabel.textContent = `採用分だけZIP（${adoptedCount}枚）`;
+      els.adoptTools.classList.toggle('hidden', adoptedCount === 0);
+      els.adoptSummary.textContent = adoptedCount ? adoptSummaryText() : '';
       els.adoptHint.classList.toggle('hidden', availableImages === 0 || adoptedCount > 0);
+    }
+
+    // 採用した画像の種類の内訳と、採用が決まった箇所の数
+    function adoptSummaryText() {
+      const byStem = {};
+      Object.values(knownItems).forEach(i => { if (i.filename) byStem[stemOf(i.filename)] = i; });
+      const counts = {};
+      const groups = new Set();
+      adoptedSet.forEach(f => {
+        const item = byStem[stemOf(f)] || {};
+        const label = item.variant_label || 'その他';
+        counts[label] = (counts[label] || 0) + 1;
+        groups.add(item.group ?? item.index);
+      });
+      const total = new Set(Object.values(knownItems).map(i => i.group ?? i.index)).size;
+      const parts = Object.entries(counts).map(([k, v]) => `${k} ${v}`).join('・');
+      return `採用 ${adoptedSet.size}枚（${parts}）／ 採用が決まった箇所 ${groups.size} / ${total}`;
+    }
+    const ADOPT_START_KEY = `zukai.adoptStart.${JOB_ID}`;
+    try { const saved = localStorage.getItem(ADOPT_START_KEY); if (saved) els.adoptStart.value = saved; } catch (e) {}
+    if (els.adoptStart.addEventListener) {
+      els.adoptStart.addEventListener('input', () => {
+        try { localStorage.setItem(ADOPT_START_KEY, els.adoptStart.value); } catch (e) {}
+        updateDownload();
+      });
     }
 
     function updateRetention() {
@@ -504,6 +553,36 @@
       } catch (e) {}
     }
 
+    // ===== 4つの段階と経過時間 =====
+    function currentStep(state) {
+      if (state.status === 'completed') return 5;
+      const phase = state.phase || 0;
+      if (phase >= 3) return 4;
+      if (phase === 2) return 3;
+      if (phase === 1) return /抽出/.test(state.message || '') ? 2 : 1;
+      return 0;
+    }
+    function formatDuration(seconds) {
+      const m = Math.floor(seconds / 60), s = seconds % 60;
+      return m ? `${m}分${String(s).padStart(2, '0')}秒` : `${s}秒`;
+    }
+    function updateStepper(state) {
+      const step = currentStep(state);
+      const failed = state.status === 'error';
+      els.steps.forEach((el, i) => {
+        const n = i + 1;
+        const base = 'rounded-lg border px-3 py-2 ';
+        if (n < step) el.className = base + 'border-green-200 bg-green-50 text-green-700';
+        else if (n === step) el.className = base + (failed ? 'border-red-300 bg-red-50 text-red-700 font-semibold'
+                                                             : 'border-purple-400 bg-purple-50 text-purple-700 font-semibold');
+        else el.className = base + 'border-gray-200 text-gray-400';
+      });
+      if (typeof state.elapsed_seconds === 'number') {
+        const label = state.status === 'completed' ? '所要' : state.status === 'error' ? '停止まで' : '経過';
+        els.elapsedNote.textContent = `${label} ${formatDuration(state.elapsed_seconds)}`;
+      }
+    }
+
     async function pollStatus() {
       try {
         const res = await fetch(`/api/status/${JOB_ID}`);
@@ -514,7 +593,7 @@
 
         // ヘッダ更新
         els.jobMessage.textContent = state.message || '...';
-        els.phaseNum.textContent = Math.min(state.phase || 0, 3);
+        updateStepper(state);
         els.overallBar.style.width = `${state.percent || 0}%`;
         els.overallPercent.textContent = `${state.percent || 0}%`;
         if (state.target_count) els.targetCountVal.textContent = state.target_count;
@@ -553,12 +632,14 @@
         adoptedSet = new Set(data.adopted || []);
         editsList = data.edits || [];
         retentionInfo = data.retention || null;
+        if (items.length > 0) {
+          // 内部キャッシュ（採用の内訳の計算にも使うので、ボタンの更新より先に入れる）
+          knownItems = {};
+          items.forEach(i => { knownItems[i.index] = i; });
+        }
         updateDownload();
         updateRetention();
         if (items.length > 0) {
-          // 内部キャッシュ
-          knownItems = {};
-          items.forEach(i => { knownItems[i.index] = i; });
           rebuildGrid(items);
           updateSummary(items);
         }
@@ -591,6 +672,11 @@
           setup: 'bg-gray-50 text-gray-700',
         };
 
+        warnCount += newLogs.filter(l => l.category === 'warn' || l.category === 'error').length;
+        if (warnCount) {
+          els.logAlert.textContent = `注意 ${warnCount}件`;
+          els.logAlert.classList.toggle('hidden', false);
+        }
         newLogs.forEach(log => {
           const div = document.createElement('div');
           div.className = `p-2 rounded-md ${colorMap[log.category] || 'bg-gray-50 text-gray-700'}`;

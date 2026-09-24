@@ -264,8 +264,24 @@ def set_adopted(job_dir: Path, filename: str, adopted: bool, group=None) -> dict
     return _update(job_dir, ADOPTION_NAME, {"version": 1, "adopted": {}}, change)
 
 
-def adopted_zip(job_dir: Path, items: list, title: str) -> tuple:
-    """採用した画像だけの ZIP（一時ファイル）と中身の枚数。対応表 CSV を同梱する。"""
+_UNSAFE_NAME_RE = re.compile(r'[\\/:*?"<>|\s]+')
+
+
+def _short_label(item: dict, limit: int = 20) -> str:
+    """ファイル名に付ける短い見出し（要点 → 章 → 抜粋の先頭）。"""
+    for key in ("keypoint", "section", "excerpt"):
+        text = _UNSAFE_NAME_RE.sub("", str(item.get(key) or "")).strip("._")
+        if text:
+            return text[:limit]
+    return ""
+
+
+def adopted_zip(job_dir: Path, items: list, title: str, start: int = 1) -> tuple:
+    """採用した画像だけの ZIP（一時ファイル）と中身の枚数。
+
+    原稿の順に並べ、ディレクターの表の番号に合わせて start から番号を振った名前にする
+    （例: 105_シベリア鉄道の建設.png）。元のファイル名と抜粋は対応表 CSV に残す。
+    """
     job_dir = Path(job_dir)
     adopted = load_adoption(job_dir)
     by_stem = {}
@@ -273,28 +289,37 @@ def adopted_zip(job_dir: Path, items: list, title: str) -> tuple:
         if item.get("filename"):
             by_stem[Path(item["filename"]).stem] = item
     edits = {e.get("output"): e for e in load_edits(job_dir)}
+    chosen = []
+    for filename in adopted:
+        try:
+            path = _image_path(job_dir, filename)
+        except EditError:
+            continue  # 採用後に消えた画像は飛ばす
+        item = by_stem.get(source_stem(filename), {})
+        order = item.get("group") or item.get("index") or 10 ** 6
+        chosen.append(((order, item.get("variant") or "", filename), filename, path, item))
+    chosen.sort(key=lambda entry: entry[0])
+    start = max(1, int(start or 1))
+    width = max(3, len(str(start + len(chosen) - 1)))
     rows = []
     archive = tempfile.TemporaryFile(mode="w+b")
-    count = 0
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
-        for filename in sorted(adopted):
-            try:
-                path = _image_path(job_dir, filename)
-            except EditError:
-                continue  # 採用後に消えた画像は飛ばす
-            zf.write(path, f"images/{filename}")
-            count += 1
-            item = by_stem.get(source_stem(filename), {})
+        for number, (_key, filename, path, item) in enumerate(chosen, start=start):
+            label = _short_label(item)
+            name = f"{number:0{width}d}_{label}{path.suffix}" if label else f"{number:0{width}d}{path.suffix}"
+            zf.write(path, name)
             edit = edits.get(filename, {})
-            rows.append([item.get("group") or item.get("index") or "", filename, item.get("variant", ""),
+            rows.append([number, name, filename, item.get("group") or item.get("index") or "", item.get("variant", ""),
                          item.get("variant_label", ""), edit.get("label", ""), item.get("section", ""),
                          item.get("excerpt", "")])
+        count = len(rows)
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow(["箇所番号", "ファイル名", "案", "種類", "手直し", "章", "原稿の抜粋"])
+        writer.writerow(["番号", "ファイル名", "元のファイル名", "箇所番号", "案", "種類", "手直し", "章", "原稿の抜粋"])
         writer.writerows(rows)
         zf.writestr("採用一覧.csv", "﻿" + buffer.getvalue(), compress_type=zipfile.ZIP_DEFLATED)
-        zf.writestr("README.txt", f"{title}\n採用した画像 {count} 枚。対応表は 採用一覧.csv。\n",
+        span = f"（番号 {start}〜{start + count - 1}）" if count else ""
+        zf.writestr("README.txt", f"{title}\n採用した画像 {count} 枚{span}。原稿の順に番号を付けています。対応表は 採用一覧.csv。\n",
                     compress_type=zipfile.ZIP_DEFLATED)
     archive.seek(0)
     return archive, count

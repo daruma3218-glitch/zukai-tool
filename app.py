@@ -209,6 +209,22 @@ def _set_job_state(job_id: str, **kwargs):
             pass
 
 
+def _job_elapsed_seconds(job_id: str, state: dict):
+    """開始から終了（実行中なら今）までの秒数。開始時刻が分からなければ None。"""
+    try:
+        started = datetime.fromisoformat(state["started_at"]) if state.get("started_at")             else datetime.strptime(job_id, "%Y%m%d_%H%M%S")
+    except (ValueError, TypeError):
+        return None
+    end = datetime.now()
+    if state.get("status") in ("completed", "error") and state.get("updated_at"):
+        try:
+            end = datetime.fromisoformat(state["updated_at"])
+        except ValueError:
+            pass
+    seconds = int((end - started).total_seconds())
+    return seconds if 0 <= seconds < 7 * 24 * 3600 else None
+
+
 def _get_job_state(job_id: str) -> dict:
     # 複数のGunicornワーカーと再起動後も、保存済みの最新状態を優先する。
     state = load_json(OUTPUT_DIR / job_id / "job.json", {})
@@ -392,6 +408,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
 def index():
     # 過去ジョブ一覧
     past_jobs = []
+    last_run = None  # 直近の完了ジョブの実績（作成画面の所要時間の目安に使う）
     if OUTPUT_DIR.exists():
         for d in sorted(OUTPUT_DIR.iterdir(), reverse=True):
             if not d.is_dir():
@@ -408,11 +425,17 @@ def index():
                 "target": manifest.get("target_count", job_state.get("target_count", 0)),
                 "date": d.name[:8] if len(d.name) >= 8 else "",
             })
+            seconds = _job_elapsed_seconds(d.name, job_state) if job_state.get("status") == "completed" else None
+            if last_run is None and seconds:
+                last_run = {"places": manifest.get("groups") or manifest.get("target_count") or 0,
+                            "images": manifest.get("images_planned") or manifest.get("succeeded") or 0,
+                            "minutes": max(1, round(seconds / 60))}
     resp = make_response(render_template(
         "upload.html",
         openai_image_models=[{"id": m, "label": l} for m, l in OPENAI_IMAGE_MODEL_CHOICES],
         default_openai_model=resolve_openai_image_model(),
         past_jobs=past_jobs[:30],
+        last_run=last_run,
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
         has_openai=bool(os.environ.get("OPENAI_API_KEY")),
@@ -494,6 +517,7 @@ def start_job():
         phase=0,
         message="キューに追加しました",
         percent=0,
+        started_at=datetime.now().isoformat(),
         target_count=target_count,
         concurrency=concurrency,
         provider=provider,
@@ -525,7 +549,7 @@ def api_status(job_id):
     state = _get_job_state(job_id)
     if not state:
         return jsonify({"status": "not_found"}), 404
-    return jsonify(state)
+    return jsonify(dict(state, elapsed_seconds=_job_elapsed_seconds(job_id, state)))
 
 
 @app.route("/api/items/<job_id>")

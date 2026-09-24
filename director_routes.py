@@ -75,7 +75,11 @@ def register(app, login_required, output_dir_getter, items_getter):
             return "結果が見つかりません", 404
         manifest = load_json(job_dir / "manifest.json", {})
         title = manifest.get("title") or load_json(job_dir / "job.json", {}).get("title") or job_id
-        archive, count = image_edit.adopted_zip(job_dir, items_getter(job_dir), title)
+        try:
+            start = min(max(int(request.args.get("start", "1")), 1), 99999)
+        except ValueError:
+            start = 1
+        archive, count = image_edit.adopted_zip(job_dir, items_getter(job_dir), title, start=start)
         if not count:
             archive.close()
             return "採用した画像がまだありません。画像の「採用」を押してから取り出してください。", 409
