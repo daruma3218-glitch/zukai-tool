@@ -70,7 +70,22 @@ test('手直し中の画像に印を出し、削除予定日を知らせる', as
   await p.run('pollItems()');
   assert.match(p.element('imgGrid').innerHTML, /直し中/);
   assert.equal(p.element('retentionNote').classList.contains('hidden'), false);
+  assert.match(p.element('retentionNote').textContent, /10月24日 ごろに、採用していない画像が自動で削除/);
+  assert.match(p.element('retentionNote').textContent, /採用した画像（1枚）は残ります/);
+});
+
+test('採用が無いときは、残したい画像を☆で採用するよう知らせる', async () => {
+  const p = page({ ...candidates, adopted: [], edits: [] });
+  await p.run('pollItems()');
   assert.match(p.element('retentionNote').textContent, /10月24日 ごろに自動で削除/);
+  assert.match(p.element('retentionNote').textContent, /☆で採用/);
+});
+
+test('保存期限の整理後は、採用画像だけを残したと知らせる', async () => {
+  const p = page({ ...candidates, retention: { days: 30, expires_at: null, trimmed: true } });
+  await p.run('pollItems()');
+  assert.equal(p.element('retentionNote').classList.contains('hidden'), false);
+  assert.match(p.element('retentionNote').textContent, /採用した画像だけを残しています/);
 });
 
 test('1案のジョブは従来どおりの格子で、採用が無ければ採用ボタンを隠す', async () => {

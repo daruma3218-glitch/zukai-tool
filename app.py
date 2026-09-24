@@ -134,7 +134,7 @@ def version():
         "default_image_model": resolve_openai_image_model(),
         "edit_image_model": resolve_edit_model(),
         "director_tools": {"candidates": list(CANDIDATE_MODES), "map_renderer": map_renderer.enabled(),
-                           "retention_days": retention.retention_days(),
+                           "retention_days": retention.retention_days(), "retention_keeps_adopted": True,
                            "edits": sorted(image_edit.ACTIONS), "adoption": True},
     })
 
@@ -284,14 +284,33 @@ def _image_snapshot(result_dir: Path, images=None) -> dict:
                 items.append(item)
                 by_index[idx] = item
         item.update(filename=path.name, status="ok", success=True)
+    trimmed = result_dir.is_dir() and retention.is_trimmed(result_dir)
+    edits = image_edit.load_edits(result_dir)
+    if trimmed:  # 保存期限の整理後: 残した（採用した）画像と、その版だけを並べる
+        items = [item for item in items if item.get("filename") in available]
+        edits = [e for e in edits if e.get("output") in available]
     snapshot["items"] = sorted(items, key=lambda item: item.get("index", 0))
     snapshot["available_images"] = len(images)
-    snapshot["edits"] = image_edit.load_edits(result_dir)
+    snapshot["edits"] = edits
     snapshot["adopted"] = sorted(image_edit.load_adoption(result_dir))
     expires = retention.expires_at(result_dir) if result_dir.is_dir() else None
-    snapshot["retention"] = {"days": retention.retention_days(),
+    snapshot["retention"] = {"days": retention.retention_days(), "trimmed": trimmed,
                              "expires_at": expires.isoformat(timespec="minutes") if expires else None}
     return snapshot
+
+
+def _retention_notice():
+    """自動削除の知らせ（容量の警告、または直近7日の容量超過による整理）。"""
+    state = retention.load_state(OUTPUT_DIR)
+    if state.get("warning"):
+        return state["warning"]
+    try:
+        at = datetime.fromisoformat(state.get("at") or "")
+    except ValueError:
+        return None
+    if state.get("capacity_triggered") and datetime.now() - at < timedelta(days=7):
+        return "保存領域が上限に近づいたため、古い結果を自動で整理しました（☆で採用した画像は残しています）。"
+    return None
 
 
 _IMAGE_NAME_RE = re.compile(r"^diagram_(\d{3})(?:_([a-c]))?$")
@@ -397,6 +416,7 @@ def index():
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
         has_openai=bool(os.environ.get("OPENAI_API_KEY")),
+        retention_notice=_retention_notice(),
     ))
     # デプロイ後に古いフォーム（新しい入力欄が無い）が使われ続けるのを防ぐ
     resp.headers["Cache-Control"] = "no-store"

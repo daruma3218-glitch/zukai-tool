@@ -323,3 +323,30 @@ def test_upload_form_preselects_the_default_image_model(client, monkeypatch, env
         monkeypatch.delenv("OPENAI_IMAGE_MODEL", raising=False)
     html = client.get("/").get_data(as_text=True)
     assert f'<option value="{expected}" selected>' in html
+
+
+def test_trimmed_job_lists_only_kept_images_without_failures(client, tmp_path):
+    import retention
+    root = job_with_images(tmp_path, "diagram_001_a.png", "diagram_001_b.png")
+    utils.save_json(root / "images_progress.json", {"items": [
+        {"index": 1, "group": 1, "variant": "a", "filename": "diagram_001_a.png", "status": "ok"},
+        {"index": 2, "group": 1, "variant": "b", "filename": "diagram_001_b.png", "status": "ok"}]})
+    (root / "images" / "diagram_001_a.png").unlink()  # 保存期限で消えた（採用していない案）
+    (root / retention.TRIM_MARKER).write_text("{}", encoding="utf-8")
+    data = client.get(f"/api/items/{root.name}").json
+    assert [i["filename"] for i in data["items"]] == ["diagram_001_b.png"]
+    assert all(i["status"] == "ok" for i in data["items"])
+    assert data["retention"]["trimmed"] is True and data["retention"]["expires_at"] is None
+
+
+def test_upload_page_shows_capacity_warning(client, tmp_path):
+    import json
+    from datetime import datetime
+    import retention
+    (tmp_path / retention.STATE_NAME).write_text(json.dumps(
+        {"at": datetime.now().isoformat(), "capacity_triggered": True,
+         "warning": "保存領域の91%を使っています。"}, ensure_ascii=False), encoding="utf-8")
+    assert "保存領域の91%を使っています。" in client.get("/").get_data(as_text=True)
+    (tmp_path / retention.STATE_NAME).write_text(json.dumps(
+        {"at": "2026-01-01T00:00:00", "capacity_triggered": True, "warning": None}), encoding="utf-8")
+    assert 'id="retentionNotice"' not in client.get("/").get_data(as_text=True)

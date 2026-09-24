@@ -7,6 +7,10 @@ Render の永続ディスク（DATA_DIR / /data）に保存すると再起動・
 - 完了・エラーで終わったジョブを、最後の更新から ZUKAI_RETENTION_DAYS 日（既定30日）で削除する。0 以下で無効。
 - ディスク使用量が ZUKAI_RETENTION_MAX_USAGE（既定0.80）を超えたら、終わったジョブを古い順に
   使用量が「上限−0.10」になるまで削除する。
+- ☆で採用した画像（adoption.json）は消さない。採用のあるジョブは、採用していない画像だけを消し、
+  採用画像と記録（JSON）を残す（retention_trimmed.json を置き、以後は対象外）。
+  採用記録が読めないジョブは、採用画像を誤って消さないよう丸ごと保留する。
+- 採用画像だけで容量の上限を超えている場合は消さずに警告を残し、画面に知らせる（retention_state.json）。
 - 実行中・待機中のジョブは消さない（3日以上更新が止まったものは終わったものとして扱う）。
 - 削除するのは出力先直下の YYYYMMDD_HHMMSS 形式のフォルダだけ。リンクはたどらない。
 - 削除は出力先の retention_log.jsonl に記録する。
@@ -28,6 +32,10 @@ STALE_ACTIVE_DAYS = 3
 LOCK_NAME = ".retention.lock"
 LOCK_STALE_SECONDS = 30 * 60
 LOG_NAME = "retention_log.jsonl"
+STATE_NAME = "retention_state.json"
+ADOPTION_NAME = "adoption.json"
+TRIM_MARKER = "retention_trimmed.json"
+_SAFE_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.(?:png|jpe?g|webp)$", re.IGNORECASE)
 
 
 def retention_days() -> int:
@@ -86,12 +94,56 @@ def is_finished(job_dir: Path, now: Optional[datetime] = None) -> bool:
     return now - last_update(job_dir) >= timedelta(days=STALE_ACTIVE_DAYS)
 
 
+def adopted_files(job_dir: Path) -> tuple:
+    """(採用した画像のファイル名の集合, 採用記録を読めたか)。記録が無ければ (空, True)。"""
+    path = Path(job_dir) / ADOPTION_NAME
+    if not path.exists():
+        return set(), True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set(), False
+    table = data.get("adopted") if isinstance(data, dict) else None
+    if not isinstance(table, dict):
+        return set(), False
+    keep = {name for name in table if isinstance(name, str) and _SAFE_IMAGE_RE.match(name)}
+    # 手直しした版を採用した場合は、画面で版を元画像にひも付けて出すため元画像も残す
+    try:
+        edits = json.loads((Path(job_dir) / "edits.json").read_text(encoding="utf-8")).get("edits", [])
+    except (OSError, ValueError, AttributeError):
+        edits = []
+    for edit in edits if isinstance(edits, list) else []:
+        if isinstance(edit, dict) and edit.get("output") in keep:
+            source = edit.get("source")
+            if isinstance(source, str) and _SAFE_IMAGE_RE.match(source):
+                keep.add(source)
+    for name in list(keep):
+        match = re.match(r"^(.+?)__e\d+(\.[A-Za-z]+)$", name)
+        if match:
+            keep.add(match.group(1) + match.group(2))
+    return keep, True
+
+
+def is_trimmed(job_dir: Path) -> bool:
+    """保存期限の整理で、採用画像だけを残したジョブか。"""
+    return (Path(job_dir) / TRIM_MARKER).is_file()
+
+
 def expires_at(job_dir: Path, days: Optional[int] = None) -> Optional[datetime]:
-    """自動削除の予定日時。無効時や実行中は None。"""
+    """自動削除（採用のあるジョブは採用外の画像の削除）の予定日時。無効時・実行中・整理済みは None。"""
     days = retention_days() if days is None else days
-    if days <= 0 or not is_finished(job_dir):
+    if days <= 0 or is_trimmed(job_dir) or not is_finished(job_dir):
         return None
     return last_update(job_dir) + timedelta(days=days)
+
+
+def load_state(output_dir: Path) -> dict:
+    """直近の自動削除の要約（画面の知らせ用）。"""
+    try:
+        data = json.loads((Path(output_dir) / STATE_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _job_dirs(output_dir: Path) -> list:
@@ -146,12 +198,13 @@ def _log(output_dir: Path, entry: dict) -> None:
 def run_retention(output_dir: Path, *, now: Optional[datetime] = None, days: Optional[int] = None,
                   max_usage: Optional[float] = None,
                   usage_fn: Callable = shutil.disk_usage, dry_run: bool = False) -> dict:
-    """期限切れ・容量超過のジョブを削除し、結果の要約を返す。"""
+    """期限切れ・容量超過のジョブを整理し、結果の要約を返す（採用画像は消さない）。"""
     output_dir = Path(output_dir)
     now = now or datetime.now()
     days = retention_days() if days is None else days
     max_usage = max_usage_ratio() if max_usage is None else max_usage
-    summary = {"checked": 0, "deleted": [], "skipped_locked": False, "dry_run": dry_run}
+    summary = {"checked": 0, "deleted": [], "trimmed": [], "kept_unreadable": [], "skipped_locked": False,
+               "dry_run": dry_run, "capacity_triggered": False, "warning": None}
     if not output_dir.is_dir():
         return summary
     lock = _acquire_lock(output_dir)
@@ -164,22 +217,72 @@ def run_retention(output_dir: Path, *, now: Optional[datetime] = None, days: Opt
         finished = [(last_update(job), job) for job in jobs if is_finished(job, now)]
         finished.sort(key=lambda pair: pair[0])
 
+        def record(kind: str, job: Path, updated: datetime, reason: str, size: int, **extra) -> None:
+            entry = {"at": now.isoformat(timespec="seconds"), "job_id": job.name, "action": kind,
+                     "reason": reason, "bytes": size, "last_update": updated.isoformat(timespec="seconds"),
+                     "dry_run": dry_run, **extra}
+            summary[kind].append(entry)
+            _log(output_dir, entry)
+
         def delete(job: Path, updated: datetime, reason: str) -> int:
             size = _dir_bytes(job)
             if not dry_run:
                 shutil.rmtree(job, ignore_errors=True)
                 if job.exists():
                     return 0
-            entry = {"at": now.isoformat(timespec="seconds"), "job_id": job.name, "reason": reason,
-                     "bytes": size, "last_update": updated.isoformat(timespec="seconds"), "dry_run": dry_run}
-            summary["deleted"].append(entry)
-            _log(output_dir, entry)
+            record("deleted", job, updated, reason, size)
             return size
+
+        def trim(job: Path, updated: datetime, reason: str, keep: set) -> int:
+            """採用していない画像だけを消し、採用画像と記録を残す。"""
+            images = job / "images"
+            freed = removed = 0
+            if images.is_dir() and not images.is_symlink():
+                for path in images.iterdir():
+                    if path.name in keep:
+                        continue
+                    try:
+                        if path.is_dir() and not path.is_symlink():
+                            size = _dir_bytes(path)
+                            if not dry_run:
+                                shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            size = path.lstat().st_size
+                            if not dry_run:
+                                path.unlink()
+                    except OSError:
+                        continue
+                    freed += size
+                    removed += 1
+            if not dry_run:
+                marker = {"at": now.isoformat(timespec="seconds"), "reason": reason,
+                          "kept": sorted(keep), "removed_files": removed, "bytes": freed}
+                try:
+                    (job / TRIM_MARKER).write_text(json.dumps(marker, ensure_ascii=False, indent=2),
+                                                   encoding="utf-8")
+                except OSError:
+                    pass
+            record("trimmed", job, updated, reason, freed, kept=len(keep), removed_files=removed)
+            return freed
+
+        def dispose(job: Path, updated: datetime, reason: str) -> int:
+            if is_trimmed(job):
+                return 0  # 採用画像だけが残っている
+            keep, readable = adopted_files(job)
+            if not readable:
+                if job.name not in summary["kept_unreadable"]:
+                    summary["kept_unreadable"].append(job.name)
+                    _log(output_dir, {"at": now.isoformat(timespec="seconds"), "job_id": job.name,
+                                      "action": "kept", "reason": "採用記録を読めないため保留", "dry_run": dry_run})
+                return 0
+            if keep:
+                return trim(job, updated, reason, keep)
+            return delete(job, updated, reason)
 
         remaining = []
         for updated, job in finished:
             if days > 0 and now - updated >= timedelta(days=days):
-                delete(job, updated, f"{days}日を過ぎた")
+                dispose(job, updated, f"{days}日を過ぎた")
             else:
                 remaining.append((updated, job))
 
@@ -189,12 +292,26 @@ def run_retention(output_dir: Path, *, now: Optional[datetime] = None, days: Opt
         except OSError:
             total = used = 0
         if total and used / total > max_usage:
+            summary["capacity_triggered"] = True
             target = max_usage - 0.10
             for updated, job in remaining:
                 if used / total <= target:
                     break
-                used -= delete(job, updated, f"容量が{int(max_usage * 100)}%を超えた")
+                used -= dispose(job, updated, f"容量が{int(max_usage * 100)}%を超えた")
+            if used / total > max_usage:
+                summary["warning"] = (f"保存領域の{int(used / total * 100)}%を使っています。採用した画像や"
+                                      "実行中の結果は自動では消さないため、不要な結果の整理かディスクの増量が必要です。")
+                _log(output_dir, {"at": now.isoformat(timespec="seconds"), "action": "warning",
+                                  "reason": summary["warning"], "dry_run": dry_run})
         summary["usage_ratio"] = round(used / total, 4) if total else None
+        if not dry_run:
+            state = {"at": now.isoformat(timespec="seconds"), "usage_ratio": summary["usage_ratio"],
+                     "deleted": len(summary["deleted"]), "trimmed": len(summary["trimmed"]),
+                     "capacity_triggered": summary["capacity_triggered"], "warning": summary["warning"]}
+            try:
+                (output_dir / STATE_NAME).write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
         return summary
     finally:
         lock.unlink(missing_ok=True)

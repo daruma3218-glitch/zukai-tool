@@ -425,13 +425,20 @@
 
     function updateRetention() {
       const info = retentionInfo;
+      if (info && info.trimmed && info.days) {
+        els.retentionNote.textContent = `保存期限（完了から${info.days}日）を過ぎたため、☆で採用した画像だけを残しています。`;
+        els.retentionNote.classList.toggle('hidden', false);
+        return;
+      }
       if (!info || !info.expires_at || !info.days) {
         els.retentionNote.classList.toggle('hidden', true);
         return;
       }
       const d = new Date(info.expires_at);
       const label = isNaN(d) ? info.expires_at : `${d.getMonth() + 1}月${d.getDate()}日`;
-      els.retentionNote.textContent = `この結果は ${label} ごろに自動で削除されます（完了から${info.days}日）。使う画像はZIPで保存してください。`;
+      els.retentionNote.textContent = adoptedSet.size > 0
+        ? `${label} ごろに、採用していない画像が自動で削除されます（完了から${info.days}日）。☆で採用した画像（${adoptedSet.size}枚）は残ります。`
+        : `この結果は ${label} ごろに自動で削除されます（完了から${info.days}日）。残したい画像は☆で採用してください（採用した画像は消えません）。`;
       els.retentionNote.classList.toggle('hidden', false);
     }
 
@@ -449,6 +456,7 @@
       adoptedSet = new Set(data.adopted || []);
       rebuildGrid(Object.values(knownItems));
       updateDownload();
+      updateRetention();
       if (modalState) renderModal();
     }
 

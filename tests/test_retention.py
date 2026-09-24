@@ -130,3 +130,62 @@ def test_expires_at_for_finished_and_none_for_active(tmp_path, monkeypatch):
 
 def test_scheduler_does_not_start_under_pytest(tmp_path):
     assert retention.start_scheduler(tmp_path) is False
+
+
+# ===== 採用した画像は消さない（2026-09-24 社長への説明どおり） =====
+def adopt(job_dir: Path, *names, edits=None):
+    (job_dir / "adoption.json").write_text(json.dumps({"version": 1, "adopted": {
+        n: {"group": 1, "at": "2026-09-30T10:00:00"} for n in names}}), encoding="utf-8")
+    if edits is not None:
+        (job_dir / "edits.json").write_text(json.dumps({"version": 1, "edits": edits}), encoding="utf-8")
+
+
+def test_expired_job_keeps_adopted_images_and_records(tmp_path):
+    old = job(tmp_path, "20260901_000000", "completed", 40)
+    for name in ("diagram_002_a.png", "diagram_002_b.png", "diagram_003_a.png", "diagram_003_a__e1.png"):
+        (old / "images" / name).write_bytes(b"y" * 50)
+    adopt(old, "diagram_002_b.png", "diagram_003_a__e1.png",
+          edits=[{"source": "diagram_003_a.png", "output": "diagram_003_a__e1.png", "status": "done"}])
+    summary = retention.run_retention(tmp_path, now=NOW, days=30, usage_fn=roomy)
+    assert old.is_dir() and summary["deleted"] == []
+    kept = sorted(p.name for p in (old / "images").iterdir())
+    # 採用2枚＋手直し版の元画像を残し、採用していない画像は消す
+    assert kept == ["diagram_002_b.png", "diagram_003_a.png", "diagram_003_a__e1.png"]
+    assert (old / "job.json").exists() and (old / "adoption.json").exists()
+    assert retention.is_trimmed(old) and retention.expires_at(old) is None
+    assert summary["trimmed"][0]["removed_files"] == 2
+    # 2回目以降は何もしない（採用画像はいつまでも残す）
+    again = retention.run_retention(tmp_path, now=NOW + timedelta(days=400), days=30, usage_fn=roomy)
+    assert again["trimmed"] == [] and again["deleted"] == []
+    assert sorted(p.name for p in (old / "images").iterdir()) == kept
+
+
+def test_unreadable_adoption_record_keeps_whole_job(tmp_path):
+    old = job(tmp_path, "20260901_000000", "completed", 40)
+    (old / "adoption.json").write_text("{壊れた", encoding="utf-8")
+    summary = retention.run_retention(tmp_path, now=NOW, days=30, usage_fn=roomy)
+    assert old.is_dir() and (old / "images" / "diagram_001.png").exists()
+    assert summary["kept_unreadable"] == ["20260901_000000"]
+
+
+def test_capacity_pressure_trims_adopted_jobs_and_warns_when_only_adopted_remain(tmp_path):
+    recent = job(tmp_path, "20261020_000000", "completed", 10)
+    (recent / "images" / "diagram_002.png").write_bytes(b"z" * 50)
+    adopt(recent, "diagram_002.png")
+    summary = retention.run_retention(tmp_path, now=NOW, days=30, max_usage=0.80,
+                                      usage_fn=lambda _p: Usage(1000, 950, 50))
+    assert [t["job_id"] for t in summary["trimmed"]] == ["20261020_000000"]
+    assert sorted(p.name for p in (recent / "images").iterdir()) == ["diagram_002.png"]
+    assert summary["capacity_triggered"] is True and "採用した画像" in summary["warning"]
+    state = retention.load_state(tmp_path)
+    assert state["warning"] == summary["warning"] and state["trimmed"] == 1
+
+
+def test_dry_run_does_not_trim(tmp_path):
+    old = job(tmp_path, "20260901_000000", "completed", 40)
+    (old / "images" / "diagram_002.png").write_bytes(b"z" * 50)
+    adopt(old, "diagram_002.png")
+    summary = retention.run_retention(tmp_path, now=NOW, days=30, usage_fn=roomy, dry_run=True)
+    assert len(summary["trimmed"]) == 1
+    assert (old / "images" / "diagram_001.png").exists() and not retention.is_trimmed(old)
+    assert retention.load_state(tmp_path) == {}
