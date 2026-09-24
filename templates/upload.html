@@ -52,15 +52,14 @@
         <h1 class="text-3xl font-bold text-gray-900 mb-2">新しい図解資料を作成</h1>
         <p class="text-sm text-gray-500 mb-6">完成原稿をセットすると、図解・イメージ画像・地図を並列で作ります。前回の設定は自動で引き継ぎます</p>
 
-        {% if not has_anthropic or not has_gemini %}
+        {% if not has_openai and not has_gemini %}
         <div class="mb-5 p-4 bg-amber-50 border border-amber-200 rounded-xl">
           <div class="flex gap-3">
             <svg class="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"/></svg>
             <div>
-              <p class="text-sm font-medium text-amber-800">API キーが未設定です</p>
+              <p class="text-sm font-medium text-amber-800">画像生成の API キーが未設定です</p>
               <div class="text-xs text-amber-700 mt-1 space-y-0.5">
-                {% if not has_anthropic %}<p>ANTHROPIC_API_KEY（プロンプト生成用）</p>{% endif %}
-                {% if not has_gemini %}<p>GEMINI_API_KEY（画像生成用）</p>{% endif %}
+                <p>OPENAI_API_KEY（GPT Image）または GEMINI_API_KEY（nanobanana）が必要です。文章の分析はサブスク経由のため、ほかのキーは不要です。</p>
               </div>
               <p class="text-xs text-amber-600 mt-2"><code class="bg-amber-100 px-1.5 py-0.5 rounded">.env</code> に設定してください</p>
             </div>
