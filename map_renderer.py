@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""地図を実データ（Natural Earth 1:50m の国境・公有）から描く（2026-09-24）。
+"""地図を実データ（Natural Earth の国境・公有。日本の立場版）から描く（2026-09-24）。
 
 画像生成AIに地図を描かせると、黒海の形が崩れる・カスピ海が2つ・日本が2つ、といった誤りが出る
 （ロシア解体新書のディレクター報告）。この描画は国の形と位置をすべて国境データから描き、
@@ -17,6 +17,9 @@ map_spec（すべて任意）:
 国の形はデータ由来なので誤らない。ピンの座標はAI由来なので、指定国の範囲内（沿岸は少し外まで許容）に
 あるかを国境データで確かめ、合わないものは描かずに notes に残す。仕様が読めない時は、抜粋に出てくる
 国名から強調する国を決める。国境は現代のもの（歴史の国境は扱わない）。
+
+国境データは Natural Earth の「日本の立場（point of view: JPN）」版。北方領土・竹島・尖閣は日本、
+クリミアはウクライナとして描く（実効支配版ではロシア扱いになるため、日本向けの動画では使わない）。
 """
 
 import json
@@ -29,7 +32,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent
-DATA_PATH = ROOT / "geodata" / "countries_50m.json"
+DATA_PATH = ROOT / "geodata" / "countries.json"
 FONT_PATH = ROOT / "assets" / "fonts" / "NotoSansJP-Bold.ttf"
 WIDTH, HEIGHT = 1920, 1080
 SUPERSAMPLE = 2

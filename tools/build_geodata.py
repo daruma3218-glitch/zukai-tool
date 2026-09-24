@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""Natural Earth 1:50m 国境（公有）から、地図描画用の軽いデータ geodata/countries_50m.json を作る。
+"""Natural Earth の国境（公有）から、地図描画用の軽いデータ geodata/countries.json を作る。
+
+既定の元データは「日本の立場版」(point of view: JPN) の 1:10m 国境。北方領土・竹島・尖閣は日本、
+クリミアはウクライナとして描かれる。実効支配版（1:50m）も --source defacto で作れる。
 
 使い方:
-  python tools/build_geodata.py <ne_50m_admin_0_countries.geojson>
+  python tools/build_geodata.py <ne_10m_admin_0_countries_jpn.geojson>
+  python tools/build_geodata.py --source defacto <ne_50m_admin_0_countries.geojson>
 
 元データは nvkelso/natural-earth-vector の固定コミットのファイルで、SHA-256 を照合してから変換する。
-国ごと（ISO A3）に図形をまとめ、座標は小数第3位（約100m）に丸める。
+国ごと（ISO A3）に図形をまとめ、線を間引き（Douglas-Peucker）、座標は小数第3位（約100m）に丸める。
 """
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-SOURCE_COMMIT = "ca96624a56bd078437bca8184e78163e5039ad19"
-SOURCE_URL = ("https://raw.githubusercontent.com/nvkelso/natural-earth-vector/" + SOURCE_COMMIT
-              + "/geojson/ne_50m_admin_0_countries.geojson")
-SOURCE_SHA256 = "3e458fc036ad0a66411f2c1e6cac49c5d7bfb81cb1123bc513b22511a2b7fdeb"
-OUT = Path(__file__).resolve().parents[1] / "geodata" / "countries_50m.json"
+COMMIT = "ca96624a56bd078437bca8184e78163e5039ad19"
+SOURCES = {
+    "jpn": {"file": "ne_10m_admin_0_countries_jpn.geojson",
+            "sha256": "11bc047064a5cf2db03efc2aece341e657df2dd59ad715a8221cc1575697df1b",
+            "tolerance": 0.02, "label": "Natural Earth 1:10m Admin 0 Countries, point of view: Japan"},
+    "defacto": {"file": "ne_50m_admin_0_countries.geojson",
+                "sha256": "3e458fc036ad0a66411f2c1e6cac49c5d7bfb81cb1123bc513b22511a2b7fdeb",
+                "tolerance": 0.0, "label": "Natural Earth 1:50m Admin 0 Countries (de facto)"},
+}
+OUT = Path(__file__).resolve().parents[1] / "geodata" / "countries.json"
 
 
 def a3_of(props):
@@ -28,23 +37,63 @@ def ring_area(ring):
     return abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(ring, ring[1:] + ring[:1]))) / 2
 
 
-def main(path):
-    raw = Path(path).read_bytes()
+def _segment_distance(p, a, b):
+    (x, y), (x1, y1), (x2, y2) = p, a, b
+    dx, dy = x2 - x1, y2 - y1
+    if dx == dy == 0:
+        return ((x - x1) ** 2 + (y - y1) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy)))
+    return ((x - x1 - t * dx) ** 2 + (y - y1 - t * dy) ** 2) ** 0.5
+
+
+def simplify(ring, tolerance):
+    """Douglas-Peucker（反復）。小さな島も消さないよう、最低4点（閉じた三角形）は残す。"""
+    if tolerance <= 0 or len(ring) <= 4:
+        return ring
+    keep = [False] * len(ring)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(ring) - 1)]
+    while stack:
+        start, end = stack.pop()
+        best, index = 0.0, None
+        for i in range(start + 1, end):
+            d = _segment_distance(ring[i], ring[start], ring[end])
+            if d > best:
+                best, index = d, i
+        if index is not None and best > tolerance:
+            keep[index] = True
+            stack.extend(((start, index), (index, end)))
+    result = [p for p, k in zip(ring, keep) if k]
+    if len(result) < 4:  # 間引きすぎた小島は元の形のまま
+        return ring
+    return result
+
+
+def main(argv):
+    kind = "jpn"
+    if len(argv) >= 2 and argv[0] == "--source":
+        kind, argv = argv[1], argv[2:]
+    if kind not in SOURCES or len(argv) != 1:
+        raise SystemExit(__doc__)
+    source = SOURCES[kind]
+    raw = Path(argv[0]).read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
-    if digest != SOURCE_SHA256:
+    if digest != source["sha256"]:
         raise SystemExit(f"hash mismatch: {digest}")
     countries = {}
+    points = 0
     for feature in json.loads(raw)["features"]:
         props, geom = feature["properties"], feature["geometry"]
         a3 = a3_of(props)
-        if not a3:
+        if not a3 or not geom:
             continue
         polys = geom["coordinates"] if geom["type"] == "MultiPolygon" else [geom["coordinates"]]
         entry = countries.setdefault(a3, {"a3": a3, "ja": "", "en": "", "polys": [], "_best": -1.0})
         area = 0.0
         for poly in polys:
-            rings = [[[round(x, 3), round(y, 3)] for x, y in ring] for ring in poly]
+            rings = [[[round(x, 3), round(y, 3)] for x, y in simplify(ring, source["tolerance"])] for ring in poly]
             entry["polys"].append(rings)
+            points += sum(len(r) for r in rings)
             area += ring_area(poly[0])
         if area > entry["_best"]:  # 同じ国コードの属領より本土の名前を使う
             entry.update(_best=area, ja=props.get("NAME_JA") or props.get("NAME") or a3,
@@ -55,13 +104,12 @@ def main(path):
         features.append(entry)
     features.sort(key=lambda e: e["a3"])
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    data = {"source": SOURCE_URL, "source_sha256": SOURCE_SHA256, "license": "public domain (Natural Earth)",
-            "features": features}
+    data = {"source": f"https://raw.githubusercontent.com/nvkelso/natural-earth-vector/{COMMIT}/geojson/{source['file']}",
+            "source_sha256": source["sha256"], "dataset": source["label"], "simplify_deg": source["tolerance"],
+            "license": "public domain (Natural Earth)", "features": features}
     OUT.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    print(f"{len(features)} countries -> {OUT} ({OUT.stat().st_size:,} bytes)")
+    print(f"{len(features)} countries, {points:,} points -> {OUT} ({OUT.stat().st_size:,} bytes)")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        raise SystemExit(__doc__)
-    main(sys.argv[1])
+    main(sys.argv[1:])

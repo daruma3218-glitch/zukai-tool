@@ -40,6 +40,36 @@ def test_caspian_sea_stays_one_sea_and_countries_come_from_data():
     assert near(pixel_at(image, info, 34.0, 43.0), m.SEA)          # 黒海も海
 
 
+def owners_in_box(x0, y0, x1, y1):
+    found = set()
+    for a3, country in m.load_countries().items():
+        for bx0, by0, bx1, by1 in country["bboxes"]:
+            if bx0 >= x0 and bx1 <= x1 and by0 >= y0 and by1 <= y1:
+                found.add(a3)
+    return found
+
+
+def test_borders_follow_japans_position():
+    # 北方領土（択捉・国後・色丹・歯舞）は日本。ロシアの図形は含まれない
+    assert owners_in_box(145.3, 43.1, 149.0, 45.6) == {"JPN"}
+    # 竹島・尖閣も日本
+    assert owners_in_box(131.7, 37.1, 132.0, 37.4) == {"JPN"}
+    assert owners_in_box(123.3, 25.6, 123.8, 26.0) == {"JPN"}
+    # クリミアはウクライナ（ロシアの図形の中に入らない）
+    crimea = (34.1, 44.95)
+    ukr = m.load_countries()["UKR"]
+    rus = m.load_countries()["RUS"]
+    assert any(m._inside(*crimea, poly[0]) for poly in ukr["polys"])
+    assert not any(m._inside(*crimea, poly[0]) for poly in rus["polys"])
+
+
+def test_northern_territories_are_not_painted_as_russia():
+    image, info = render({"focus": ["JPN"], "highlight": [{"a3": "RUS", "tone": "main"},
+                                                          {"a3": "JPN", "tone": "warn"}]}, "ロシアと日本",
+                         no_text=True)
+    assert near(pixel_at(image, info, 147.9, 45.05), m.TONES["warn"], tol=40)  # 択捉島は日本の色
+
+
 def test_japan_is_drawn_once_and_sea_of_japan_is_sea():
     image, info = render({"focus": ["JPN", "KOR"], "highlight": [{"a3": "JPN", "tone": "warn"}]}, "日本",
                          no_text=True)
