@@ -28,10 +28,17 @@ from flask import (
     url_for,
 )
 
+import re
+
 from utils import load_env, load_json, save_json
 from pipeline import DiagramPipeline
 from generator import (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS,
-                       OPENAI_IMAGE_MODEL_CHOICES, resolve_openai_image_model)
+                       OPENAI_IMAGE_MODEL_CHOICES, resolve_openai_image_model, resolve_edit_model)
+from prompter import CANDIDATE_MODES, MAP_MODES
+import director_routes
+import image_edit
+import map_renderer
+import retention
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -124,6 +131,11 @@ def version():
         "pipeline_phases": 3,
         "partial_download_enabled": True,
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
+        "default_image_model": resolve_openai_image_model(),
+        "edit_image_model": resolve_edit_model(),
+        "director_tools": {"candidates": list(CANDIDATE_MODES), "map_renderer": map_renderer.enabled(),
+                           "retention_days": retention.retention_days(),
+                           "edits": sorted(image_edit.ACTIONS), "adoption": True},
     })
 
 
@@ -172,6 +184,12 @@ def logout():
 
 
 # ====== ジョブ管理 ======
+@app.before_request
+def start_retention_once():
+    # 古いジョブの自動削除（起動後1回＋6時間ごと）。プロセスごとに1本だけ動く。
+    retention.start_scheduler(OUTPUT_DIR)
+
+
 @app.after_request
 def prevent_stale_progress(response):
     if request.path.startswith(("/api/", "/progress/")) or request.path == "/version":
@@ -246,19 +264,37 @@ def _image_snapshot(result_dir: Path, images=None) -> dict:
     by_index = {item.get("index"): item for item in items}
     known = {item.get("filename") for item in items}
     for path in images:
-        if path.name in known:
-            continue
-        suffix = path.stem.rsplit("_", 1)[-1]
-        idx = int(suffix) if suffix.isdigit() else max(by_index, default=0) + 1
-        item = by_index.get(idx)
-        if item is None:
-            item = {"index": idx}
-            items.append(item)
-            by_index[idx] = item
+        if path.name in known or image_edit.is_edit_file(path.name):
+            continue  # 手直しした版は edits.json で元画像にひも付けて表示する
+        match = _IMAGE_NAME_RE.match(path.stem)
+        variant = match.group(2) if match else None
+        if match and variant:  # 候補（diagram_004_b.png）: 抜粋番号＋案で探す
+            group = int(match.group(1))
+            item = next((i for i in items if i.get("group") == group and i.get("variant") == variant), None)
+            if item is None:
+                item = {"index": max(by_index, default=0) + 1, "group": group, "variant": variant}
+                items.append(item)
+                by_index[item["index"]] = item
+        else:
+            suffix = path.stem.rsplit("_", 1)[-1]
+            idx = int(suffix) if suffix.isdigit() else max(by_index, default=0) + 1
+            item = by_index.get(idx)
+            if item is None:
+                item = {"index": idx}
+                items.append(item)
+                by_index[idx] = item
         item.update(filename=path.name, status="ok", success=True)
     snapshot["items"] = sorted(items, key=lambda item: item.get("index", 0))
     snapshot["available_images"] = len(images)
+    snapshot["edits"] = image_edit.load_edits(result_dir)
+    snapshot["adopted"] = sorted(image_edit.load_adoption(result_dir))
+    expires = retention.expires_at(result_dir) if result_dir.is_dir() else None
+    snapshot["retention"] = {"days": retention.retention_days(),
+                             "expires_at": expires.isoformat(timespec="minutes") if expires else None}
     return snapshot
+
+
+_IMAGE_NAME_RE = re.compile(r"^diagram_(\d{3})(?:_([a-c]))?$")
 
 
 def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
@@ -267,7 +303,9 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          openai_quality: str = "medium",
                          worldview_preset: str = "",
                          no_text_mode: bool = False,
-                         openai_model: str = ""):
+                         openai_model: str = "",
+                         candidate_mode: str = "single",
+                         map_mode: str = "data"):
     job_dir = OUTPUT_DIR / job_id
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
@@ -299,6 +337,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             progress_callback=on_progress,
             log_callback=on_log,
             item_callback=on_item,
+            candidate_mode=candidate_mode,
+            map_mode=map_mode,
         )
         manifest = pipeline.run()
         _set_job_state(
@@ -318,6 +358,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
         traceback.print_exc()
         _set_job_state(job_id, status="error", message=str(e)[:200], percent=0)
         _add_log(job_id, "error", "パイプライン実行エラー", str(e)[:300])
+    finally:
+        retention.run_in_background(OUTPUT_DIR)  # 新しい画像が増えた直後に容量を確かめる
 
 
 # ====== ルート ======
@@ -405,6 +447,12 @@ def start_job():
     user_instructions = request.form.get("user_instructions", "").strip()
     worldview_preset = request.form.get("worldview_preset", "").strip()
     no_text_mode = request.form.get("no_text_mode") == "on"
+    candidate_mode = request.form.get("candidate_mode", "single")
+    if candidate_mode not in CANDIDATE_MODES:
+        candidate_mode = "single"
+    map_mode = request.form.get("map_mode", "data")
+    if map_mode not in MAP_MODES or not map_renderer.enabled():
+        map_mode = "ai" if not map_renderer.enabled() else "data"
 
     # ジョブ作成
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -425,11 +473,14 @@ def start_job():
         provider=provider,
         openai_quality=openai_quality if provider == PROVIDER_GPT_IMAGE else None,
         openai_model=openai_model if provider == PROVIDER_GPT_IMAGE else None,
+        candidate_mode=candidate_mode,
+        map_mode=map_mode,
     )
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset, no_text_mode, openai_model),
+        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality,
+              worldview_preset, no_text_mode, openai_model, candidate_mode, map_mode),
         daemon=True,
     )
     thread.start()
@@ -533,6 +584,11 @@ def download_zip(job_id):
     except Exception:
         archive.close()
         raise
+
+
+# 手直し・採用・採用分ZIP（ディレクター向けの追加API）
+director_routes.register(app, login_required, lambda: OUTPUT_DIR,
+                         lambda job_dir: _image_snapshot(job_dir)["items"])
 
 
 if __name__ == "__main__":

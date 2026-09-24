@@ -62,6 +62,52 @@ NO_TEXT_BLOCK = """
 """
 
 
+# 候補の出し方（2026-09-24）。single は従来どおり1案。
+CANDIDATE_MODES = ("single", "pair", "mixed")
+MAP_MODES = ("data", "ai")
+TYPE_LABELS = {"diagram": "図解", "illustration": "イメージ画像", "realphoto": "実写風",
+               "map": "地図", "chart": "グラフ"}
+
+CANDIDATE_BLOCKS = {
+    "pair": """
+【候補を2案（同じ種類で構図違い）】
+各項目について、同じ type のまま、構図・視点・見せ方がはっきり違う2案を作ること。
+出力の各項目に "variants": [{"variant": "a", "prompt": "..."}, {"variant": "b", "prompt": "..."}] を入れ、
+"prompt" には a と同じものを入れる。言い換えではなく、ディレクターが見比べて選べるほど見た目を変える
+（例: 全体図とアップ、並べ方の違い、比喩の違い）。2案とも【必須ルール】をすべて守ること。
+""",
+    "mixed": """
+【候補を型違いで2〜3案】
+各項目について、その文に合う見せ方を種類違いで2〜3案作ること。種類は diagram（図解）/ illustration（イメージ画像）/
+realphoto（実写風）/ map（地図）/ chart（グラフ）から選ぶ。1案目（a）は元の type にする。
+- map は、国・地域・位置関係が文に出てくる項目だけ。chart は、数値の比較・推移が文にある項目だけ。
+- 出力の各項目に "variants": [{"variant": "a", "type": "diagram", "prompt": "..."},
+  {"variant": "b", "type": "illustration", "prompt": "..."}] を入れる。"prompt" には a と同じものを入れる。
+- どの案も【必須ルール】をすべて守ること。
+""",
+}
+
+MAP_SPEC_BLOCK = """
+【地図は実際の地図データで描く（type が map の項目・案）】
+地図は画像AIで描かず、国境データから描く。map の項目・案では英文プロンプトの代わりに "map_spec" を出す。
+国の形や位置は書かない（データから描くので不要）。
+"map_spec": {
+  "focus": ["RUS", "JPN"],
+  "highlight": [{"a3": "RUS", "tone": "main"}, {"a3": "JPN", "tone": "warn"}],
+  "labels": true,
+  "label_overrides": {"CHN": "清"},
+  "pins": [{"name": "旅順", "country": "CHN", "lon": 121.26, "lat": 38.81}],
+  "arrows": [{"from": "RUS", "to": "旅順", "tone": "main"}]
+}
+- focus: 画面に収める国（ISO 3166-1 alpha-3、1〜8か国）。highlight: 強調する国と色
+  （tone は main / compare / neutral / warn / attention）。
+- label_overrides: 国名を抜粋にある呼び方（例: 清、ソ連）に置き換える時だけ。抜粋に実在する語のみ。
+- pins: 都市・地点（最大6）。name は抜粋に実在する語のみ。座標に確信がない地点は入れない。
+- arrows: 国コードか pins の name を結ぶ（最大4）。
+- excerpt に出てこない国・地名は入れない。国境は現代のもの。
+"""
+
+
 def _build_user_block(user_instructions: str) -> str:
     if not user_instructions.strip():
         return ""
@@ -78,12 +124,23 @@ def generate_prompts_batch(
     user_instructions: str = "",
     worldview_preset: str = "",
     no_text_mode: bool = False,
+    candidate_mode: str = "single",
+    map_mode: str = "ai",
 ) -> list:
     """1 バッチ（10 件程度）の視覚化ポイントを英文プロンプト化"""
     user_block = _build_user_block(user_instructions)
     worldview_block = WORLDVIEW_PRESETS.get((worldview_preset or "").strip(), "")
     if no_text_mode:
         worldview_block = worldview_block + NO_TEXT_BLOCK
+    candidate_block = CANDIDATE_BLOCKS.get(candidate_mode, "")
+    use_map_spec = map_mode == "data" and (candidate_mode == "mixed"
+                                           or any(ex.get("type") == "map" for ex in excerpts_batch))
+    extra_block = candidate_block + (MAP_SPEC_BLOCK if use_map_spec else "")
+    extra_fields = ""
+    if candidate_block:
+        extra_fields += '\n    "variants": [（上の【候補】の指示どおり。案ごとに variant・（型違いは type）・prompt または map_spec）],'
+    if use_map_spec:
+        extra_fields += '\n    "map_spec": {（type が map の項目だけ。上の【地図】の形式）},'
     excerpts_json = json.dumps(excerpts_batch, ensure_ascii=False, indent=2)
 
     system = (
@@ -103,7 +160,7 @@ def generate_prompts_batch(
 
 視覚化ポイント:
 {excerpts_json}
-{user_block}{worldview_block}
+{user_block}{worldview_block}{extra_block}
 
 【必須ルール】
 1. プロンプトは英語で記述（画像生成モデル向け）
@@ -152,7 +209,7 @@ JSON配列のみで返すこと（マークダウン禁止）:
     "excerpt": "元の抜粋（そのまま）",
     "type": "元のtype（そのまま）",
     "keypoint": "元のkeypoint（そのまま）",
-    "allowed_terms": (元のallowed_termsをそのまま),
+    "allowed_terms": (元のallowed_termsをそのまま),{extra_fields}
     "used_labels": ["画像内ラベルに使った語（excerpt内の原文ママのみ・無ければ空配列）"]
   }}
 ]
@@ -163,7 +220,9 @@ JSON配列のみで返すこと（マークダウン禁止）:
     prompts = parse_json_array(result)
 
     # 入力の excerpt 情報をマージ（プロンプト生成側で抜けても保持）
-    prompts_by_index = {p.get("index"): p for p in prompts if p.get("prompt")}
+    # 地図の項目は prompt の代わりに map_spec だけを返すことがある。
+    prompts_by_index = {p.get("index"): p for p in prompts
+                        if isinstance(p, dict) and (p.get("prompt") or p.get("map_spec") or p.get("variants"))}
     merged = []
     for ex in excerpts_batch:
         idx = ex.get("index")
@@ -218,9 +277,17 @@ def generate_all_prompts(
     no_text_mode: bool = False,
     max_workers: int = 5,
     log: Optional[Callable] = None,
+    candidate_mode: str = "single",
+    map_mode: str = "ai",
 ) -> list:
     """全視覚化ポイントを並列バッチで英文プロンプト化"""
     log = log or (lambda *a, **kw: None)
+    candidate_mode = candidate_mode if candidate_mode in CANDIDATE_MODES else "single"
+    map_mode = map_mode if map_mode in MAP_MODES else "ai"
+    if candidate_mode != "single":
+        log("prompter", {"pair": "候補: 同じ種類で構図違いの2案", "mixed": "候補: 型違いで2〜3案"}[candidate_mode])
+    if map_mode == "data":
+        log("prompter", "地図: 画像AIを使わず、実際の地図データで描く")
 
     # 10 件ずつバッチに分割
     batches = []
@@ -241,7 +308,8 @@ def generate_all_prompts(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_batch = {
             executor.submit(generate_prompts_batch, client, batch, title,
-                            user_instructions, worldview_preset, no_text_mode): idx
+                            user_instructions, worldview_preset, no_text_mode,
+                            candidate_mode, map_mode): idx
             for idx, batch in enumerate(batches)
         }
         for future in as_completed(future_to_batch):

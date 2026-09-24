@@ -4,13 +4,15 @@
 asyncio + Semaphore で同時 N 枚を並列生成する。
 プロバイダは 2 種類から選択可:
   - "nanobanana": Google Gemini Flash Image（高速・安価・16:9 自然）
-  - "gpt-image":  OpenAI gpt-image-2（高品質・テキスト精度高）
+  - "gpt-image":  OpenAI gpt-image-2.5 Flare（既定。高品質・テキスト精度高）
+種類が「地図」で map_spec がある項目は、画像AIを使わず map_renderer で実データから描く。
 
 両 SDK は同期 API なので loop.run_in_executor で thread pool に委譲する。
 """
 
 import asyncio
 import base64
+import functools
 import os
 import tempfile
 import time
@@ -28,14 +30,23 @@ from PIL import Image
 
 # ===== モデル設定 =====
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-image-preview"
-DEFAULT_OPENAI_MODEL = "gpt-image-2"
-# UI で選べる OpenAI 画像モデル（順序=表示順）。2026-09-08 公開の gpt-image-2.5 系を追加。
+# 2026-09-24: 既定を gpt-image-2.5 Flare へ（OpenAI公式: gpt-image-2より高品質・待ち時間は約半分・トークン単価は同じ）。
+# 環境変数 OPENAI_IMAGE_MODEL=gpt-image-2 で従来に戻せる。
+DEFAULT_OPENAI_MODEL = "gpt-image-2.5-flare"
+# UI で選べる OpenAI 画像モデル（順序=表示順）。
 OPENAI_IMAGE_MODEL_CHOICES = [
-    ("gpt-image-2", "gpt-image-2（標準）"),
-    ("gpt-image-2.5-flare", "gpt-image-2.5 Flare（高品質・低遅延）"),
+    ("gpt-image-2.5-flare", "gpt-image-2.5 Flare（標準・高品質・低遅延）"),
     ("gpt-image-2.5-sunburst", "gpt-image-2.5 Sunburst（編集制御向け・プレミアム）"),
+    ("gpt-image-2", "gpt-image-2（従来）"),
 ]
 VALID_OPENAI_IMAGE_MODELS = {m for m, _ in OPENAI_IMAGE_MODEL_CHOICES}
+# 1枚ずつの手直し（文字消し・指示直し）は、編集の精度を重視した Sunburst を既定にする。
+DEFAULT_EDIT_MODEL = "gpt-image-2.5-sunburst"
+
+
+def resolve_edit_model() -> str:
+    env = os.environ.get("ZUKAI_EDIT_MODEL", "").strip()
+    return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_EDIT_MODEL
 
 
 def resolve_openai_image_model(*candidates) -> str:
@@ -357,6 +368,78 @@ def _sync_generate_image_openai(
     return False, last_error or "max retries exceeded"
 
 
+# ===== OpenAI 画像編集（1枚ずつの手直し） =====
+EDIT_SIZE = (1536, 1024)  # gpt-image の横長サイズ（3:2）
+
+
+def _pad_to_ratio(img: "Image.Image", ratio: float) -> tuple:
+    """16:9 の画像を上下（または左右）の余白で ratio に広げる。戻り値は (canvas, box)。
+
+    box は元画像が置かれた範囲で、編集結果をこの範囲に切り戻すと元の構図に揃う。
+    """
+    w, h = img.size
+    bg = _detect_background_color(img.convert("RGB"))
+    if w / h > ratio:
+        canvas_w, canvas_h = w, int(round(w / ratio))
+    else:
+        canvas_w, canvas_h = int(round(h * ratio)), h
+    canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
+    left, top = (canvas_w - w) // 2, (canvas_h - h) // 2
+    canvas.paste(img.convert("RGB"), (left, top))
+    return canvas, (left, top, left + w, top + h)
+
+
+def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_path: Path,
+                            model_name: str = DEFAULT_EDIT_MODEL, quality: str = "medium") -> tuple:
+    """元画像を OpenAI の画像編集で直し、元と同じ範囲・大きさで別ファイルに保存する。"""
+    src = Image.open(source_path)
+    src.load()
+    canvas, box = _pad_to_ratio(src, EDIT_SIZE[0] / EDIT_SIZE[1])
+    sent = canvas.resize(EDIT_SIZE, Image.LANCZOS)
+    buffer = BytesIO()
+    sent.save(buffer, format="PNG")
+    last_error = ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.images.edit(
+                model=model_name,
+                image=("image.png", buffer.getvalue(), "image/png"),
+                prompt=instruction,
+                size=f"{EDIT_SIZE[0]}x{EDIT_SIZE[1]}",
+                quality=quality,
+                n=1,
+            )
+            datum = response.data[0] if response and response.data else None
+            b64 = getattr(datum, "b64_json", None) if datum else None
+            if not b64:
+                last_error = "no image in response"
+                continue
+            edited = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+            edited = edited.resize(canvas.size, Image.LANCZOS).crop(box)
+            _save_png(edited, output_path)
+            return True, ""
+        except Exception as e:
+            err = str(e)
+            last_error = err[:200]
+            err_lower = err.lower()
+            if "429" in err or "rate" in err_lower:
+                time.sleep(20 * (attempt + 1))
+                continue
+            if "safety" in err_lower or "policy" in err_lower or "moderation" in err_lower:
+                return False, f"content policy blocked: {err[:120]}"
+            if "404" in err or "model_not_found" in err_lower or "does not exist" in err_lower:
+                return False, f"model not available: {model_name} ({err[:80]})"
+            if "401" in err or "invalid api key" in err_lower:
+                return False, f"invalid OpenAI API key: {err[:80]}"
+            time.sleep(3 + 2 * attempt)
+    return False, last_error or "max retries exceeded"
+
+
+def image_filename(index: int, variant: str = "") -> str:
+    """1案なら従来の diagram_004.png、複数案なら diagram_004_a.png。"""
+    return f"diagram_{index:03d}_{variant}.png" if variant else f"diagram_{index:03d}.png"
+
+
 # ===== 並列ジェネレータ =====
 class ParallelImageGenerator:
     """asyncio + Semaphore による並列画像生成器（マルチプロバイダ）"""
@@ -432,8 +515,14 @@ class ParallelImageGenerator:
         keypoint = prompt_entry.get("keypoint", "")
         allowed_terms = prompt_entry.get("allowed_terms", [])
         no_text = bool(prompt_entry.get("no_text"))
-        filename = f"diagram_{idx:03d}.png"
+        filename = prompt_entry.get("filename") or image_filename(idx)
         output_path = output_dir / filename
+        # 候補（複数案）の情報は画面でまとめて並べるために、そのまま結果へ引き継ぐ。
+        extra = {k: prompt_entry[k] for k in ("group", "variant", "variant_label", "render")
+                 if prompt_entry.get(k) not in (None, "")}
+        is_map = prompt_entry.get("render") == "map"
+        provider = "map-data" if is_map else self.provider
+        notes: list = []
 
         async with semaphore:
             self.progress_callback({
@@ -442,20 +531,30 @@ class ParallelImageGenerator:
                 "section": section,
                 "keypoint": keypoint,
                 "excerpt": excerpt,
-                "provider": self.provider,
+                "provider": provider,
+                **extra,
             })
 
-            full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms,
-                                             no_text=no_text)
             loop = asyncio.get_running_loop()
-
             try:
-                success, error = await loop.run_in_executor(
-                    None,
-                    self._dispatch_sync_generate,
-                    full_prompt,
-                    output_path,
-                )
+                if is_map:
+                    # 地図は画像AIを使わず、国境データから描く（形・位置を誤らない・画像代なし）。
+                    import map_renderer
+                    success, error, notes = await loop.run_in_executor(
+                        None,
+                        functools.partial(map_renderer.render_map_file, prompt_entry.get("map_spec") or {},
+                                          output_path, excerpt=excerpt, allowed_terms=allowed_terms,
+                                          no_text=no_text),
+                    )
+                else:
+                    full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms,
+                                                     no_text=no_text)
+                    success, error = await loop.run_in_executor(
+                        None,
+                        self._dispatch_sync_generate,
+                        full_prompt,
+                        output_path,
+                    )
             except Exception as e:
                 success, error = False, str(e)[:200]
 
@@ -476,10 +575,15 @@ class ParallelImageGenerator:
                 "allowed_terms": allowed_terms,
                 "type": prompt_type,
                 "prompt": prompt_text,
-                "provider": self.provider,
+                "provider": provider,
                 "success": success,
                 "error": error if not success else "",
+                **extra,
             }
+            if is_map:
+                result["map_spec"] = prompt_entry.get("map_spec") or {}
+            if notes:
+                result["notes"] = notes
 
             self.progress_callback({
                 "index": idx,
@@ -489,10 +593,12 @@ class ParallelImageGenerator:
                 "excerpt": excerpt,
                 "filename": filename if success else None,
                 "error": error if not success else "",
-                "provider": self.provider,
+                "provider": provider,
                 "completed_total": completed_now,
                 "failed_total": failed_now,
                 "grand_total": self._total,
+                **extra,
+                **({"notes": notes} if notes else {}),
             })
 
             return result

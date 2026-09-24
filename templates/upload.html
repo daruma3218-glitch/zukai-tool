@@ -38,7 +38,7 @@
         <span class="hidden md:inline text-xs text-gray-400 ml-2">原稿から図解を並列生成</span>
       </div>
       <div class="flex items-center gap-3">
-        <span class="hidden md:inline text-xs text-gray-400">Claude + Gemini</span>
+        <span class="hidden md:inline text-xs text-gray-400">ASTRA + GPT Image 2.5 + 地図データ</span>
         <a href="/logout" class="text-xs text-gray-400 hover:text-gray-600 transition">ログアウト</a>
       </div>
     </div>
@@ -50,7 +50,7 @@
       <!-- Main Form -->
       <div class="lg:col-span-3">
         <h1 class="text-3xl font-bold text-gray-900 mb-2">新しい図解資料を作成</h1>
-        <p class="text-sm text-gray-500 mb-6">完成原稿をセットすると、Gemini で図解画像を並列生成します</p>
+        <p class="text-sm text-gray-500 mb-6">完成原稿をセットすると、図解・イメージ画像・地図を並列で作ります。前回の設定は自動で引き継ぎます</p>
 
         {% if not has_anthropic or not has_gemini %}
         <div class="mb-5 p-4 bg-amber-50 border border-amber-200 rounded-xl">
@@ -121,10 +121,54 @@
             </label>
             <textarea
               name="user_instructions"
+              id="userInstructions"
               rows="3"
               placeholder="例: 水彩タッチでやわらかい雰囲気にして / 落ち着いたモノトーンで / 子供向けに親しみやすく"
               class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 text-sm"
             ></textarea>
+            <button type="button" id="restoreInstructions" class="hidden mt-1 text-xs text-purple-600 hover:underline">前回の指示を入れる</button>
+          </div>
+
+          <!-- 候補の出し方 -->
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-2">
+              候補の出し方
+              <span class="text-xs text-gray-400 font-normal">（見比べて「採用」を選べます）</span>
+            </label>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+              <label class="cursor-pointer">
+                <input type="radio" name="candidate_mode" value="single" class="peer sr-only" checked>
+                <div class="h-full p-3 bg-white border-2 border-gray-200 rounded-xl text-xs peer-checked:border-purple-500 peer-checked:bg-purple-50 transition">
+                  <p class="font-semibold text-gray-900 text-sm">1案</p>
+                  <p class="text-gray-500 mt-0.5">従来どおり。1箇所に1枚</p>
+                </div>
+              </label>
+              <label class="cursor-pointer">
+                <input type="radio" name="candidate_mode" value="pair" class="peer sr-only">
+                <div class="h-full p-3 bg-white border-2 border-gray-200 rounded-xl text-xs peer-checked:border-purple-500 peer-checked:bg-purple-50 transition">
+                  <p class="font-semibold text-gray-900 text-sm">2案（構図違い）</p>
+                  <p class="text-gray-500 mt-0.5">「章ごとに2回生成して選ぶ」を1回で。画像代も2回分と同じ</p>
+                </div>
+              </label>
+              <label class="cursor-pointer">
+                <input type="radio" name="candidate_mode" value="mixed" class="peer sr-only">
+                <div class="h-full p-3 bg-white border-2 border-gray-200 rounded-xl text-xs peer-checked:border-purple-500 peer-checked:bg-purple-50 transition">
+                  <p class="font-semibold text-gray-900 text-sm">型違いで2〜3案</p>
+                  <p class="text-gray-500 mt-0.5">図解・イメージ画像・実写風・地図から、その文に合うもの</p>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- 地図の作り方 -->
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-2">
+              地図の作り方
+            </label>
+            <select name="map_mode" id="mapMode" class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 text-sm bg-white">
+              <option value="data" selected>実際の地図データで描く（推奨・国の形や位置を誤らない・画像代なし）</option>
+              <option value="ai">画像AIで描く（従来）</option>
+            </select>
           </div>
 
           <!-- 画像生成モデル選択 -->
@@ -135,7 +179,7 @@
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
               <!-- nanobanana -->
               <label class="provider-card relative cursor-pointer">
-                <input type="radio" name="provider" value="nanobanana" class="peer sr-only" checked>
+                <input type="radio" name="provider" value="nanobanana" class="peer sr-only">
                 <div class="p-4 bg-white border-2 border-gray-200 rounded-xl peer-checked:border-purple-500 peer-checked:bg-purple-50 transition hover:border-purple-300">
                   <div class="flex items-start gap-3">
                     <div class="flex-shrink-0 w-10 h-10 rounded-lg bg-gradient-to-br from-yellow-400 to-orange-400 flex items-center justify-center text-xl">
@@ -158,22 +202,22 @@
 
               <!-- gpt-image -->
               <label class="provider-card relative cursor-pointer">
-                <input type="radio" name="provider" value="gpt-image" class="peer sr-only">
+                <input type="radio" name="provider" value="gpt-image" class="peer sr-only" checked>
                 <div class="p-4 bg-white border-2 border-gray-200 rounded-xl peer-checked:border-pink-500 peer-checked:bg-pink-50 transition hover:border-pink-300">
                   <div class="flex items-start gap-3">
                     <div class="flex-shrink-0 w-10 h-10 rounded-lg bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-white font-bold text-sm">
-                      G2
+                      2.5
                     </div>
                     <div class="flex-1 min-w-0">
                       <div class="flex items-center gap-2 mb-0.5">
-                        <p class="text-sm font-semibold text-gray-900">gpt-image-2</p>
+                        <p class="text-sm font-semibold text-gray-900">GPT Image 2.5（標準）</p>
                         {% if has_openai %}
                         <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 font-medium">利用可</span>
                         {% else %}
                         <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 font-medium">キー未設定</span>
                         {% endif %}
                       </div>
-                      <p class="text-[11px] text-gray-500 leading-snug">OpenAI ChatGPT-image 2.0。<strong>高品質・テキスト精度高</strong></p>
+                      <p class="text-[11px] text-gray-500 leading-snug">OpenAI の最新モデル（Flare）。<strong>高品質・文字も正確・待ち時間は2の約半分</strong></p>
                     </div>
                   </div>
                 </div>
@@ -181,9 +225,9 @@
             </div>
 
             <!-- gpt-image 選択時のみ表示: 品質 -->
-            <div id="qualityRow" class="mt-3 hidden">
+            <div id="qualityRow" class="mt-3">
               <label class="block text-xs font-medium text-gray-600 mb-2">OpenAI 画像モデル</label>
-              <select name="openai_model" class="w-full mb-3 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-purple-500">
+              <select name="openai_model" id="openaiModel" class="w-full mb-3 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-purple-500">
                 {% for m in openai_image_models %}
                 <option value="{{ m.id }}">{{ m.label }}</option>
                 {% endfor %}
@@ -219,9 +263,9 @@
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div class="bg-white rounded-xl border border-gray-200 p-4">
               <label class="block text-sm font-medium text-gray-700 mb-3">
-                生成枚数
+                図にする箇所
                 <span class="ml-1 text-purple-600 font-bold" id="countLabel">50</span>
-                <span class="text-xs text-gray-400">枚</span>
+                <span class="text-xs text-gray-400">箇所</span>
               </label>
               <input
                 type="range"
@@ -233,6 +277,7 @@
               <div class="flex justify-between text-xs text-gray-400 mt-1">
                 <span>10</span><span>50</span><span>100</span><span>200</span>
               </div>
+              <p id="planEstimate" class="text-[11px] text-gray-500 mt-2"></p>
             </div>
 
             <div class="bg-white rounded-xl border border-gray-200 p-4">
@@ -347,27 +392,88 @@
       charCount.textContent = manuscriptText.value.length.toLocaleString();
     });
 
+    // 画像の枚数の目安（候補の出し方 × 箇所）
+    const planEstimate = document.getElementById('planEstimate');
+    function checkedValue(name) {
+      const el = document.querySelector(`input[name="${name}"]:checked`);
+      return el ? el.value : '';
+    }
+    function updateEstimate() {
+      const n = parseInt(targetCount.value) || 0;
+      const mode = checkedValue('candidate_mode');
+      const text = mode === 'pair' ? `${n}箇所 × 2案 ＝ 画像 約${n * 2}枚（地図は1枚・画像代なし）`
+        : mode === 'mixed' ? `${n}箇所 × 2〜3案 ＝ 画像 約${n * 2}〜${n * 3}枚（地図は画像代なし）`
+        : `${n}箇所 ＝ 画像 約${n}枚`;
+      planEstimate.textContent = '目安: ' + text;
+    }
+
     // スライダー
-    targetCount.addEventListener('input', () => { countLabel.textContent = targetCount.value; });
+    targetCount.addEventListener('input', () => { countLabel.textContent = targetCount.value; updateEstimate(); });
     concurrency.addEventListener('input', () => { concurrencyLabel.textContent = concurrency.value; });
+    document.querySelectorAll('input[name="candidate_mode"]').forEach(r => r.addEventListener('change', updateEstimate));
 
     // モデル選択 → 品質欄の表示切替 + 推奨並列度の調整
     const qualityRow = document.getElementById('qualityRow');
-    document.querySelectorAll('input[name="provider"]').forEach(radio => {
-      radio.addEventListener('change', (e) => {
-        const v = e.target.value;
-        if (v === 'gpt-image') {
-          qualityRow.classList.remove('hidden');
-          // OpenAI はレート制限が厳しめなので並列度を抑える
-          if (parseInt(concurrency.value) > 8) {
-            concurrency.value = 8;
-            concurrencyLabel.textContent = 8;
-          }
-        } else {
-          qualityRow.classList.add('hidden');
+    function applyProvider(v) {
+      if (v === 'gpt-image') {
+        qualityRow.classList.remove('hidden');
+        // OpenAI はレート制限が厳しめなので並列度を抑える
+        if (parseInt(concurrency.value) > 8) {
+          concurrency.value = 8;
+          concurrencyLabel.textContent = 8;
         }
-      });
+      } else {
+        qualityRow.classList.add('hidden');
+      }
+    }
+    document.querySelectorAll('input[name="provider"]').forEach(radio => {
+      radio.addEventListener('change', (e) => applyProvider(e.target.value));
     });
+
+    // 前回の設定を覚える（このブラウザだけ。使えない環境では何もしない）
+    const SETTINGS_KEY = 'zukai.settings.v1';
+    const INSTRUCTIONS_KEY = 'zukai.lastInstructions.v1';
+    const userInstructions = document.getElementById('userInstructions');
+    const restoreInstructions = document.getElementById('restoreInstructions');
+    function readStore(key) {
+      try { return localStorage.getItem(key); } catch (e) { return null; }
+    }
+    function writeStore(key, value) {
+      try { localStorage.setItem(key, value); } catch (e) {}
+    }
+    function restoreSettings() {
+      let saved = {};
+      try { saved = JSON.parse(readStore(SETTINGS_KEY) || '{}') || {}; } catch (e) { saved = {}; }
+      ['provider', 'candidate_mode', 'openai_quality'].forEach(name => {
+        const el = saved[name] && document.querySelector(`input[name="${name}"][value="${saved[name]}"]`);
+        if (el) el.checked = true;
+      });
+      ['openai_model', 'map_mode', 'worldview_preset'].forEach(name => {
+        const el = document.querySelector(`select[name="${name}"]`);
+        if (el && saved[name] !== undefined && [...el.options].some(o => o.value === saved[name])) el.value = saved[name];
+      });
+      if (saved.target_count) { targetCount.value = saved.target_count; countLabel.textContent = targetCount.value; }
+      if (saved.concurrency) { concurrency.value = saved.concurrency; concurrencyLabel.textContent = concurrency.value; }
+      applyProvider(checkedValue('provider'));
+      if (readStore(INSTRUCTIONS_KEY)) restoreInstructions.classList.remove('hidden');
+      updateEstimate();
+    }
+    function saveSettings() {
+      const data = {
+        provider: checkedValue('provider'), candidate_mode: checkedValue('candidate_mode'),
+        openai_quality: checkedValue('openai_quality'),
+        openai_model: document.querySelector('select[name="openai_model"]').value,
+        map_mode: document.querySelector('select[name="map_mode"]').value,
+        worldview_preset: document.querySelector('select[name="worldview_preset"]').value,
+        target_count: targetCount.value, concurrency: concurrency.value,
+      };
+      writeStore(SETTINGS_KEY, JSON.stringify(data));
+      if (userInstructions.value.trim()) writeStore(INSTRUCTIONS_KEY, userInstructions.value);
+    }
+    restoreInstructions.addEventListener('click', () => {
+      userInstructions.value = readStore(INSTRUCTIONS_KEY) || '';
+    });
+    restoreSettings();
 
     // フォーム送信
     form.addEventListener('submit', async (e) => {
@@ -375,6 +481,7 @@
       errorBox.classList.add('hidden');
       submitBtn.disabled = true;
       submitText.textContent = '送信中...';
+      saveSettings();
 
       const formData = new FormData(form);
       try {

@@ -115,10 +115,15 @@
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
           <span id="downloadLabel">ZIP でダウンロード</span>
         </a>
+        <a id="adoptedBtn" href="" class="hidden inline-flex items-center gap-2 px-5 py-2.5 bg-amber-500 text-white font-medium rounded-xl hover:bg-amber-600 transition shadow-md">
+          ★ <span id="adoptedLabel">採用分だけZIP</span>
+        </a>
         <a href="/" class="inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition">
           + 新しいジョブを作成
         </a>
       </div>
+      <p id="adoptHint" class="hidden mt-2 text-xs text-gray-500">画像の右上の ☆ を押すと「採用」になり、採用した画像だけをZIPで取り出せます（章・抜粋との対応表つき）。</p>
+      <p id="retentionNote" class="hidden mt-2 text-xs text-gray-500"></p>
     </div>
 
     <!-- メイン: グリッド + サイドログ -->
@@ -175,11 +180,25 @@
         </div>
       </div>
       <div class="bg-gray-100 flex items-center justify-center p-4">
-        <img id="modalImg" src="" class="max-w-full max-h-[70vh] object-contain rounded-lg shadow">
+        <img id="modalImg" src="" class="max-w-full max-h-[56vh] object-contain rounded-lg shadow">
+      </div>
+      <div class="px-5 py-3 border-t border-gray-200">
+        <div class="flex flex-wrap items-center gap-2">
+          <button id="modalAdopt" onclick="toggleShownAdopted()" class="px-3 py-1.5 rounded-lg text-sm font-medium border border-amber-400 text-amber-700 hover:bg-amber-50">☆ この版を採用</button>
+          <span class="text-gray-300">|</span>
+          <button onclick="editImage('flip')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">左右反転</button>
+          <button onclick="editImage('remove_text')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">文字を全部消す</button>
+          <input id="instructText" type="text" maxlength="1000" placeholder="例: 背景をもっと暗く / 右の人物を消して" class="flex-1 min-w-[12rem] px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
+          <button onclick="editImage('instruct')" class="px-3 py-1.5 rounded-lg text-sm border border-purple-400 text-purple-700 hover:bg-purple-50">指示して直す</button>
+        </div>
+        <p class="text-[11px] text-gray-400 mt-1">左右反転は費用なし。文字消し・指示直しは画像1枚分の費用（GPT Image 2.5 Sunburst）。元の画像は残り、直した画像は別の版として下に並びます。</p>
+        <p id="editStatus" class="text-xs mt-1"></p>
+        <div id="versionStrip" class="mt-2 flex gap-2 overflow-x-auto"></div>
       </div>
       <div class="px-5 py-3 border-t border-gray-200 bg-gray-50">
         <p class="text-xs text-gray-500 mb-1">対応する原稿の抜粋:</p>
         <p id="modalExcerpt" class="text-sm text-gray-800"></p>
+        <p id="modalNotes" class="text-xs text-amber-700 mt-1"></p>
       </div>
     </div>
   </div>
@@ -191,6 +210,12 @@
     let jobStatus = 'running';
     let availableImages = 0;
     let knownItems = {}; // index -> item
+    let adoptedSet = new Set();   // 採用したファイル名（元画像または手直し版）
+    let editsList = [];           // 手直しの記録（edits.json）
+    let retentionInfo = null;     // 自動削除の予定
+    let lastStructure = '';       // 画像の並び（候補の組）が変わった時だけ全体を描き直す
+    let modalState = null;        // {idx, source, shown}
+    let editPollTimer = null;
 
     const els = {
       jobTitle: document.getElementById('jobTitle'),
@@ -210,7 +235,31 @@
       actions: document.getElementById('actions'),
       downloadBtn: document.getElementById('downloadBtn'),
       downloadLabel: document.getElementById('downloadLabel'),
+      adoptedBtn: document.getElementById('adoptedBtn'),
+      adoptedLabel: document.getElementById('adoptedLabel'),
+      adoptHint: document.getElementById('adoptHint'),
+      retentionNote: document.getElementById('retentionNote'),
     };
+
+    // ===== 採用・手直しの記録 =====
+    function stemOf(name) {
+      return (name || '').replace(/\.[^.]+$/, '').replace(/__e\d+$/, '');
+    }
+    function editsFor(filename) {
+      const stem = stemOf(filename);
+      return editsList.filter(e => stemOf(e.source) === stem);
+    }
+    function adoptedVersionsOf(filename) {
+      const stem = stemOf(filename);
+      return [...adoptedSet].filter(f => stemOf(f) === stem);
+    }
+    function isAdopted(item) {
+      return !!item.filename && adoptedVersionsOf(item.filename).length > 0;
+    }
+    function cardSignature(item) {
+      const edits = item.filename ? editsFor(item.filename).map(e => e.status).join('') : '';
+      return `${item.status}|${item.filename || ''}|${isAdopted(item)}|${edits}`;
+    }
 
     function escapeHtml(s) {
       if (!s) return '';
@@ -281,36 +330,70 @@
           </div>`;
       }
 
-      // フッター: 番号
+      // 番号（候補は「箇所番号＋案」）・採用の☆・手直しの版数
+      const number = `${String(item.group ?? idx).padStart(3, '0')}${item.variant || ''}`;
+      const adopted = isAdopted(item);
+      const edits = filename ? editsFor(filename) : [];
+      const running = edits.some(e => e.status === 'running');
+      const typeBadge = (item.variant || item.render === 'map') && item.variant_label
+        ? `<span class="absolute bottom-10 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(item.variant_label)}</span>` : '';
+      const adoptBtn = status === 'ok' && filename
+        ? `<button type="button" title="採用する（もう一度押すと取り消し）" onclick="event.stopPropagation(); toggleCardAdopted(${idx})" class="absolute top-1 right-1 z-10 w-7 h-7 rounded-full ${adopted ? 'bg-amber-400 text-white' : 'bg-black/40 text-white hover:bg-amber-400'} text-sm leading-7 text-center">${adopted ? '★' : '☆'}</button>` : '';
+      const editBadge = edits.length
+        ? `<span class="absolute top-1.5 right-9 z-10 ${running ? 'bg-yellow-400' : 'bg-purple-600'} text-white text-[10px] px-1.5 py-0.5 rounded">${running ? '直し中' : '直し' + edits.filter(e => e.status === 'ok').length}</span>` : '';
       return `
-        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border border-gray-200 bg-white" data-status="${status}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
-          <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${String(idx).padStart(3, '0')}</span>
+        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border ${adopted ? 'border-amber-400 ring-2 ring-amber-300' : 'border-gray-200'} bg-white" data-status="${status}" data-sig="${escapeHtml(cardSignature(item))}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
+          <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${number}</span>
+          ${adoptBtn}${editBadge}${typeBadge}
           ${inner}
         </div>`;
+    }
+
+    function renderGroups(items) {
+      // 候補（複数案）は、同じ抜粋の案を横に並べて見比べられるようにする
+      const byGroup = new Map();
+      items.forEach(item => {
+        const g = item.group ?? item.index;
+        if (!byGroup.has(g)) byGroup.set(g, []);
+        byGroup.get(g).push(item);
+      });
+      return [...byGroup.entries()].sort((a, b) => a[0] - b[0]).map(([g, list]) => {
+        list.sort((a, b) => (a.variant || '').localeCompare(b.variant || ''));
+        const first = list[0];
+        return `
+          <div class="border border-gray-100 rounded-xl p-3">
+            <div class="flex items-baseline gap-2 mb-1">
+              <span class="font-mono text-xs font-semibold text-purple-700">No.${String(g).padStart(3, '0')}</span>
+              <span class="text-[11px] text-gray-400 truncate">${escapeHtml(first.section || '')}</span>
+            </div>
+            <p class="text-xs text-gray-700 mb-2">${escapeHtml(first.excerpt || '')}</p>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-3">${list.map(renderItem).join('')}</div>
+          </div>`;
+      }).join('');
     }
 
     function rebuildGrid(items) {
       // ソート
       items.sort((a, b) => (a.index || 0) - (b.index || 0));
       const grid = els.imgGrid;
+      const grouped = items.some(i => i.variant);
+      const structure = `${grouped}|` + items.map(i => `${i.index}:${i.group ?? ''}:${i.variant ?? ''}`).join(',');
       // 部分更新: 既存と差分があるカードのみ書き換える
       const existingIds = new Set(Array.from(grid.querySelectorAll('[id^="card-"]')).map(e => parseInt(e.id.replace('card-', ''))));
-      const newIds = new Set(items.map(i => i.index));
 
-      // 全て新規（初回）
-      if (existingIds.size === 0 && items.length > 0) {
-        grid.innerHTML = items.map(renderItem).join('');
+      // 初回、または候補の組み方が変わった時は全体を描き直す
+      if ((existingIds.size === 0 || structure !== lastStructure) && items.length > 0) {
+        lastStructure = structure;
+        grid.className = grouped ? 'space-y-3'
+          : 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-3';
+        grid.innerHTML = grouped ? renderGroups(items) : items.map(renderItem).join('');
         return;
       }
 
-      // 既存のうち、ステータスが変わったものだけ書き換え
+      // 既存のうち、状態・採用・手直しが変わったものだけ書き換え
       items.forEach(item => {
         const card = document.getElementById(`card-${item.index}`);
-        const prevStatus = card?.getAttribute('data-status');
-        if (!card) {
-          // 新規追加
-          grid.insertAdjacentHTML('beforeend', renderItem(item));
-        } else if (prevStatus !== item.status || card.getAttribute('data-filename') !== (item.filename || '')) {
+        if (card && card.getAttribute('data-sig') !== cardSignature(item)) {
           card.outerHTML = renderItem(item);
         }
       });
@@ -333,6 +416,65 @@
       els.downloadLabel.textContent = jobStatus === 'completed'
         ? `ZIP でダウンロード（${availableImages}枚）`
         : `完成済み ${availableImages}枚をZIPでダウンロード`;
+      const adoptedCount = adoptedSet.size;
+      els.adoptedBtn.classList.toggle('hidden', adoptedCount === 0);
+      els.adoptedBtn.href = `/download-adopted/${JOB_ID}`;
+      els.adoptedLabel.textContent = `採用分だけZIP（${adoptedCount}枚）`;
+      els.adoptHint.classList.toggle('hidden', availableImages === 0 || adoptedCount > 0);
+    }
+
+    function updateRetention() {
+      const info = retentionInfo;
+      if (!info || !info.expires_at || !info.days) {
+        els.retentionNote.classList.toggle('hidden', true);
+        return;
+      }
+      const d = new Date(info.expires_at);
+      const label = isNaN(d) ? info.expires_at : `${d.getMonth() + 1}月${d.getDate()}日`;
+      els.retentionNote.textContent = `この結果は ${label} ごろに自動で削除されます（完了から${info.days}日）。使う画像はZIPで保存してください。`;
+      els.retentionNote.classList.toggle('hidden', false);
+    }
+
+    async function postJson(url, body) {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                     body: JSON.stringify(body) });
+      let data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (!res.ok) throw new Error(data.error || `エラー（${res.status}）`);
+      return data;
+    }
+
+    async function setAdopted(filename, adopted, group) {
+      const data = await postJson(`/api/adopt/${JOB_ID}`, { filename, adopted, group });
+      adoptedSet = new Set(data.adopted || []);
+      rebuildGrid(Object.values(knownItems));
+      updateDownload();
+      if (modalState) renderModal();
+    }
+
+    async function toggleCardAdopted(idx) {
+      const item = knownItems[idx];
+      if (!item || !item.filename) return;
+      try {
+        const versions = adoptedVersionsOf(item.filename);
+        if (versions.length) {
+          for (const f of versions) await setAdopted(f, false, item.group ?? item.index);
+        } else {
+          await setAdopted(item.filename, true, item.group ?? item.index);
+        }
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    function scheduleEditPoll() {
+      // 手直しが進行中の間は、生成が終わった後も状態を取りに行く
+      if (editPollTimer || !editsList.some(e => e.status === 'running')) return;
+      editPollTimer = setTimeout(async () => {
+        editPollTimer = null;
+        await pollItems();
+        if (modalState) renderModal();
+      }, 2000);
     }
 
     // ===== 完了通知（別タブ・他作業中でもデスクトップ通知を出す） =====
@@ -400,13 +542,19 @@
         const data = await res.json();
         const items = data.items || [];
         availableImages = data.available_images ?? items.filter(i => i.status === 'ok' && i.filename).length;
+        adoptedSet = new Set(data.adopted || []);
+        editsList = data.edits || [];
+        retentionInfo = data.retention || null;
         updateDownload();
+        updateRetention();
         if (items.length > 0) {
+          // 内部キャッシュ
+          knownItems = {};
+          items.forEach(i => { knownItems[i.index] = i; });
           rebuildGrid(items);
           updateSummary(items);
-          // 内部キャッシュ
-          items.forEach(i => { knownItems[i.index] = i; });
         }
+        scheduleEditPoll();
       } catch (e) {
         console.error('items error', e);
       }
@@ -455,20 +603,113 @@
     }
 
     function openModal(idx) {
+      const item = knownItems[idx];
       const card = document.getElementById(`card-${idx}`);
-      if (!card) return;
-      const filename = card.getAttribute('data-filename');
+      const filename = (item && item.filename) || (card && card.getAttribute('data-filename'));
       if (!filename) return;
-      document.getElementById('modalImg').src = `/results/${JOB_ID}/images/${filename}`;
-      document.getElementById('modalDownload').href = `/results/${JOB_ID}/images/${filename}`;
-      document.getElementById('modalTitle').textContent = card.getAttribute('data-keypoint') || `図 ${idx}`;
-      document.getElementById('modalSection').textContent = card.getAttribute('data-section') || '';
-      document.getElementById('modalExcerpt').textContent = card.getAttribute('data-excerpt') || '';
+      modalState = { idx, source: filename, shown: filename, pending: null };
+      const title = (item && (item.keypoint || (item.excerpt || '').substring(0, 30))) || `図 ${idx}`;
+      const prefix = item && item.variant
+        ? `No.${String(item.group ?? idx).padStart(3, '0')}${item.variant} ${item.variant_label || ''}　` : '';
+      document.getElementById('modalTitle').textContent = prefix + title;
+      document.getElementById('modalSection').textContent = (item && item.section) || '';
+      document.getElementById('modalExcerpt').textContent = (item && item.excerpt) || '';
+      const notes = (item && item.notes) || [];
+      document.getElementById('modalNotes').textContent = notes.length ? '地図のメモ: ' + notes.join(' / ') : '';
+      document.getElementById('instructText').value = '';
+      document.getElementById('editStatus').textContent = '';
+      renderModal();
       document.getElementById('modal').classList.remove('hidden');
     }
+
+    function renderModal() {
+      if (!modalState) return;
+      const source = modalState.source;
+      const edits = editsFor(source);
+      // 頼んだ手直しが終わったら、その版を表示する
+      const pending = modalState.pending && edits.find(e => e.output === modalState.pending);
+      if (pending && pending.status !== 'running') {
+        if (pending.status === 'ok') modalState.shown = pending.output;
+        modalState.pending = null;
+      }
+      const shownEdit = edits.find(e => e.output === modalState.shown);
+      if (shownEdit && shownEdit.status !== 'ok') modalState.shown = source;
+      const shown = modalState.shown;
+      const url = `/results/${JOB_ID}/images/${shown}`;
+      const img = document.getElementById('modalImg');
+      if (!img.src.endsWith(url)) img.src = url;
+      document.getElementById('modalDownload').href = url;
+      const adopted = adoptedSet.has(shown);
+      const adoptBtn = document.getElementById('modalAdopt');
+      adoptBtn.textContent = adopted ? '★ 採用中（押すと取り消し）' : '☆ この版を採用';
+      adoptBtn.className = 'px-3 py-1.5 rounded-lg text-sm font-medium border ' +
+        (adopted ? 'bg-amber-400 border-amber-400 text-white' : 'border-amber-400 text-amber-700 hover:bg-amber-50');
+      const versions = [{ output: source, label: '元の画像', status: 'ok' }, ...edits];
+      document.getElementById('versionStrip').innerHTML = versions.map(v => {
+        const active = v.output === shown;
+        const star = adoptedSet.has(v.output) ? '★ ' : '';
+        if (v.status === 'running') {
+          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-yellow-50 border border-yellow-300 flex items-center justify-center text-[11px] text-yellow-700">${escapeHtml(v.label)}…</div>`;
+        }
+        if (v.status === 'failed') {
+          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-red-50 border border-red-300 p-1 text-[10px] text-red-700 overflow-hidden" title="${escapeHtml(v.error || '')}">${escapeHtml(v.label)}：失敗<br>${escapeHtml((v.error || '').substring(0, 60))}</div>`;
+        }
+        return `<button type="button" onclick="showVersion('${v.output}')" class="flex-shrink-0 w-32 rounded-lg overflow-hidden border-2 ${active ? 'border-purple-500' : 'border-transparent'}"><img src="/results/${JOB_ID}/images/${v.output}" class="w-32 h-[4.5rem] object-cover" loading="lazy"><span class="block text-[10px] text-gray-600 py-0.5">${star}${escapeHtml(v.label)}</span></button>`;
+      }).join('');
+      const running = edits.filter(e => e.status === 'running').length;
+      const status = document.getElementById('editStatus');
+      if (running) {
+        status.textContent = `手直し中（${running}件）… 終わると下に並びます`;
+        status.className = 'text-xs mt-1 text-yellow-700';
+      } else if (status.className.indexOf('text-red') === -1) {
+        status.textContent = '';
+      }
+    }
+
+    function showVersion(output) {
+      if (!modalState) return;
+      modalState.shown = output;
+      renderModal();
+    }
+
+    async function toggleShownAdopted() {
+      if (!modalState) return;
+      const item = knownItems[modalState.idx] || {};
+      try {
+        await setAdopted(modalState.shown, !adoptedSet.has(modalState.shown), item.group ?? item.index);
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function editImage(action) {
+      if (!modalState) return;
+      const instruction = action === 'instruct' ? document.getElementById('instructText').value.trim() : '';
+      if (action === 'instruct' && !instruction) {
+        alert('直してほしい内容を入力してください');
+        return;
+      }
+      const status = document.getElementById('editStatus');
+      status.textContent = '';
+      status.className = 'text-xs mt-1';
+      try {
+        const data = await postJson(`/api/edit/${JOB_ID}`, { source: modalState.shown, action, instruction });
+        editsList = data.edits || editsList;
+        if (data.edit) modalState.pending = data.edit.output;
+        if (action === 'instruct') document.getElementById('instructText').value = '';
+        renderModal();
+        rebuildGrid(Object.values(knownItems));
+        scheduleEditPoll();
+      } catch (e) {
+        status.textContent = e.message;
+        status.className = 'text-xs mt-1 text-red-600';
+      }
+    }
+
     function closeModal(e) {
       if (e && e.target.tagName === 'IMG') return;
       document.getElementById('modal').classList.add('hidden');
+      modalState = null;
     }
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') closeModal();
