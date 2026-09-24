@@ -393,5 +393,6 @@ def test_upload_page_shows_last_run_and_folds_advanced_settings(client, tmp_path
     utils.save_json(root / "manifest.json", {"groups": 10, "images_planned": 20, "succeeded": 19})
     html = client.get("/").get_data(as_text=True)
     assert "前回の実績: 10箇所・画像20枚で約10分" in html
+    assert "✓ 19/20" in html  # 最近のジョブは予定の枚数と比べる
     assert html.index('id="mainSettings"') < html.index('id="advancedSettings"') < html.index('id="submitBtn"')
     assert html.index('id="qualityRow"') < html.index('id="advancedSettings"')  # 画質はよく使う設定の側

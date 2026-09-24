@@ -422,7 +422,8 @@ def index():
                 "title": manifest.get("title", job_state.get("title", d.name)),
                 "status": job_state.get("status", "unknown"),
                 "succeeded": manifest.get("succeeded", job_state.get("succeeded", 0)),
-                "target": manifest.get("target_count", job_state.get("target_count", 0)),
+                # 候補モードは「箇所数」ではなく予定の枚数と比べる（19/10 ではなく 19/20）
+                "target": manifest.get("images_planned") or manifest.get("target_count", job_state.get("target_count", 0)),
                 "date": d.name[:8] if len(d.name) >= 8 else "",
             })
             seconds = _job_elapsed_seconds(d.name, job_state) if job_state.get("status") == "completed" else None
