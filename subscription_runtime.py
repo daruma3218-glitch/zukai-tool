@@ -48,6 +48,11 @@ RETRY_DELAYS = (5, 15)
 # 図解検査 20260910_065100 では Codex の上限応答が約97秒後に解けており、即停止だと1バッチ分が未確認になった。
 # 待機後も継続できなければ、呼出側が許可している場合だけ他方のサブスクCLIへ移る。従量APIへは切り替えない。
 USAGE_LIMIT_DELAYS = (30, 90)
+# 2026-09-25: PCワーカーのハートビートが古い時は、止めて通知する前に合計45秒（0・5・20・45秒の4回）確かめる。
+# 同日10:37〜11:37、PCのメモリ・TCPポート不足でハートビートの書き込みが一時的に遅れ、
+# 旧設定（合計20秒）ではワーカーが処理を続けていたのに worker_unavailable の通知が7件出た。
+WORKER_CHECK_DELAYS = (5, 15, 25)
+WORKER_HEARTBEAT_FRESH_SEC = 60
 BUCKET = "subsk-gateway"
 JOB_ID = contextvars.ContextVar("subscription_job_id", default="")
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -160,8 +165,8 @@ def readiness():
             "ready":any(s["ready"] for s in status.values()), "providers":status}
 
 
-def _safe_label(value):
-    return re.sub(r"[\x00-\x1f\[\]]", " ", str(value or ""))[:160]
+def _safe_label(value, limit=160):
+    return re.sub(r"[\x00-\x1f\[\]]", " ", str(value or ""))[:limit]
 
 
 def _env_secret(name):
@@ -195,14 +200,15 @@ def enqueue_notice(request, attempts, reason, *, test=False):
     job = request.get("job_id") or request["id"]
     # A job's parallel failures produce one notice. Without a job id, use the call id.
     notice_id = hashlib.sha256((request.get("tool", "") + ":" + job).encode()).hexdigest()[:20]
-    routes = ", ".join(f"{a['provider']}#{a['attempt']}:{a['reason']}" for a in attempts)
+    routes = ", ".join(f"{a['provider']}#{a['attempt']}:{a['reason']}" + (f"({a['heartbeat']})" if a.get("heartbeat") else "")
+                       for a in attempts)
     title = "CLI障害通知の接続テスト" if test else "サブスクCLI処理停止・要確認"
     body = (f"[info][title]{title}[/title]\n"
             f"ツール: {_safe_label(request.get('tool'))}\n"
             f"工程: {_safe_label(request.get('label'))}\n"
             f"ジョブ: {_safe_label(job)}\n"
             f"状態: {_safe_label(reason)}\n"
-            f"試行: {_safe_label(routes)}\n"
+            f"試行: {_safe_label(routes, 320)}\n"
             "従量課金LLM APIへの切替は行っていません。再開用の入力を保存しました。\n"
             f"通知ID: {notice_id}\n[/info]")
     with _notice_db() as db:
@@ -719,20 +725,39 @@ def _storage(method,path,body=None):
         return exc.code,{}
 
 
+def _worker_heartbeat():
+    """PCワーカーのハートビートを読み、(使えるか, 短い理由) を返す。理由は routing.jsonl と通知の試行欄に残す。"""
+    try:
+        code,hb=_storage("GET","hb/worker.json")
+    except CliFailure as exc:
+        return False,str(exc)[:40]
+    except (OSError,ValueError) as exc:
+        return False,type(exc).__name__
+    if code!=200:
+        return False,"http"+str(code)
+    try:
+        age=time.time()-float(hb.get("ts",0))
+    except (TypeError,ValueError):
+        return False,"bad_ts"
+    if hb.get("policy_version")!=POLICY_VERSION or hb.get("routing_version")!=ROUTING_VERSION:
+        return False,"version"
+    if age>=WORKER_HEARTBEAT_FRESH_SEC:
+        return False,"age"+str(int(age))+"s"
+    return True,""
+
+
 def _gateway_generate(request):
     attempts=[]
-    for index in range(3):
+    for index in range(len(WORKER_CHECK_DELAYS)+1):
         if index:
-            time.sleep(RETRY_DELAYS[index-1])
-        try:
-            code,hb=_storage("GET","hb/worker.json")
-            if (code==200 and time.time()-float(hb.get("ts",0))<60
-                    and hb.get("policy_version")==POLICY_VERSION
-                    and hb.get("routing_version")==ROUTING_VERSION):
-                break
-        except (OSError,ValueError,CliFailure):
-            pass
-        attempts.append({"provider":"worker","attempt":index+1,"reason":"worker_unavailable"})
+            time.sleep(WORKER_CHECK_DELAYS[index-1])
+        alive,detail=_worker_heartbeat()
+        if alive:
+            if attempts:
+                # 一瞬の途切れで止めずに済んだ記録（通知は出さない）。
+                _record(request,outcome="worker_blink_recovered",attempts=attempts)
+            break
+        attempts.append({"provider":"worker","attempt":index+1,"reason":"worker_unavailable","heartbeat":detail})
     else:
         _terminal(request,attempts,"worker_unavailable")
     path="req/"+request["id"]+".json"
