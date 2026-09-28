@@ -1,6 +1,7 @@
 """Subscription-only Claude/Codex execution. Canonical copy: subsk-worker.
 
-No metered LLM API client is imported or called. Vendored copies are hash-checked.
+No metered LLM API is called unless a tool is explicitly switched (SUBSK_API_TOOLS / api_switch.json;
+default off, 2026-09-28). There is no automatic fallback to the API. Vendored copies are hash-checked.
 Prompts/checkpoints stay in ignored local state; notices contain metadata only.
 """
 from __future__ import annotations
@@ -169,7 +170,7 @@ def readiness():
         except (CliFailure, OSError) as exc:
             status[provider] = {"ready":False, "reason":getattr(exc,"code","launch_failed")}
     return {"policy_version":POLICY_VERSION, "routing_version":ROUTING_VERSION, "api_fallback":False,
-            "ready":any(s["ready"] for s in status.values()), "providers":status}
+            "ready":any(s["ready"] for s in status.values()), "providers":status, "api_switch":api_switch_status()}
 
 
 def _safe_label(value, limit=160):
@@ -821,6 +822,202 @@ def _gateway_generate(request):
         _terminal(request,attempts,"gateway_unavailable")
 
 
+# ── 従量APIへの明示の切り替え（2026-09-28 社長承認「切り替えられるように準備だけ」・既定オフ）──
+# スタッフが起動する仕組み（センテンス・図解・ロシア原稿など）を、個人向けサブスクではなく
+# 各ツール専用の API キーで動かすためのスイッチ。docs/subscription-terms-review-2026-09.md §6。
+# - 指定したツールだけが対象。自動の切り替えではない（サブスクが失敗しても API へは落ちない）。
+# - 設定: 環境変数 SUBSK_API_TOOLS（例 "sentence,zukai"・"*"=このプロセスの全ツール）。空なら
+#   state_dir()/api_switch.json の {"tools": [...], "openai_key_env": "...", "anthropic_key_env": "..."}。
+#   キーの値は、名前で指した環境変数から読む（SUBSK_API_OPENAI_KEY_ENV / SUBSK_API_ANTHROPIC_KEY_ENV）。
+# - generate() の入口でだけ判定する。PCワーカー（run_local_request を直接呼ぶ）は対象外のまま。
+API_SWITCH_FILE = "api_switch.json"
+API_CLAUDE_MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+# GPT-5.6 系は API の料金表で Daybreak（cyber）枠の扱いのため、API では同じ段の GPT-6 を使う（2026-09-28 料金表）
+API_OPENAI_MODELS = {"gpt-5.6-sol": "gpt-6-sol", "gpt-5.6-terra": "gpt-6-sol", "gpt-5.6-luna": "gpt-6-luna"}
+API_ANTHROPIC_MAX_TOKENS = 64000
+API_PAUSE_TURNS = 5
+
+
+def _api_switch_config():
+    conf = {}
+    raw = os.environ.get("SUBSK_API_TOOLS", "").strip()
+    if not raw:
+        try:
+            conf = json.loads((state_dir()/API_SWITCH_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            conf = {}
+        if not isinstance(conf, dict):
+            conf = {}
+        tools = conf.get("tools") or []
+        raw = ",".join(str(t) for t in tools) if isinstance(tools, list) else ""
+    tools = {t.strip() for t in raw.split(",") if t.strip()}
+    key_env = {
+        "codex": (os.environ.get("SUBSK_API_OPENAI_KEY_ENV") or str(conf.get("openai_key_env") or "")
+                  or "SUBSK_OPENAI_API_KEY").strip(),
+        "claude": (os.environ.get("SUBSK_API_ANTHROPIC_KEY_ENV") or str(conf.get("anthropic_key_env") or "")
+                   or "SUBSK_ANTHROPIC_API_KEY").strip(),
+    }
+    return {"tools": tools, "key_env": key_env}
+
+
+def _api_key(conf, provider):
+    name = conf["key_env"].get(provider, "")
+    return os.environ.get(name, "").strip() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", name or "") else ""
+
+
+def api_switch_status():
+    """切り替えの状態（真偽値と環境変数の名前だけ。キーの値は返さない）。"""
+    conf = _api_switch_config()
+    return {"tools": sorted(conf["tools"]),
+            "openai_key_env": conf["key_env"]["codex"], "openai_key_present": bool(_api_key(conf, "codex")),
+            "anthropic_key_env": conf["key_env"]["claude"], "anthropic_key_present": bool(_api_key(conf, "claude"))}
+
+
+def _api_enabled_for(request, conf):
+    return bool(conf["tools"]) and ("*" in conf["tools"] or request.get("tool") in conf["tools"])
+
+
+def _api_prompt(request):
+    prompt = request["query"]
+    if request["use_search"]:
+        prompt += "\n\n検索を使って根拠を確認し、参照した出典URLを本文に明記してください。"
+    return prompt
+
+
+def _api_claude(request, route, key):
+    import anthropic
+    model = API_CLAUDE_MODELS.get(route["model"], route["model"])
+    if not model.startswith("claude-"):
+        raise CliFailure("api_model_unsupported")
+    content = []
+    for attachment in request.get("attachments", []):
+        kind = "document" if attachment["media_type"] == "application/pdf" else "image"
+        content.append({"type": kind, "source": {"type": "base64", "media_type": attachment["media_type"],
+                                                   "data": attachment["data"]}})
+    content.append({"type": "text", "text": _api_prompt(request)})
+    kwargs = {"model": model, "max_tokens": API_ANTHROPIC_MAX_TOKENS,
+              "system": [{"type": "text", "text": request["system"] or " ", "cache_control": {"type": "ephemeral"}}],
+              "messages": [{"role": "user", "content": content}]}
+    extra = {}
+    if "haiku" not in model:
+        effort = route["effort"]
+        if model.startswith("claude-sonnet-4") and effort == "xhigh":
+            effort = "high"
+        extra = {"thinking": {"type": "adaptive"}, "output_config": {"effort": effort}}
+    if request["use_search"]:
+        search_type = "web_search_20250305" if "haiku" in model else "web_search_20260209"
+        kwargs["tools"] = [{"type": search_type, "name": "web_search", "max_uses": 10}]
+    client = anthropic.Anthropic(api_key=key, timeout=float(request["timeout"]), max_retries=2)
+    totals = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0, "web_search_requests": 0}
+    texts = []
+    for _ in range(API_PAUSE_TURNS):
+        with client.messages.stream(**kwargs, extra_body=extra or None) as stream:
+            message = stream.get_final_message()
+        usage = message.usage
+        for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            totals[field] += int(getattr(usage, field, 0) or 0)
+        server = getattr(usage, "server_tool_use", None)
+        totals["web_search_requests"] += int(getattr(server, "web_search_requests", 0) or 0)
+        if message.stop_reason == "refusal":
+            raise CliFailure("api_refusal")
+        texts += [block.text for block in message.content if getattr(block, "type", "") == "text"]
+        if message.stop_reason != "pause_turn":
+            break
+        kwargs["messages"] = kwargs["messages"] + [{"role": "assistant", "content": message.content}]
+    if message.stop_reason == "max_tokens":
+        raise CliFailure("output_too_long")
+    text = "".join(texts).strip()
+    if not text:
+        raise CliFailure("api_empty_response")
+    return text, {"usage": totals, "model": model}
+
+
+def _api_openai(request, route, key):
+    import openai
+    model = API_OPENAI_MODELS.get(route["model"], route["model"] or "gpt-6-sol")
+    content = [{"type": "input_text", "text": _api_prompt(request)}]
+    for index, attachment in enumerate(request.get("attachments", [])):
+        data_url = "data:" + attachment["media_type"] + ";base64," + attachment["data"]
+        if attachment["media_type"] == "application/pdf":
+            content.append({"type": "input_file", "filename": f"input_{index}.pdf", "file_data": data_url})
+        else:
+            content.append({"type": "input_image", "image_url": data_url})
+    kwargs = {"model": model, "instructions": request["system"],
+              "input": [{"role": "user", "content": content}], "reasoning": {"effort": route["effort"]}}
+    if request["use_search"]:
+        kwargs["tools"] = [{"type": "web_search"}]
+    client = openai.OpenAI(api_key=key, timeout=float(request["timeout"]), max_retries=2)
+    response = client.responses.create(**kwargs)
+    if getattr(response, "status", "completed") not in ("completed", None):
+        raise CliFailure("api_incomplete")
+    text = (response.output_text or "").strip()
+    if not text:
+        raise CliFailure("api_empty_response")
+    usage = response.usage
+    details = getattr(usage, "input_tokens_details", None)
+    out_details = getattr(usage, "output_tokens_details", None)
+    return text, {"usage": {"input_tokens": int(usage.input_tokens or 0),
+                            "cached_input_tokens": int(getattr(details, "cached_tokens", 0) or 0),
+                            "output_tokens": int(usage.output_tokens or 0),
+                            "reasoning_output_tokens": int(getattr(out_details, "reasoning_tokens", 0) or 0)},
+                  "model": model}
+
+
+def _api_failure_code(exc):
+    if isinstance(exc, CliFailure):
+        return exc.code
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return "api_auth_failed"
+    if status == 429:
+        return "usage_limit"
+    if status == 400:
+        return "api_bad_request"
+    if "timeout" in type(exc).__name__.lower():
+        return "timeout"
+    return "api_error"
+
+
+def run_api_request(request, conf=None):
+    """切り替え済みツールの要求を、専用キーの従量APIで実行する。キーが無い提供元は使わない。"""
+    conf = conf or _api_switch_config()
+    primary = request.get("primary", "claude")
+    other = "codex" if primary == "claude" else "claude"
+    providers = [primary] + ([other] if request.get("allow_fallback", True) else [])
+    providers = [p for p in providers if _api_key(conf, p)]
+    attempts = []
+    if not providers:
+        attempts.append({"provider": "api", "attempt": 1, "reason": "api_key_missing"})
+        _terminal(request, attempts, "api_key_missing")
+    started_all = time.monotonic()
+    for provider in providers:
+        route = resolve_route(request, provider)
+        started = time.monotonic()
+        try:
+            call = _api_claude if provider == "claude" else _api_openai
+            text, result = call(request, route, _api_key(conf, provider))
+        except Exception as exc:
+            reason = _api_failure_code(exc)
+            item = {"provider": provider, "attempt": 1, "reason": reason, "billing": "api_key",
+                    "elapsed_s": round(time.monotonic()-started, 1), "error": type(exc).__name__, **route}
+            attempts.append(item)
+            _record(request, outcome="retry_failed", **item)
+            continue
+        if request.get("protocol_tools"):
+            _parse_protocol(text, request["protocol_tools"])
+        # outcome は "completed_api"（サブスク利用量の画面は "completed" だけをサブスク分として数える）
+        _record(request, outcome="completed_api", provider=provider, attempt=1, billing="api_key",
+                elapsed_s=round(time.monotonic()-started, 1), total_elapsed_s=round(time.monotonic()-started_all, 1),
+                requested_model=request.get("model"), **{**route, "model": result["model"]}, usage=result["usage"])
+        payload = {"usage": result["usage"], "result": text, "is_error": False, "_provider": provider,
+                   "_authentication": "api_key", "_billing": "api_key", "_policy_version": POLICY_VERSION,
+                   "_requested_model": request.get("model"), "_model": result["model"], "_effort": route["effort"],
+                   "_workload": route["workload"], "_routing_version": ROUTING_VERSION, "_attempts": attempts}
+        return text, payload
+    _terminal(request, attempts, "api_unavailable")
+
+
 def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900,
              tool="workflow",label="",channel="",job_id="",attachments=None,effort=None,max_tokens=4096,protocol_tools=None,
               workload="",fallback_model=None,allow_fallback=True,notify=True):
@@ -842,6 +1039,9 @@ def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900
     # Older workers require a non-null --effort. New workers use the provider-specific fields.
     request["effort"]=request["effort"] or request[request["primary"]+"_effort"]
     start_notification_pump()
+    conf=_api_switch_config()
+    if _api_enabled_for(request,conf):
+        return run_api_request(request,conf)
     if cli_path("claude") or cli_path("codex"):
         return run_local_request(request)
     if _gateway_conf():
