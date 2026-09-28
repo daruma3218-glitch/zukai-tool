@@ -136,7 +136,14 @@ def check_auth(provider, env=None):
     if not cli:
         raise CliFailure("cli_missing")
     args = [cli, "auth", "status", "--json"] if provider == "claude" else [cli, "login", "status"]
-    code, out, err = _run(args, env=env, timeout=30)
+    try:
+        code, out, err = _run(args, env=env, timeout=30)
+    except CliFailure as exc:
+        # 2026-09-28: 同時処理が多いとログイン確認そのものが30秒を超える(センテンス 20260928_023118 は
+        # 制限180秒の処理が約42秒で timeout 扱いになり、再試行されずに停止通知)。本物の処理時間切れと分け、再試行させる。
+        if exc.code == "timeout":
+            raise CliFailure("auth_timeout") from None
+        raise
     if code:
         raise CliFailure("auth_unavailable")
     if provider == "claude":
@@ -201,6 +208,7 @@ def enqueue_notice(request, attempts, reason, *, test=False):
     # A job's parallel failures produce one notice. Without a job id, use the call id.
     notice_id = hashlib.sha256((request.get("tool", "") + ":" + job).encode()).hexdigest()[:20]
     routes = ", ".join(f"{a['provider']}#{a['attempt']}:{a['reason']}" + (f"({a['heartbeat']})" if a.get("heartbeat") else "")
+                       + (f"/{int(a['elapsed_s'])}秒" if isinstance(a.get("elapsed_s"), (int, float)) else "")
                        for a in attempts)
     title = "CLI障害通知の接続テスト" if test else "サブスクCLI処理停止・要確認"
     body = (f"[info][title]{title}[/title]\n"
@@ -383,14 +391,18 @@ def _terminal(request, attempts, reason, *, already_notified=False):
         checkpoint = ""
         reason += ":checkpoint_write_failed"
     queued = already_notified
-    if not queued:
+    # 2026-09-28: 判定役を2つ並べる検品などは、1つの失敗で止めても結果が出る。呼び出し側が notify=False を渡した時は
+    # 記録だけ残して通知しない(全部の判定役が失敗した時は呼び出し側が notify_group_stopped で1件だけ通知する)。
+    suppressed = not queued and request.get("notify", True) is False
+    if not queued and not suppressed:
         try:
             enqueue_notice(request,attempts,reason,test=bool(request.get("notification_test")))
             queued = True
             flush_notifications()
         except (OSError,sqlite3.Error):
             pass
-    _record(request,outcome="stopped",reason=reason,attempts=attempts,notification_queued=queued)
+    _record(request,outcome="stopped",reason=reason,attempts=attempts,notification_queued=queued,
+            **({"notification_suppressed":True} if suppressed else {}))
     raise SubscriptionUnavailable(reason,attempts=attempts,request_id=request["id"],
                                   checkpoint=str(checkpoint),notified=queued)
 
@@ -687,7 +699,9 @@ def run_local_request(request):
                 text,payload=_invoke(provider,request)
             except Exception as exc:
                 reason=getattr(exc,"code","local_execution_error")
-                item={"provider":provider,"attempt":index+1,"reason":reason, **routes[provider]}
+                # 2026-09-28: 経過秒数を残す(制限時間まで待った時間切れか、途中の失敗かを数字で見分ける)
+                item={"provider":provider,"attempt":index+1,"reason":reason,
+                      "elapsed_s":round(time.monotonic()-started,1), **routes[provider]}
                 attempts.append(item)
                 _record(request,outcome="retry_failed",**item)
                 if reason in {"cli_missing","unsupported_attachment","attachment_too_long","billing_route_rejected","output_too_long",
@@ -809,7 +823,7 @@ def _gateway_generate(request):
 
 def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900,
              tool="workflow",label="",channel="",job_id="",attachments=None,effort=None,max_tokens=4096,protocol_tools=None,
-              workload="",fallback_model=None,allow_fallback=True):
+              workload="",fallback_model=None,allow_fallback=True,notify=True):
     if not isinstance(allow_fallback, bool):
         raise ValueError("allow_fallback must be a boolean")
     if primary is not None and primary not in {"claude", "codex"}:
@@ -822,7 +836,7 @@ def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900
              "use_search":bool(use_search),"timeout":max(30,int(timeout or 900)),"tool":tool,"label":label,
              "channel":channel,"attachments":attachments or [],"effort":effort,"max_tokens":max_tokens,
              "protocol_tools":protocol_tools or [], "workload":workload, "fallback_model":fallback_model,
-              "routing_version":ROUTING_VERSION,"allow_fallback":allow_fallback}
+              "routing_version":ROUTING_VERSION,"allow_fallback":allow_fallback,"notify":bool(notify)}
     for provider in ("claude", "codex"):
         request[provider+"_effort"]=resolve_route(request, provider)["effort"]
     # Older workers require a non-null --effort. New workers use the provider-specific fields.
@@ -833,6 +847,16 @@ def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900
     if _gateway_conf():
         return _gateway_generate(request)
     return run_local_request(request)  # records both missing binaries and notifies
+
+
+def notify_group_stopped(*, tool, label, job_id, reason, attempts):
+    """notify=False で個別の通知を止めた呼び出しが、まとめて全部失敗した時に1件だけ通知する(2026-09-28)。"""
+    request={"id":uuid.uuid4().hex,"tool":tool,"label":label,"job_id":job_id or ""}
+    notice_id=enqueue_notice(request,attempts,reason)
+    with contextlib.suppress(OSError,sqlite3.Error):
+        flush_notifications()
+    _record(request,outcome="group_stopped",reason=reason,attempts=attempts,notification_queued=True)
+    return notice_id
 
 
 def file_attachment(path):
