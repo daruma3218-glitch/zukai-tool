@@ -131,6 +131,8 @@ def version():
         "pipeline_phases": 3,
         "partial_download_enabled": True,
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
+        # 従量APIへの明示の切り替え（既定オフ・2026-09-28）。ツール名・環境変数の名前・真偽値だけ
+        "llm_api_switch": subscription_runtime.api_switch_status(),
         "default_image_model": resolve_openai_image_model(),
         "edit_image_model": resolve_edit_model(),
         "director_tools": {"candidates": list(CANDIDATE_MODES), "map_renderer": map_renderer.enabled(),
