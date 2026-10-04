@@ -210,7 +210,7 @@ def install(module, root):
             if path.exists() and json.loads(path.read_text(encoding="utf-8")).get("status") not in TERMINAL:
                 return True
             edits = directory / "edits.json"
-            if edits.exists() and any(edit.get("status") == "running" for edit in
+            if edits.exists() and any(edit.get("status") in {"queued", "running"} for edit in
                                       json.loads(edits.read_text(encoding="utf-8")).get("edits", [])):
                 return True
         return False

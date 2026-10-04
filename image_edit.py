@@ -7,7 +7,7 @@
   edits.json に記録する。
 - どの画像を使うかは adoption.json に「採用」として記録し、採用分だけ ZIP で取り出せる。
 
-複数のワーカー（gunicorn）から同じジョブの記録を更新しても壊れないよう、記録の読み書きはロックする。
+既存の1 worker運用で複数リクエストが競合しないよう、記録の読み書きはロックする。
 """
 
 import csv
@@ -28,11 +28,17 @@ from contextlib import closing
 from image_resources import image_task
 
 import generator
+import resource_diagnostics
+import retention
 
 EDITS_NAME = "edits.json"
 ADOPTION_NAME = "adoption.json"
 LOCK_TIMEOUT = 10.0
 MAX_RUNNING_EDITS_PER_JOB = 3
+ACTIVE_EDIT_STATUSES = {"queued", "running"}
+# The deployed service has one worker. A fresh worker cannot own old threads.
+PROCESS_OWNER = f"{os.getpid()}-{uuid.uuid4().hex}"
+PROCESS_STARTED_AT = time.time()
 IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+\.(png|jpg|jpeg|webp)$")
 EDIT_SUFFIX_RE = re.compile(r"__e(\d+)$")
 
@@ -109,30 +115,52 @@ def _update(job_dir: Path, name: str, default, change):
         return result
 
 
-STALE_RUNNING_MINUTES = 15
-
-
-def _mark_stale(edits: list) -> bool:
-    """サーバーの再起動などで止まった手直しを「中断」にする（同時実行の枠を空けるため）。"""
+def _mark_stale(edits: list, job_dir: Path) -> bool:
+    """Only a lost worker ownership proves interruption; elapsed time does not."""
     changed = False
-    now = datetime.now()
     for entry in edits:
-        if entry.get("status") != "running":
+        if entry.get("status") not in ACTIVE_EDIT_STATUSES or entry.get("owner") == PROCESS_OWNER:
             continue
-        try:
-            started = datetime.fromisoformat(entry.get("created_at", ""))
-        except ValueError:
-            started = now
-        if (now - started).total_seconds() > STALE_RUNNING_MINUTES * 60:
-            entry.update(status="failed", error="中断（サーバーの再起動などで止まりました。もう一度お試しください）")
-            changed = True
+        name = entry.get("output", "")
+        path = job_dir / "images" / name if isinstance(name, str) and IMAGE_NAME_RE.fullmatch(name) else None
+        saved = path is not None and not path.is_symlink() and path.is_file() and path.stat().st_size > 0
+        entry.update(status="ok" if saved else "interrupted",
+                     error="" if saved else "サーバーの再起動で中断しました。必要ならもう一度お試しください。",
+                     finished_at=datetime.now().isoformat(timespec="seconds"))
+        changed = True
     return changed
+
+
+def release_previous_worker_lock(path: Path):
+    """Startup only: the single old worker is gone; keep this worker's locks."""
+    try:
+        if not path.is_symlink() and path.stat().st_mtime < PROCESS_STARTED_AT:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def recover_interrupted_edits(job_dir: Path) -> int:
+    for name in (EDITS_NAME, ADOPTION_NAME):
+        release_previous_worker_lock(Path(job_dir) / f".{name}.lock")
+    path = Path(job_dir) / EDITS_NAME
+    if not path.is_file():
+        return 0
+    with _JobLock(job_dir, EDITS_NAME):
+        data = _read(path, {"version": 1, "edits": []})
+        edits = data.get("edits", [])
+        count = sum(e.get("status") in ACTIVE_EDIT_STATUSES and e.get("owner") != PROCESS_OWNER for e in edits)
+        if _mark_stale(edits, job_dir):
+            backup = job_dir / "recovery_history" / f"edits-{uuid.uuid4().hex}"
+            backup.mkdir(parents=True)
+            (backup / EDITS_NAME).write_bytes(path.read_bytes())
+            _write(path, data)
+        return count
 
 
 def load_edits(job_dir: Path) -> list:
     data = _read(Path(job_dir) / EDITS_NAME, {"version": 1, "edits": []})
     edits = data.get("edits", []) if isinstance(data, dict) else []
-    _mark_stale(edits)  # 表示用。ファイルへの書き戻しは次の更新時に行う
     return edits
 
 
@@ -191,8 +219,8 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
 
     def reserve(data):
         edits = data.setdefault("edits", [])
-        _mark_stale(edits)
-        running = [e for e in edits if e.get("status") == "running"]
+        _mark_stale(edits, job_dir)
+        running = [e for e in edits if e.get("status") in ACTIVE_EDIT_STATUSES]
         for e in running:  # 同じ依頼の二重送信は、進行中の1件を返して重複させない
             if e.get("source") == source and e.get("action") == action and e.get("instruction") == instruction:
                 return dict(e, duplicate=True)
@@ -201,14 +229,31 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
         entry = {"id": uuid.uuid4().hex[:12], "source": source,
                  "output": _next_edit_name(job_dir, source, edits), "action": action,
                  "label": ACTION_LABELS[action], "instruction": instruction, "model": model,
-                 "status": "running", "error": "", "created_at": datetime.now().isoformat(timespec="seconds")}
+                 "status": "queued", "owner": PROCESS_OWNER, "error": "",
+                 "created_at": datetime.now().isoformat(timespec="seconds")}
         edits.append(entry)
         return dict(entry)
 
-    entry = _update(job_dir, EDITS_NAME, {"version": 1, "edits": []}, reserve)
+    cleanup_lock = retention._acquire_lock(job_dir.parent)
+    if cleanup_lock is None:
+        raise EditError("保存データの整理中です。少し待ってからもう一度お試しください。")
+    try:
+        _image_path(job_dir, source)  # Recheck after taking retention's lock.
+        entry = _update(job_dir, EDITS_NAME, {"version": 1, "edits": []}, reserve)
+    finally:
+        cleanup_lock.unlink(missing_ok=True)
     if entry.get("duplicate"):
         return entry
     output_path = job_dir / "images" / entry["output"]
+
+    def started():
+        def change(data):
+            for e in data.get("edits", []):
+                if e.get("id") == entry["id"]:
+                    e.update(status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+                    break
+        _update(job_dir, EDITS_NAME, {"version": 1, "edits": []}, change)
+        resource_diagnostics.record("started", "flip" if action == "flip" else "edit")
 
     def finish(ok: bool, error: str = ""):
         def change(data):
@@ -218,13 +263,17 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
                              finished_at=datetime.now().isoformat(timespec="seconds"))
                     return dict(e)
             return None
-        return _update(job_dir, EDITS_NAME, {"version": 1, "edits": []}, change)
+        result = _update(job_dir, EDITS_NAME, {"version": 1, "edits": []}, change)
+        resource_diagnostics.record("finished", "flip" if action == "flip" else "edit")
+        return result
 
     if action == "flip":
         try:
-            with image_task(), closing(Image.open(source_path)) as img, closing(img.convert("RGB")) as rgb:
-                with closing(ImageOps.mirror(rgb)) as mirrored:
-                    generator._save_png(mirrored, output_path)
+            with image_task():
+                started()
+                with closing(Image.open(source_path)) as img, closing(img.convert("RGB")) as rgb:
+                    with closing(ImageOps.mirror(rgb)) as mirrored:
+                        generator._save_png(mirrored, output_path)
             return finish(True)
         except Exception as exc:
             return finish(False, f"左右反転に失敗: {exc}")
@@ -238,9 +287,9 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
                 client = client_factory()
             else:
                 import openai
-                client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+                client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=180, max_retries=0)
             ok, error = generator._sync_edit_image_openai(client, source_path, prompt, output_path,
-                                                          model_name=model)
+                                                          model_name=model, on_start=started)
         except Exception as exc:
             ok, error = False, str(exc)
         finally:
@@ -253,7 +302,10 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
         finish(ok, error)
 
     if run_async:
-        threading.Thread(target=work, name=f"zukai-edit-{entry['id']}", daemon=True).start()
+        try:
+            threading.Thread(target=work, name=f"zukai-edit-{entry['id']}", daemon=True).start()
+        except Exception:
+            return finish(False, "手直しを開始できませんでした。もう一度お試しください。")
         return entry
     work()
     return next((e for e in load_edits(job_dir) if e.get("id") == entry["id"]), entry)

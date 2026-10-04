@@ -349,7 +349,7 @@
         error:      { color: 'bg-red-50 text-red-700',     dot: 'bg-red-500',              label: 'エラー' },
         cancelling: { dot: 'bg-amber-500 ring-pulse', label: '中止処理中' },
         cancelled:  { dot: 'bg-gray-500', label: '中止済み' },
-        interrupted:{ dot: 'bg-gray-500', label: '停止' },
+        interrupted:{ dot: 'bg-gray-500', label: '中断' },
         not_found:  { color: 'bg-gray-100 text-gray-500',  dot: 'bg-gray-300',             label: '見つかりません' },
       };
       const v = map[status] || map.running;
@@ -399,7 +399,7 @@
         // pending
         inner = `
           <div class="aspect-video bg-gray-50 flex items-center justify-center">
-            <span class="text-xs text-gray-400">${status === 'cancelled' ? '中止（未生成）' : '待機中'}</span>
+            <span class="text-xs text-gray-400">${status === 'cancelled' ? '中止（未生成）' : status === 'interrupted' ? '中断（未生成）' : '待機中'}</span>
           </div>
           <div class="px-2 py-1.5 bg-white">
             <p class="text-[10px] text-gray-400 truncate">${section}</p>
@@ -411,7 +411,7 @@
       const number = `${String(item.group ?? idx).padStart(3, '0')}${item.variant || ''}`;
       const adopted = isAdopted(item);
       const edits = filename ? editsFor(filename) : [];
-      const running = edits.some(e => e.status === 'running');
+      const running = edits.some(e => ['queued', 'running'].includes(e.status));
       const typeBadge = (item.variant || item.render === 'map') && item.variant_label
         ? `<span class="absolute bottom-10 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(item.variant_label)}</span>` : '';
       const adoptBtn = status === 'ok' && filename
@@ -719,7 +719,7 @@
 
     function scheduleEditPoll() {
       // 手直しが進行中の間は、生成が終わった後も状態を取りに行く
-      if (editPollTimer || !editsList.some(e => e.status === 'running')) return;
+      if (editPollTimer || !editsList.some(e => ['queued', 'running'].includes(e.status))) return;
       editPollTimer = setTimeout(async () => {
         editPollTimer = null;
         await pollItems();
@@ -761,7 +761,7 @@
     }
     function updateStepper(state) {
       const step = currentStep(state);
-      const failed = state.status === 'error';
+      const failed = ['error', 'interrupted'].includes(state.status);
       els.steps.forEach((el, i) => {
         const n = i + 1;
         const base = 'rounded-lg border px-3 py-2 ';
@@ -798,7 +798,8 @@
         if (state.concurrency) els.concurrencyVal.textContent = state.concurrency;
         if (state.title) els.jobTitle.textContent = state.title;
         else if (state.status === 'cancelled') els.jobTitle.textContent = '中止したジョブ';
-        document.title = `${state.status === 'cancelled' ? '中止済み' : state.status === 'cancelling' ? '中止処理中' : state.status === 'completed' ? '生成完了' : '生成中'} - 図解スタジオ`;
+        else if (state.status === 'interrupted') els.jobTitle.textContent = '中断したジョブ';
+        document.title = `${state.status === 'interrupted' ? '中断' : state.status === 'error' ? 'エラー' : state.status === 'cancelled' ? '中止済み' : state.status === 'cancelling' ? '中止処理中' : state.status === 'completed' ? '生成完了' : '生成中'} - 図解スタジオ`;
 
         // ステータスバッジ
         els.statusBadge.innerHTML = statusBadgeHtml(state.status);
@@ -928,7 +929,7 @@
       const edits = editsFor(source);
       // 頼んだ手直しが終わったら、その版を表示する
       const pending = modalState.pending && edits.find(e => e.output === modalState.pending);
-      if (pending && pending.status !== 'running') {
+      if (pending && !['queued', 'running'].includes(pending.status)) {
         if (pending.status === 'ok') modalState.shown = pending.output;
         modalState.pending = null;
       }
@@ -948,18 +949,19 @@
       document.getElementById('versionStrip').innerHTML = versions.map(v => {
         const active = v.output === shown;
         const star = adoptedSet.has(v.output) ? '★ ' : '';
-        if (v.status === 'running') {
-          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-yellow-50 border border-yellow-300 flex items-center justify-center text-[11px] text-yellow-700">${escapeHtml(v.label)}…</div>`;
+        if (['queued', 'running'].includes(v.status)) {
+          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-yellow-50 border border-yellow-300 flex items-center justify-center text-[11px] text-yellow-700">${escapeHtml(v.label)}：${v.status === 'queued' ? '順番待ち' : '処理中'}…</div>`;
         }
-        if (v.status === 'failed') {
-          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-red-50 border border-red-300 p-1 text-[10px] text-red-700 overflow-hidden" title="${escapeHtml(v.error || '')}">${escapeHtml(v.label)}：失敗<br>${escapeHtml((v.error || '').substring(0, 60))}</div>`;
+        if (['failed', 'interrupted'].includes(v.status)) {
+          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-red-50 border border-red-300 p-1 text-[10px] text-red-700 overflow-hidden" title="${escapeHtml(v.error || '')}">${escapeHtml(v.label)}：${v.status === 'interrupted' ? '中断' : '失敗'}<br>${escapeHtml((v.error || '').substring(0, 60))}</div>`;
         }
         return `<button type="button" onclick="showVersion('${v.output}')" class="flex-shrink-0 w-32 rounded-lg overflow-hidden border-2 ${active ? 'border-purple-500' : 'border-transparent'}"><img src="/results/${JOB_ID}/images/${v.output}" class="w-32 h-[4.5rem] object-cover" loading="lazy"><span class="block text-[10px] text-gray-600 py-0.5">${star}${escapeHtml(v.label)}</span></button>`;
       }).join('');
       const running = edits.filter(e => e.status === 'running').length;
+      const queued = edits.filter(e => e.status === 'queued').length;
       const status = document.getElementById('editStatus');
-      if (running) {
-        status.textContent = `手直し中（${running}件）… 終わると下に並びます`;
+      if (running || queued) {
+        status.textContent = `手直し：処理中 ${running}件・順番待ち ${queued}件。終わると下に並びます`;
         status.className = 'text-xs mt-1 text-yellow-700';
       } else if (status.className.indexOf('text-red') === -1) {
         status.textContent = '';

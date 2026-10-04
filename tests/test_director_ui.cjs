@@ -45,6 +45,27 @@ const candidates = {
   retention: { days: 30, expires_at: '2026-10-24T10:00' },
 };
 
+test('順番待ちの手直しは完了扱いにせず、待機と処理中を分ける', async () => {
+  const waiting = { ...candidates, edits: [{ ...candidates.edits[0], status: 'queued' }] };
+  const p = page(waiting);
+  await p.run('pollItems()');
+  p.element('modalImg').src = '';
+  p.run("modalState = {idx: 1, source: 'diagram_001_a.png', shown: 'diagram_001_a.png', pending: 'diagram_001_a__e1.png'}; renderModal()");
+  assert.match(p.element('versionStrip').innerHTML, /順番待ち/);
+  assert.match(p.element('editStatus').textContent, /処理中 0件・順番待ち 1件/);
+  assert.equal(p.run('modalState.pending'), 'diagram_001_a__e1.png');
+  assert.doesNotMatch(p.element('versionStrip').innerHTML, /src="[^\"]+__e1.png/);
+});
+
+test('再起動による中断を表示し、未生成画像を待機中にしない', async () => {
+  const p = page({items: [{index: 1, status: 'interrupted'}]}, 'interrupted');
+  await p.run('pollStatus()');
+  await p.run('pollItems()');
+  assert.match(p.element('statusBadge').innerHTML, /中断/);
+  assert.match(p.element('imgGrid').innerHTML, /中断（未生成）/);
+  assert.equal(p.element('restartBtn').classList.contains('hidden'), false);
+});
+
 test('候補は同じ抜粋の案を横に並べ、案の番号と種類を出す', async () => {
   const p = page(candidates);
   await p.run('pollItems()');

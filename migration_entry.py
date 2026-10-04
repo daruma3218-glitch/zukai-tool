@@ -55,6 +55,8 @@ def create_app():
         raise RuntimeError("Invalid MIGRATION_ACCESS")
     module = importlib.import_module("app")
     from deploy_guard import install
+    if not MigrationGate(module.app, root, mode).read_only():
+        module.recover_interrupted_jobs()
     return MigrationGate(install(module, root), root, mode)
 
 

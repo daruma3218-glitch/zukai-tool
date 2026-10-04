@@ -69,7 +69,7 @@ def test_waiting_deploy_allows_cancel_but_sealed_deploy_does_not(guard):
     assert request(guard, path="/api/cancel/20261004_100000_abcdef")[0] == "503 Service Unavailable"
 
 
-@pytest.mark.parametrize("edit_status,busy", [("running", True), ("ok", False), ("failed", False)])
+@pytest.mark.parametrize("edit_status,busy", [("queued", True), ("running", True), ("ok", False), ("failed", False), ("interrupted", False)])
 def test_completed_job_with_running_image_edit_still_blocks_deploy(tmp_path, monkeypatch, edit_status, busy):
     from deploy_guard import install
     monkeypatch.setenv("SECRET_KEY", "test-only")

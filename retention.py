@@ -88,6 +88,14 @@ def last_update(job_dir: Path) -> datetime:
 def is_finished(job_dir: Path, now: Optional[datetime] = None) -> bool:
     """終わったジョブか。実行中・待機中でも、3日以上更新が止まっていれば終わったものとみなす。"""
     now = now or datetime.now()
+    edits_path = job_dir / "edits.json"
+    if edits_path.exists():
+        try:
+            edits = json.loads(edits_path.read_text(encoding="utf-8")).get("edits", [])
+            if any(e.get("status") in {"queued", "running"} for e in edits):
+                return False
+        except (OSError, ValueError, AttributeError, TypeError):
+            return False  # Do not delete images when edit ownership is unknown.
     status = _read_state(job_dir).get("status")
     if status in TERMINAL_STATUSES:
         return True

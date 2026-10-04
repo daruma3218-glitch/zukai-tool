@@ -189,7 +189,9 @@ def test_remove_text_runs_with_sunburst_and_records_result(client, tmp_path, mon
     monkeypatch.setattr(image_edit.threading, "Thread", InlineThread)
     calls = []
 
-    def fake_edit(client_, source, prompt, output, model_name, quality="medium"):
+    def fake_edit(client_, source, prompt, output, model_name, quality="medium", on_start=None):
+        if on_start:
+            on_start()
         calls.append((model_name, prompt))
         generator._save_png(Image.new("RGB", (160, 90), "white"), output)
         return True, ""
@@ -229,10 +231,11 @@ def test_edit_stuck_by_restart_is_released(tmp_path, monkeypatch):
     utils.save_json(root / "edits.json", {"version": 1, "edits": [
         {"id": f"s{n}", "source": "diagram_004.png", "output": f"diagram_004__e{n}.png", "action": "instruct",
          "instruction": f"x{n}", "status": "running", "created_at": old} for n in (1, 2, 3)]})
-    assert all(e["status"] == "failed" and "中断" in e["error"] for e in image_edit.load_edits(root))
+    image_edit.recover_interrupted_edits(root)
+    assert all(e["status"] == "interrupted" and "中断" in e["error"] for e in image_edit.load_edits(root))
     monkeypatch.setattr(image_edit.threading, "Thread", lambda **kw: mock.Mock())
     entry = image_edit.request_edit(root, "diagram_004.png", "remove_text")  # 枠が空いて受け付けられる
-    assert entry["status"] == "running" and entry["output"] == "diagram_004__e4.png"
+    assert entry["status"] == "queued" and entry["output"] == "diagram_004__e4.png"
 
 
 @pytest.mark.parametrize("body", [{"source": "../job.json", "action": "flip"},

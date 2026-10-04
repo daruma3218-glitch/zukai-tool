@@ -398,8 +398,10 @@ def _pad_to_ratio(img: "Image.Image", ratio: float) -> tuple:
 
 @limited_image_task
 def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_path: Path,
-                            model_name: str = DEFAULT_EDIT_MODEL, quality: str = "medium") -> tuple:
+                            model_name: str = DEFAULT_EDIT_MODEL, quality: str = "medium", on_start=None) -> tuple:
     """元画像を OpenAI の画像編集で直し、元と同じ範囲・大きさで別ファイルに保存する。"""
+    if on_start:
+        on_start()  # The shared image slot has been acquired by the decorator.
     with closing(Image.open(source_path)) as src:
         canvas, box = _pad_to_ratio(src, EDIT_SIZE[0] / EDIT_SIZE[1])
     with closing(canvas):

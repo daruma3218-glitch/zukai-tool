@@ -41,6 +41,7 @@ import director_routes
 import image_edit
 import map_renderer
 import retention
+import resource_diagnostics
 import retry_missing
 import job_health
 from image_resources import IMAGE_TASK_LIMIT
@@ -87,6 +88,8 @@ _job_logs: dict[str, list] = {}
 _jobs_lock = threading.RLock()
 _active_jobs = set()  # The production service uses one Gunicorn worker, eight threads.
 TERMINAL_STATUSES = {"completed", "error", "cancelled", "interrupted"}
+_recovery_lock = threading.Lock()
+_recovered_roots = set()
 
 
 # ====== 認証 ======
@@ -137,8 +140,11 @@ def version():
         "image_review_enabled": False,
         "pipeline_phases": 3,
         "partial_download_enabled": True,
-        "memory_safety": {"version": 1, "image_task_limit": IMAGE_TASK_LIMIT,
-                          "scope": "process", "explicit_image_close": True},
+        "memory_safety": {"version": 2, "image_task_limit": IMAGE_TASK_LIMIT,
+                          "scope": "process", "explicit_image_close": True,
+                          "terminal_cache_release": True, "resource_logging": True},
+        "restart_recovery": {"version": 1, "preserves_images": True, "automatic_resume": False},
+        "edit_queue": {"version": 1, "owner_tracking": True, "request_timeout_seconds": 180},
         "job_cancellation": {"version": 1, "whole_job": True, "preserves_images": True,
                              "restart_settings": True, "inflight_requests_may_finish": True},
         "missing_image_retry": {"version": 1, "preserves_completed": True, "confirmation_required": True},
@@ -221,10 +227,17 @@ def _set_job_state(job_id: str, **kwargs):
             return
         if any(key in kwargs and kwargs[key] != state.get(key) for key in ("phase", "message", "percent")):
             kwargs.setdefault("last_progress_at", datetime.now().isoformat())
+        phase_changed = "phase" in kwargs and kwargs["phase"] != state.get("phase")
         state.update(kwargs)
         state["updated_at"] = datetime.now().isoformat()
         save_json(OUTPUT_DIR / job_id / "job.json", state)
-        _jobs[job_id] = state
+        if state.get("status") in TERMINAL_STATUSES:
+            _jobs.pop(job_id, None)
+            _job_logs.pop(job_id, None)
+        else:
+            _jobs[job_id] = state
+        if phase_changed:
+            resource_diagnostics.record("phase", "generation", active_jobs=len(_active_jobs))
 
 
 def _job_elapsed_seconds(job_id: str, state: dict):
@@ -298,12 +311,78 @@ def _add_log(job_id: str, category: str, message: str, detail: str = ""):
         "detail": detail,
     }
     with _jobs_lock:
-        logs = _job_logs.setdefault(job_id, load_json(OUTPUT_DIR / job_id / "logs.json", []))
+        logs = _job_logs.get(job_id)
+        if logs is None:
+            logs = load_json(OUTPUT_DIR / job_id / "logs.json", [])
         logs.append(entry)
         try:
             save_json(OUTPUT_DIR / job_id / "logs.json", logs)
         except OSError:
             pass
+        if job_id in _active_jobs and _get_job_state(job_id).get("status") not in TERMINAL_STATUSES:
+            _job_logs[job_id] = logs
+        else:
+            _job_logs.pop(job_id, None)
+
+
+def _release_job_resources(job_id, operation):
+    with _jobs_lock:
+        _active_jobs.discard(job_id)
+        _jobs.pop(job_id, None)
+        _job_logs.pop(job_id, None)
+        active = len(_active_jobs)
+    resource_diagnostics.record("finished", operation, active_jobs=active)
+
+
+def recover_interrupted_jobs():
+    """Run once at worker startup, before accepting requests (one worker only).
+
+    A new worker has no surviving pipeline/edit threads. Do not infer a restart
+    from elapsed time, and never restart paid work automatically.
+    """
+    root = OUTPUT_DIR.resolve()
+    with _recovery_lock, _jobs_lock:
+        if root in _recovered_roots:
+            return
+        image_edit.release_previous_worker_lock(root / retention.LOCK_NAME)
+        recovered_jobs = recovered_edits = 0
+        for directory in sorted(root.iterdir()):
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            recovered_edits += image_edit.recover_interrupted_edits(directory)
+            state = load_json(directory / "job.json", {})
+            if (directory.name in _active_jobs
+                    or state.get("status") not in {"queued", "running", "cancelling"}):
+                continue
+            # Preserve the exact pre-recovery metadata, not just a rewritten state.
+            history = directory / "recovery_history" / secrets.token_hex(8)
+            history.mkdir(parents=True)
+            for name in ("job.json", "images_progress.json", "manifest.json"):
+                source = directory / name
+                if source.is_file():
+                    shutil.copy2(source, history / name)
+            items = _image_snapshot(directory)["items"]
+            for item in items:
+                if item.get("status") not in {"ok", "failed"}:
+                    item.update(status="interrupted", success=False)
+            succeeded = sum(i.get("status") == "ok" for i in items)
+            failed = sum(i.get("status") == "failed" for i in items)
+            now = datetime.now().isoformat()
+            save_json(directory / "images_progress.json", {"items": items, "updated_at": now})
+            manifest = load_json(directory / "manifest.json", {})
+            manifest.update(status="interrupted", items=items, succeeded=succeeded, failed=failed,
+                            images_planned=len(items), interrupted_at=now)
+            save_json(directory / "manifest.json", manifest)
+            state.update(status="interrupted", updated_at=now, interrupted_at=now,
+                         succeeded=succeeded, failed=failed,
+                         message=f"サーバーの再起動で中断しました。完成済み {succeeded}枚は保存されています。未生成分の再生成、または設定を直した作り直しを選べます。")
+            save_json(directory / "job.json", state)
+            _add_log(directory.name, "system", "サーバー再起動による中断を検出。完成画像を保持しました。")
+            _release_job_resources(directory.name, "startup")
+            recovered_jobs += 1
+        _recovered_roots.add(root)
+        resource_diagnostics.record("recovered", "startup", recovered_jobs=recovered_jobs,
+                                    recovered_edits=recovered_edits)
 
 
 def _completed_images(result_dir: Path) -> list[Path]:
@@ -397,6 +476,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          map_mode: str = "data"):
     job_dir = OUTPUT_DIR / job_id
     cancellation = Cancellation(job_dir)
+    resource_diagnostics.record("started", "generation", active_jobs=len(_active_jobs))
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
         _set_job_state(job_id, status="running", phase=0, message="開始しています...", percent=0)
@@ -464,8 +544,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                 _set_job_state(job_id, status="error", message=str(e)[:200], percent=0)
                 _add_log(job_id, "error", "パイプライン実行エラー", str(e)[:300])
     finally:
-        with _jobs_lock:
-            _active_jobs.discard(job_id)
+        _release_job_resources(job_id, "generation")
         retention.run_in_background(OUTPUT_DIR)  # 新しい画像が増えた直後に容量を確かめる
 
 
@@ -681,6 +760,7 @@ def restart_settings(job_id):
 
 def _run_missing_thread(job_id, plan):
     job_dir = OUTPUT_DIR / job_id
+    resource_diagnostics.record("started", "missing_retry", active_jobs=len(_active_jobs))
     try:
         _set_job_state(job_id, status="running", phase=3, message="不足分の画像を再生成しています。", percent=50)
         manifest = retry_missing.generate(job_dir, plan,
@@ -698,8 +778,7 @@ def _run_missing_thread(job_id, plan):
             _set_job_state(job_id, status="error", message="再生成を停止しました。完成画像は残っています。")
             _add_log(job_id, "error", "不足分の再生成エラー", str(exc)[:200])
     finally:
-        with _jobs_lock:
-            _active_jobs.discard(job_id)
+        _release_job_resources(job_id, "missing_retry")
         retention.run_in_background(OUTPUT_DIR)
 
 
@@ -868,6 +947,7 @@ director_routes.register(app, login_required, lambda: OUTPUT_DIR,
 
 
 if __name__ == "__main__":
+    recover_interrupted_jobs()
     port = int(os.environ.get("PORT", 3001))
     print("\n" + "=" * 50)
     print("  図解スタジオ 起動中...")
