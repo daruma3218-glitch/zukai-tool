@@ -40,6 +40,7 @@ import director_routes
 import image_edit
 import map_renderer
 import retention
+from image_resources import IMAGE_TASK_LIMIT
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -133,6 +134,8 @@ def version():
         "image_review_enabled": False,
         "pipeline_phases": 3,
         "partial_download_enabled": True,
+        "memory_safety": {"version": 1, "image_task_limit": IMAGE_TASK_LIMIT,
+                          "scope": "process", "explicit_image_close": True},
         "job_cancellation": {"version": 1, "whole_job": True, "preserves_images": True,
                              "restart_settings": True, "inflight_requests_may_finish": True},
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
@@ -491,6 +494,7 @@ def index():
         default_openai_model=resolve_openai_image_model(),
         past_jobs=past_jobs[:30],
         last_run=last_run,
+        image_task_limit=IMAGE_TASK_LIMIT,
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
         has_openai=bool(os.environ.get("OPENAI_API_KEY")),
@@ -543,10 +547,10 @@ def start_job():
     target_count = max(5, min(target_count, 200))
 
     try:
-        concurrency = int(request.form.get("concurrency", "12"))
+        concurrency = int(request.form.get("concurrency", str(IMAGE_TASK_LIMIT)))
     except ValueError:
-        concurrency = 12
-    concurrency = max(1, min(concurrency, 24))
+        concurrency = IMAGE_TASK_LIMIT
+    concurrency = max(1, min(concurrency, IMAGE_TASK_LIMIT))
 
     user_instructions = request.form.get("user_instructions", "").strip()
     worldview_preset = request.form.get("worldview_preset", "").strip()

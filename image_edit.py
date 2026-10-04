@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageOps
+from contextlib import closing
+from image_resources import image_task
 
 import generator
 
@@ -220,8 +222,9 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
 
     if action == "flip":
         try:
-            with Image.open(source_path) as img:
-                generator._save_png(ImageOps.mirror(img.convert("RGB")), output_path)
+            with image_task(), closing(Image.open(source_path)) as img, closing(img.convert("RGB")) as rgb:
+                with closing(ImageOps.mirror(rgb)) as mirrored:
+                    generator._save_png(mirrored, output_path)
             return finish(True)
         except Exception as exc:
             return finish(False, f"左右反転に失敗: {exc}")
@@ -229,6 +232,7 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
     prompt = REMOVE_TEXT_PROMPT if action == "remove_text" else instruction + INSTRUCT_SUFFIX
 
     def work():
+        client = None
         try:
             if client_factory is not None:
                 client = client_factory()
@@ -239,6 +243,13 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
                                                           model_name=model)
         except Exception as exc:
             ok, error = False, str(exc)
+        finally:
+            # A caller-supplied client belongs to the caller.
+            if client_factory is None and client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
         finish(ok, error)
 
     if run_async:

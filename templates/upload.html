@@ -304,19 +304,20 @@
             <div>
               <label class="block text-sm font-medium text-gray-700 mb-3">
                 並列度
-                <span class="ml-1 text-pink-600 font-bold" id="concurrencyLabel">12</span>
+                <span class="ml-1 text-pink-600 font-bold" id="concurrencyLabel">{{ image_task_limit }}</span>
                 <span class="text-xs text-gray-400">枚同時</span>
               </label>
               <input
                 type="range"
                 name="concurrency"
                 id="concurrency"
-                min="1" max="24" step="1" value="12"
+                min="1" max="{{ image_task_limit }}" step="1" value="{{ image_task_limit }}"
                 class="w-full"
               >
               <div class="flex justify-between text-xs text-gray-400 mt-1">
-                <span>1</span><span>8</span><span>16</span><span>24</span>
+                <span>1</span><span>{{ image_task_limit }}</span>
               </div>
+              <p class="text-xs text-gray-500 mt-2">安定して生成するため、ほかのジョブや手直しと合わせて最大{{ image_task_limit }}枚ずつ進めます。</p>
             </div>
             </div>
           </details>

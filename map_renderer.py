@@ -29,7 +29,9 @@ import tempfile
 from functools import lru_cache
 from pathlib import Path
 
+from contextlib import closing
 from PIL import Image, ImageDraw, ImageFont
+from image_resources import limited_image_task
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "geodata" / "countries.json"
@@ -425,33 +427,33 @@ def visible_anchor(country, view, width=WIDTH, height=HEIGHT):
     国名や矢印の端を、画面外にある国全体の重心ではなく、見えている部分に置くために使う。
     """
     mw, mh = max(width // MASK_SCALE, 1), max(height // MASK_SCALE, 1)
-    mask = Image.new("L", (mw, mh), 0)
-    draw = ImageDraw.Draw(mask)
-    for poly, bbox in zip(country["polys"], country["bboxes"]):
-        shifted = (_shift(bbox[0], view.frame, bbox[2]), bbox[1], _shift(bbox[2], view.frame, bbox[2]), bbox[3])
-        if not view.intersects(shifted):
-            continue
-        for ring, fill in [(poly[0], 255)] + [(hole, 0) for hole in poly[1:]]:
-            points = [(x / MASK_SCALE, y / MASK_SCALE) for x, y in
-                      (view.project(_shift(lon, view.frame, bbox[2]), lat) for lon, lat in ring)]
-            if len(points) >= 3:
-                draw.polygon(points, fill=fill)
-    count = sx = sy = 0
-    pixels = mask.load()
-    for y in range(mh):
-        for x in range(mw):
-            if pixels[x, y]:
-                count += 1
-                sx += x
-                sy += y
-    if not count:
-        return None, 0.0
-    cx, cy = sx / count, sy / count
-    if not pixels[min(int(cx), mw - 1), min(int(cy), mh - 1)]:
-        best = min(((x, y) for y in range(mh) for x in range(mw) if pixels[x, y]),
-                   key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
-        cx, cy = best
-    return ((cx + 0.5) * MASK_SCALE, (cy + 0.5) * MASK_SCALE), count / (mw * mh)
+    with closing(Image.new("L", (mw, mh), 0)) as mask:
+        draw = ImageDraw.Draw(mask)
+        for poly, bbox in zip(country["polys"], country["bboxes"]):
+            shifted = (_shift(bbox[0], view.frame, bbox[2]), bbox[1], _shift(bbox[2], view.frame, bbox[2]), bbox[3])
+            if not view.intersects(shifted):
+                continue
+            for ring, fill in [(poly[0], 255)] + [(hole, 0) for hole in poly[1:]]:
+                points = [(x / MASK_SCALE, y / MASK_SCALE) for x, y in
+                          (view.project(_shift(lon, view.frame, bbox[2]), lat) for lon, lat in ring)]
+                if len(points) >= 3:
+                    draw.polygon(points, fill=fill)
+        count = sx = sy = 0
+        pixels = mask.load()
+        for y in range(mh):
+            for x in range(mw):
+                if pixels[x, y]:
+                    count += 1
+                    sx += x
+                    sy += y
+        if not count:
+            return None, 0.0
+        cx, cy = sx / count, sy / count
+        if not pixels[min(int(cx), mw - 1), min(int(cy), mh - 1)]:
+            best = min(((x, y) for y in range(mh) for x in range(mw) if pixels[x, y]),
+                       key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+            cx, cy = best
+        return ((cx + 0.5) * MASK_SCALE, (cy + 0.5) * MASK_SCALE), count / (mw * mh)
 
 
 def _point_for(name, spec, countries, view, anchors):
@@ -487,148 +489,149 @@ def render_map(spec, excerpt: str = "", allowed_terms=None, no_text: bool = Fals
         view = choose_view(spec["focus"], countries, width, height, pins=spec["pins"])
 
     s = SUPERSAMPLE
-    image = Image.new("RGB", (width * s, height * s), SEA)
-    draw = ImageDraw.Draw(image)
-    tones = {h["a3"]: h["tone"] for h in spec["highlight"]}
+    with closing(Image.new("RGB", (width * s, height * s), SEA)) as image:
+        draw = ImageDraw.Draw(image)
+        tones = {h["a3"]: h["tone"] for h in spec["highlight"]}
 
-    def project_ring(ring, ring_max):
-        return [(x * s, y * s) for x, y in (view.project(_shift(lon, view.frame, ring_max), lat)
-                                            for lon, lat in ring)]
+        def project_ring(ring, ring_max):
+            return [(x * s, y * s) for x, y in (view.project(_shift(lon, view.frame, ring_max), lat)
+                                                for lon, lat in ring)]
 
-    visible = []
-    for country in sorted(countries.values(), key=lambda c: -c["main_area"]):
-        for poly, bbox in zip(country["polys"], country["bboxes"]):
-            shifted = (_shift(bbox[0], view.frame, bbox[2]), bbox[1], _shift(bbox[2], view.frame, bbox[2]), bbox[3])
-            if view.intersects(shifted):
-                visible.append((country["a3"], poly, bbox[2]))
+        visible = []
+        for country in sorted(countries.values(), key=lambda c: -c["main_area"]):
+            for poly, bbox in zip(country["polys"], country["bboxes"]):
+                shifted = (_shift(bbox[0], view.frame, bbox[2]), bbox[1], _shift(bbox[2], view.frame, bbox[2]), bbox[3])
+                if view.intersects(shifted):
+                    visible.append((country["a3"], poly, bbox[2]))
 
-    # 面 → 境界線の順。強調しない国を先に塗り、強調国を上に重ねる。
-    for highlighted in (False, True):
-        for a3, poly, ring_max in visible:
-            if (a3 in tones) != highlighted:
-                continue
-            fill = TONES[tones[a3]] if highlighted else LAND
-            draw.polygon(project_ring(poly[0], ring_max), fill=fill)
-            for hole in poly[1:]:
-                draw.polygon(project_ring(hole, ring_max), fill=LAND)
-    for highlighted in (False, True):
-        for a3, poly, ring_max in visible:
-            if (a3 in tones) != highlighted:
-                continue
-            ring = poly[0]
-            points = project_ring(ring, ring_max)
-            # 経度180度で分かれた図形の切れ目は国境ではないので線を引かない。
-            run = []
-            for i in range(len(ring) + 1):
-                a, b = ring[i % len(ring)], ring[(i + 1) % len(ring)]
-                run.append(points[i % len(ring)])
-                if abs(a[0]) >= 179.999 and abs(b[0]) >= 179.999:
-                    if len(run) >= 2:
-                        draw.line(run, fill=HIGHLIGHT_EDGE if highlighted else LAND_EDGE,
-                                  width=(3 if highlighted else 2) * s, joint="curve")
-                    run = []
-            if len(run) >= 2:
-                draw.line(run, fill=HIGHLIGHT_EDGE if highlighted else LAND_EDGE,
-                          width=(3 if highlighted else 2) * s, joint="curve")
+        # 面 → 境界線の順。強調しない国を先に塗り、強調国を上に重ねる。
+        for highlighted in (False, True):
+            for a3, poly, ring_max in visible:
+                if (a3 in tones) != highlighted:
+                    continue
+                fill = TONES[tones[a3]] if highlighted else LAND
+                draw.polygon(project_ring(poly[0], ring_max), fill=fill)
+                for hole in poly[1:]:
+                    draw.polygon(project_ring(hole, ring_max), fill=LAND)
+        for highlighted in (False, True):
+            for a3, poly, ring_max in visible:
+                if (a3 in tones) != highlighted:
+                    continue
+                ring = poly[0]
+                points = project_ring(ring, ring_max)
+                # 経度180度で分かれた図形の切れ目は国境ではないので線を引かない。
+                run = []
+                for i in range(len(ring) + 1):
+                    a, b = ring[i % len(ring)], ring[(i + 1) % len(ring)]
+                    run.append(points[i % len(ring)])
+                    if abs(a[0]) >= 179.999 and abs(b[0]) >= 179.999:
+                        if len(run) >= 2:
+                            draw.line(run, fill=HIGHLIGHT_EDGE if highlighted else LAND_EDGE,
+                                      width=(3 if highlighted else 2) * s, joint="curve")
+                        run = []
+                if len(run) >= 2:
+                    draw.line(run, fill=HIGHLIGHT_EDGE if highlighted else LAND_EDGE,
+                              width=(3 if highlighted else 2) * s, joint="curve")
 
-    # 矢印
-    anchors = {}
-    for arrow in spec["arrows"]:
-        (x0, y0), (x2, y2) = (_point_for(arrow["from"], spec, countries, view, anchors),
-                              _point_for(arrow["to"], spec, countries, view, anchors))
-        x0, y0, x2, y2 = x0 * s, y0 * s, x2 * s, y2 * s
-        length = math.hypot(x2 - x0, y2 - y0)
-        if length < 20 * s:
-            notes.append(f"矢印 {arrow['from']}→{arrow['to']} は短すぎるため描きません")
-            continue
-        # 国名の上から出ないよう、国が始点の時は少し先から描き始める。
-        if arrow["from"] in countries:
-            step = min(length * 0.15, 70 * s)
-            x0, y0 = x0 + (x2 - x0) / length * step, y0 + (y2 - y0) / length * step
+        # 矢印
+        anchors = {}
+        for arrow in spec["arrows"]:
+            (x0, y0), (x2, y2) = (_point_for(arrow["from"], spec, countries, view, anchors),
+                                  _point_for(arrow["to"], spec, countries, view, anchors))
+            x0, y0, x2, y2 = x0 * s, y0 * s, x2 * s, y2 * s
             length = math.hypot(x2 - x0, y2 - y0)
-        nx, ny = -(y2 - y0) / length, (x2 - x0) / length
-        cx, cy = (x0 + x2) / 2 + nx * length * 0.18, (y0 + y2) / 2 + ny * length * 0.18
-        head = 34 * s
-        curve = []
-        for i in range(41):
-            t = i / 40
-            curve.append(((1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t * t * x2,
-                          (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t * t * y2))
-        ex, ey = curve[-1]
-        px, py = curve[-4]
-        angle = math.atan2(ey - py, ex - px)
-        cut = [p for p in curve if math.hypot(p[0] - ex, p[1] - ey) > head * 0.8] or curve[:2]
-        tip = [(ex, ey),
-               (ex - head * math.cos(angle - 0.45), ey - head * math.sin(angle - 0.45)),
-               (ex - head * math.cos(angle + 0.45), ey - head * math.sin(angle + 0.45))]
-        draw.line(cut, fill="#FFFFFF", width=16 * s, joint="curve")
-        draw.polygon(tip, fill="#FFFFFF", outline="#FFFFFF", width=5 * s)
-        draw.line(cut, fill=TONES[arrow["tone"]], width=10 * s, joint="curve")
-        draw.polygon(tip, fill=TONES[arrow["tone"]])
-
-    # ピン
-    pin_points = []
-    for pin in spec["pins"]:
-        lon = pin["lon"] + 360 if view.frame == "pacific" and pin["lon"] < 0 else pin["lon"]
-        x, y = view.project(lon, pin["lat"])
-        if not (0 <= x <= width and 0 <= y <= height):
-            notes.append(f"ピン「{pin['name']}」は画面の外のため描きません")
-            continue
-        r = 13 * s
-        draw.ellipse((x * s - r, y * s - r, x * s + r, y * s + r), fill=PIN_FILL, outline="#FFFFFF", width=5 * s)
-        pin_points.append((pin, x * s, y * s))
-
-    # 文字（「文字なし」の時は描かない）
-    placed = []
-    labels_drawn = 0
-    if not no_text:
-        if spec["labels"]:
-            for a3, tone in tones.items():
-                if a3 not in anchors:
-                    anchors[a3] = visible_anchor(countries[a3], view, width, height)
-                anchor, share = anchors[a3]
-                text = spec["label_overrides"].get(a3, countries[a3]["ja"])
-                if not anchor:
-                    notes.append(f"国名「{text}」は画面の外のため省きました")
-                    continue
-                x = min(max(anchor[0], 120), width - 120) * s
-                y = min(max(anchor[1], 50), height - 50) * s
-                # 小さく見えている国は文字も小さくして、周りの国を隠しすぎないようにする。
-                font = _font((46 if share >= 0.02 else 34) * s)
-                dark = tone in DARK_TONES and share >= 0.004
-                box = _text_box(draw, (x, y), text, font, 6 * s)
-                if _overlaps(box, placed):
-                    notes.append(f"国名「{text}」は他の文字と重なるため省きました")
-                    continue
-                draw.text((x, y), text, font=font, anchor="mm",
-                          fill=TEXT_LIGHT if dark else TEXT_DARK,
-                          stroke_width=6 * s, stroke_fill=TEXT_DARK if dark else TEXT_LIGHT)
-                placed.append(box)
-                labels_drawn += 1
-        for pin, x, y in pin_points:
-            if not pin["show_name"]:
+            if length < 20 * s:
+                notes.append(f"矢印 {arrow['from']}→{arrow['to']} は短すぎるため描きません")
                 continue
-            font = _font(38 * s)
-            for dx, anchor in ((28 * s, "lm"), (-28 * s, "rm")):
-                box = draw.textbbox((x + dx, y), pin["name"], font=font, anchor=anchor, stroke_width=6 * s)
-                if box[0] >= 0 and box[2] <= width * s and not _overlaps(box, placed):
-                    draw.text((x + dx, y), pin["name"], font=font, anchor=anchor, fill=TEXT_DARK,
-                              stroke_width=6 * s, stroke_fill=TEXT_LIGHT)
+            # 国名の上から出ないよう、国が始点の時は少し先から描き始める。
+            if arrow["from"] in countries:
+                step = min(length * 0.15, 70 * s)
+                x0, y0 = x0 + (x2 - x0) / length * step, y0 + (y2 - y0) / length * step
+                length = math.hypot(x2 - x0, y2 - y0)
+            nx, ny = -(y2 - y0) / length, (x2 - x0) / length
+            cx, cy = (x0 + x2) / 2 + nx * length * 0.18, (y0 + y2) / 2 + ny * length * 0.18
+            head = 34 * s
+            curve = []
+            for i in range(41):
+                t = i / 40
+                curve.append(((1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t * t * x2,
+                              (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t * t * y2))
+            ex, ey = curve[-1]
+            px, py = curve[-4]
+            angle = math.atan2(ey - py, ex - px)
+            cut = [p for p in curve if math.hypot(p[0] - ex, p[1] - ey) > head * 0.8] or curve[:2]
+            tip = [(ex, ey),
+                   (ex - head * math.cos(angle - 0.45), ey - head * math.sin(angle - 0.45)),
+                   (ex - head * math.cos(angle + 0.45), ey - head * math.sin(angle + 0.45))]
+            draw.line(cut, fill="#FFFFFF", width=16 * s, joint="curve")
+            draw.polygon(tip, fill="#FFFFFF", outline="#FFFFFF", width=5 * s)
+            draw.line(cut, fill=TONES[arrow["tone"]], width=10 * s, joint="curve")
+            draw.polygon(tip, fill=TONES[arrow["tone"]])
+
+        # ピン
+        pin_points = []
+        for pin in spec["pins"]:
+            lon = pin["lon"] + 360 if view.frame == "pacific" and pin["lon"] < 0 else pin["lon"]
+            x, y = view.project(lon, pin["lat"])
+            if not (0 <= x <= width and 0 <= y <= height):
+                notes.append(f"ピン「{pin['name']}」は画面の外のため描きません")
+                continue
+            r = 13 * s
+            draw.ellipse((x * s - r, y * s - r, x * s + r, y * s + r), fill=PIN_FILL, outline="#FFFFFF", width=5 * s)
+            pin_points.append((pin, x * s, y * s))
+
+        # 文字（「文字なし」の時は描かない）
+        placed = []
+        labels_drawn = 0
+        if not no_text:
+            if spec["labels"]:
+                for a3, tone in tones.items():
+                    if a3 not in anchors:
+                        anchors[a3] = visible_anchor(countries[a3], view, width, height)
+                    anchor, share = anchors[a3]
+                    text = spec["label_overrides"].get(a3, countries[a3]["ja"])
+                    if not anchor:
+                        notes.append(f"国名「{text}」は画面の外のため省きました")
+                        continue
+                    x = min(max(anchor[0], 120), width - 120) * s
+                    y = min(max(anchor[1], 50), height - 50) * s
+                    # 小さく見えている国は文字も小さくして、周りの国を隠しすぎないようにする。
+                    font = _font((46 if share >= 0.02 else 34) * s)
+                    dark = tone in DARK_TONES and share >= 0.004
+                    box = _text_box(draw, (x, y), text, font, 6 * s)
+                    if _overlaps(box, placed):
+                        notes.append(f"国名「{text}」は他の文字と重なるため省きました")
+                        continue
+                    draw.text((x, y), text, font=font, anchor="mm",
+                              fill=TEXT_LIGHT if dark else TEXT_DARK,
+                              stroke_width=6 * s, stroke_fill=TEXT_DARK if dark else TEXT_LIGHT)
                     placed.append(box)
                     labels_drawn += 1
-                    break
-            else:
-                notes.append(f"ピン「{pin['name']}」の名前は他の文字と重なるため省きました")
+            for pin, x, y in pin_points:
+                if not pin["show_name"]:
+                    continue
+                font = _font(38 * s)
+                for dx, anchor in ((28 * s, "lm"), (-28 * s, "rm")):
+                    box = draw.textbbox((x + dx, y), pin["name"], font=font, anchor=anchor, stroke_width=6 * s)
+                    if box[0] >= 0 and box[2] <= width * s and not _overlaps(box, placed):
+                        draw.text((x + dx, y), pin["name"], font=font, anchor=anchor, fill=TEXT_DARK,
+                                  stroke_width=6 * s, stroke_fill=TEXT_LIGHT)
+                        placed.append(box)
+                        labels_drawn += 1
+                        break
+                else:
+                    notes.append(f"ピン「{pin['name']}」の名前は他の文字と重なるため省きました")
 
-    result = image.resize((width, height), Image.LANCZOS)
-    info = {"view": view.as_dict(), "focus": spec["focus"], "highlight": spec["highlight"],
-            "pins": [p["name"] for p, _x, _y in pin_points], "arrows": len(spec["arrows"]),
-            "labels_drawn": labels_drawn, "notes": notes, "_view": view}
-    return result, info
+        result = image.resize((width, height), Image.LANCZOS)
+        info = {"view": view.as_dict(), "focus": spec["focus"], "highlight": spec["highlight"],
+                "pins": [p["name"] for p, _x, _y in pin_points], "arrows": len(spec["arrows"]),
+                "labels_drawn": labels_drawn, "notes": notes, "_view": view}
+        return result, info
 
 
+@limited_image_task
 def render_map_file(spec, output_path: Path, excerpt: str = "", allowed_terms=None,
-                    no_text: bool = False) -> tuple:
+                    no_text: bool = False, cancel_check=None) -> tuple:
     """地図を描いてPNGで保存する。戻り値 (成功, エラー文, notes)。"""
     try:
         image, info = render_map(spec, excerpt, allowed_terms, no_text)
@@ -646,6 +649,7 @@ def render_map_file(spec, output_path: Path, excerpt: str = "", allowed_terms=No
         image.save(temp_path, format="PNG")
         os.replace(temp_path, output_path)
     finally:
+        image.close()
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
     return True, "", notes
