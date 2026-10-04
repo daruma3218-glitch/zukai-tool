@@ -174,7 +174,12 @@ class DeployGuard:
         if not mutation:
             return self.application(environ, start)
         with self.lock:
-            if self._read() or not self.root.is_dir():
+            state = self._read()
+            # A waiting deployment must still let people stop their own job.
+            # The application validates login, CSRF and the job; sealed stays closed.
+            cancel_while_waiting = (state and state.get("phase") == "waiting"
+                                    and method == "POST" and re.fullmatch(r"/api/cancel/[A-Za-z0-9_-]+", path))
+            if (state and not cancel_while_waiting) or not self.root.is_dir():
                 return self.response(start, "503 Service Unavailable",
                                      {"ok": False, "code": "deployment_pending", "error": MESSAGE})
             self.writes += 1
@@ -203,6 +208,10 @@ def install(module, root):
                 continue
             path = directory / "job.json"
             if path.exists() and json.loads(path.read_text(encoding="utf-8")).get("status") not in TERMINAL:
+                return True
+            edits = directory / "edits.json"
+            if edits.exists() and any(edit.get("status") == "running" for edit in
+                                      json.loads(edits.read_text(encoding="utf-8")).get("edits", [])):
                 return True
         return False
     guard = DeployGuard(module.app, root, os.environ["SECRET_KEY"],

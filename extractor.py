@@ -24,6 +24,7 @@ def analyze_manuscript(
     client: anthropic.Anthropic,
     manuscript_text: str,
     log: Optional[Callable] = None,
+    cancel_check=None,
 ) -> dict:
     """原稿の全体構造（タイトル・キーワード・セクション）を把握する"""
     log = log or (lambda *a, **kw: None)
@@ -50,7 +51,7 @@ def analyze_manuscript(
 
 JSONのみ返すこと。"""
 
-    result = claude_query(client, query, system, max_tokens=2048, model=CLAUDE_MODEL, workload="diagram_selection")
+    result = claude_query(client, query, system, max_tokens=2048, model=CLAUDE_MODEL, workload="diagram_selection", cancel_check=cancel_check)
     data = parse_json_object(result)
 
     if not data:
@@ -72,6 +73,7 @@ def extract_visual_points(
     target_count: int = 50,
     user_instructions: str = "",
     log: Optional[Callable] = None,
+    cancel_check=None,
 ) -> list:
     """原稿からN個の視覚化ポイントを抽出する。
 
@@ -187,7 +189,7 @@ JSON配列のみで返すこと（前置き・後書き・コードブロック�
 合計**{target_count}個**返すこと。それ未満は無効です。"""
 
     log("extractor", f"視覚化ポイントを抽出中（目標 {target_count} 個）...")
-    result = claude_query(client, query, system, max_tokens=16000, model=CLAUDE_MODEL, workload="diagram_selection")
+    result = claude_query(client, query, system, max_tokens=16000, model=CLAUDE_MODEL, workload="diagram_selection", cancel_check=cancel_check)
     excerpts = parse_json_array(result)
     log("extractor", f"1回目の抽出: {len(excerpts)} 個")
 
@@ -220,7 +222,7 @@ JSON配列のみで返すこと:
   {{"index": {len(excerpts) + 1}, "excerpt": "...", "section": "...", "type": "...", "keypoint": "..."}}
 ]"""
         log("extractor", f"補充リクエスト（残り {remaining} 個）...")
-        result2 = claude_query(client, supplement_query, system, max_tokens=10000, model=CLAUDE_MODEL, workload="diagram_selection")
+        result2 = claude_query(client, supplement_query, system, max_tokens=10000, model=CLAUDE_MODEL, workload="diagram_selection", cancel_check=cancel_check)
         extra = parse_json_array(result2)
         log("extractor", f"補充結果: {len(extra)} 個追加")
         if not extra:

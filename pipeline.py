@@ -20,6 +20,7 @@ from extractor import analyze_manuscript, extract_visual_points
 from prompter import generate_all_prompts, CANDIDATE_MODES, MAP_MODES
 import candidates
 import map_renderer
+from job_control import check_cancel
 from generator import (
     run_parallel_generation,
     DEFAULT_CONCURRENCY,
@@ -49,9 +50,11 @@ class DiagramPipeline:
         item_callback: Optional[Callable] = None,
         candidate_mode: str = "single",
         map_mode: str = "ai",
+        cancel_check=None,
     ):
         self.candidate_mode = candidate_mode if candidate_mode in CANDIDATE_MODES else "single"
         self.map_mode = map_mode if map_mode in MAP_MODES else "ai"
+        self.cancel_check = cancel_check
         self.manuscript_text = manuscript_text
         self.output_dir = Path(output_dir)
         self.target_count = max(1, min(target_count, 200))
@@ -126,6 +129,7 @@ class DiagramPipeline:
 
     # ---- メインフロー ----
     def run(self) -> dict:
+        check_cancel(self.cancel_check)
         client = get_anthropic_client()
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         openai_key = os.environ.get("OPENAI_API_KEY", "")
@@ -145,7 +149,8 @@ class DiagramPipeline:
         # Phase 1: 原稿分析
         self._progress(1, "原稿を分析中...", 3)
         self._log("analyze", "ASTRAで原稿の全体構造を分析しています...")
-        analysis = analyze_manuscript(client, self.manuscript_text, log=self._log)
+        analysis = analyze_manuscript(client, self.manuscript_text, log=self._log, cancel_check=self.cancel_check)
+        check_cancel(self.cancel_check)
         title = analysis.get("title", "無題")
         sections = analysis.get("sections", [])
         keywords = analysis.get("keywords", [])
@@ -171,7 +176,9 @@ class DiagramPipeline:
             target_count=self.target_count,
             user_instructions=self.user_instructions,
             log=self._log,
+            cancel_check=self.cancel_check,
         )
+        check_cancel(self.cancel_check)
         save_json(self.output_dir / "excerpts.json", {"items": excerpts})
         self._log("extract", f"抽出完了: {len(excerpts)} 個")
         self._progress(1, f"抽出完了: {len(excerpts)} 個の視覚化ポイント", 25)
@@ -204,7 +211,9 @@ class DiagramPipeline:
             log=self._log,
             candidate_mode=self.candidate_mode,
             map_mode=self.map_mode,
+            cancel_check=self.cancel_check,
         )
+        check_cancel(self.cancel_check)
         self._log("prompter", f"プロンプト生成完了: {len(prompts)} 件")
 
         # 候補（複数案）と地図を、1枚ずつの生成項目に展開する。1案なら従来と同じ番号・ファイル名。
@@ -244,7 +253,9 @@ class DiagramPipeline:
             openai_model=self.openai_model,
             concurrency=self.concurrency,
             progress_callback=self._on_item_event,
+            cancel_check=self.cancel_check,
         )
+        check_cancel(self.cancel_check)
 
         # 結果サマリ
         success_count = sum(1 for r in results if r.get("success"))

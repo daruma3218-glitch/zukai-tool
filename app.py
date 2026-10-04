@@ -32,6 +32,7 @@ import re
 
 from utils import load_env, load_json, save_json
 from pipeline import DiagramPipeline
+from job_control import Cancellation, JobCancelled
 from generator import (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS,
                        OPENAI_IMAGE_MODEL_CHOICES, resolve_openai_image_model, resolve_edit_model)
 from prompter import CANDIDATE_MODES, MAP_MODES
@@ -79,7 +80,9 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 # ジョブ状態（メモリ）
 _jobs: dict[str, dict] = {}
 _job_logs: dict[str, list] = {}
-_jobs_lock = threading.Lock()
+_jobs_lock = threading.RLock()
+_active_jobs = set()  # The production service uses one Gunicorn worker, eight threads.
+TERMINAL_STATUSES = {"completed", "error", "cancelled", "interrupted"}
 
 
 # ====== 認証 ======
@@ -130,6 +133,8 @@ def version():
         "image_review_enabled": False,
         "pipeline_phases": 3,
         "partial_download_enabled": True,
+        "job_cancellation": {"version": 1, "whole_job": True, "preserves_images": True,
+                             "restart_settings": True, "inflight_requests_may_finish": True},
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
         # 従量APIへの明示の切り替え（既定オフ・2026-09-28）。ツール名・環境変数の名前・真偽値だけ
         "llm_api_switch": subscription_runtime.api_switch_status(),
@@ -201,24 +206,25 @@ def prevent_stale_progress(response):
 
 def _set_job_state(job_id: str, **kwargs):
     with _jobs_lock:
-        state = _jobs.setdefault(job_id, {})
+        state = _get_job_state(job_id)
+        if kwargs.get("status") in {"running", "completed"}:
+            Cancellation(OUTPUT_DIR / job_id).check()
+        if state.get("status") in TERMINAL_STATUSES:
+            return
         state.update(kwargs)
         state["updated_at"] = datetime.now().isoformat()
-        # ファイルにも保存
-        try:
-            save_json(OUTPUT_DIR / job_id / "job.json", state)
-        except Exception:
-            pass
+        save_json(OUTPUT_DIR / job_id / "job.json", state)
+        _jobs[job_id] = state
 
 
 def _job_elapsed_seconds(job_id: str, state: dict):
     """開始から終了（実行中なら今）までの秒数。開始時刻が分からなければ None。"""
     try:
-        started = datetime.fromisoformat(state["started_at"]) if state.get("started_at")             else datetime.strptime(job_id, "%Y%m%d_%H%M%S")
+        started = datetime.fromisoformat(state["started_at"]) if state.get("started_at")             else datetime.strptime(job_id[:15], "%Y%m%d_%H%M%S")
     except (ValueError, TypeError):
         return None
     end = datetime.now()
-    if state.get("status") in ("completed", "error") and state.get("updated_at"):
+    if state.get("status") in TERMINAL_STATUSES and state.get("updated_at"):
         try:
             end = datetime.fromisoformat(state["updated_at"])
         except ValueError:
@@ -238,6 +244,41 @@ def _get_job_state(job_id: str) -> dict:
     return {}
 
 
+def _job_dir_for(job_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id or ""):
+        return None
+    path = OUTPUT_DIR / job_id
+    if path.is_symlink() or not path.is_dir() or path.resolve().parent != OUTPUT_DIR.resolve():
+        return None
+    return path
+
+
+def _finish_cancelled(job_id):
+    """Called after this job's local workers have drained; keep all saved results."""
+    with _jobs_lock:
+        if _get_job_state(job_id).get("status") in TERMINAL_STATUSES:
+            return
+        job_dir = OUTPUT_DIR / job_id
+        items = _image_snapshot(job_dir)["items"]
+        for item in items:
+            if item.get("status") not in {"ok", "failed"}:
+                item.update(status="cancelled", success=False)
+        succeeded = sum(i.get("status") == "ok" for i in items)
+        failed = sum(i.get("status") == "failed" for i in items)
+        cancelled = sum(i.get("status") == "cancelled" for i in items)
+        save_json(job_dir / "images_progress.json", {"items": items, "updated_at": datetime.now().isoformat()})
+        analysis = load_json(job_dir / "analysis.json", {})
+        manifest = load_json(job_dir / "manifest.json", {})
+        manifest.update(status="cancelled", title=manifest.get("title") or analysis.get("title", job_id),
+                        items=items, succeeded=succeeded, failed=failed, cancelled=cancelled,
+                        images_planned=len(items), completed_at=datetime.now().isoformat())
+        save_json(job_dir / "manifest.json", manifest)
+        _set_job_state(job_id, status="cancelled", title=manifest["title"], succeeded=succeeded,
+                       failed=failed, cancelled=cancelled,
+                       message=f"中止しました。完成済み {succeeded}枚は保存されています。")
+        _add_log(job_id, "system", f"ジョブを中止（完成済み {succeeded}枚を保持）")
+
+
 def _add_log(job_id: str, category: str, message: str, detail: str = ""):
     entry = {
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -246,7 +287,7 @@ def _add_log(job_id: str, category: str, message: str, detail: str = ""):
         "detail": detail,
     }
     with _jobs_lock:
-        logs = _job_logs.setdefault(job_id, [])
+        logs = _job_logs.setdefault(job_id, load_json(OUTPUT_DIR / job_id / "logs.json", []))
         logs.append(entry)
         try:
             save_json(OUTPUT_DIR / job_id / "logs.json", logs)
@@ -344,6 +385,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          candidate_mode: str = "single",
                          map_mode: str = "data"):
     job_dir = OUTPUT_DIR / job_id
+    cancellation = Cancellation(job_dir)
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
         _set_job_state(job_id, status="running", phase=0, message="開始しています...", percent=0)
@@ -376,8 +418,10 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             item_callback=on_item,
             candidate_mode=candidate_mode,
             map_mode=map_mode,
+            cancel_check=cancellation.check,
         )
         manifest = pipeline.run()
+        cancellation.check()
         planned = manifest.get("images_planned") or manifest.get("target_count", 0)
         groups = manifest.get("groups") or planned
         message = f"完了: 成功 {manifest['succeeded']} / {planned} 枚"
@@ -395,12 +439,20 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             target_count=planned,
         )
         _add_log(job_id, "system", f"全フェーズ完了（成功 {manifest['succeeded']} / 失敗 {manifest['failed']}）")
+    except JobCancelled:
+        _finish_cancelled(job_id)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        _set_job_state(job_id, status="error", message=str(e)[:200], percent=0)
-        _add_log(job_id, "error", "パイプライン実行エラー", str(e)[:300])
+        with _jobs_lock:
+            if cancellation.requested():
+                _finish_cancelled(job_id)
+            else:
+                _set_job_state(job_id, status="error", message=str(e)[:200], percent=0)
+                _add_log(job_id, "error", "パイプライン実行エラー", str(e)[:300])
     finally:
+        with _jobs_lock:
+            _active_jobs.discard(job_id)
         retention.run_in_background(OUTPUT_DIR)  # 新しい画像が増えた直後に容量を確かめる
 
 
@@ -507,12 +559,19 @@ def start_job():
         map_mode = "ai" if not map_renderer.enabled() else "data"
 
     # ジョブ作成
-    job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3)
     job_dir = OUTPUT_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+    job_dir.mkdir(parents=True, exist_ok=False)
     (job_dir / "manuscript.txt").write_text(manuscript_text, encoding="utf-8")
     if user_instructions:
         (job_dir / "user_instructions.txt").write_text(user_instructions, encoding="utf-8")
+    # Immutable input settings: result target_count may later become the image count.
+    save_json(job_dir / "request.json", {
+        "target_count": target_count, "concurrency": concurrency, "provider": provider,
+        "openai_quality": openai_quality, "openai_model": openai_model,
+        "worldview_preset": worldview_preset, "no_text_mode": no_text_mode,
+        "user_instructions": user_instructions, "candidate_mode": candidate_mode, "map_mode": map_mode,
+    })
 
     _set_job_state(
         job_id,
@@ -536,14 +595,73 @@ def start_job():
               worldview_preset, no_text_mode, openai_model, candidate_mode, map_mode),
         daemon=True,
     )
-    thread.start()
+    with _jobs_lock:
+        _active_jobs.add(job_id)
+    try:
+        thread.start()
+    except Exception:
+        with _jobs_lock:
+            _active_jobs.discard(job_id)
+        _set_job_state(job_id, status="error", message="開始できませんでした。設定を確認して作り直してください。")
+        raise
     return jsonify({"job_id": job_id, "redirect": f"/progress/{job_id}"})
 
 
 @app.route("/progress/<job_id>")
 @login_required
 def progress_page(job_id):
-    return render_template("progress.html", job_id=job_id)
+    if not _job_dir_for(job_id):
+        return "ジョブが見つかりません", 404
+    token = session.setdefault("cancel_csrf", secrets.token_hex(32))
+    return render_template("progress.html", job_id=job_id, cancel_csrf=token)
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+@login_required
+def cancel_job(job_id):
+    expected = session.get("cancel_csrf", "")
+    if not request.is_json or not expected or not secrets.compare_digest(expected, request.headers.get("X-CSRF-Token", "")):
+        return jsonify({"error": "画面を再読み込みしてから中止してください。"}), 403
+    job_dir = _job_dir_for(job_id)
+    if job_dir is None:
+        return jsonify({"error": "ジョブが見つかりません"}), 404
+    with _jobs_lock:
+        state = _get_job_state(job_id)
+        if not state:
+            return jsonify({"error": "ジョブの状態が見つかりません"}), 404
+        if state.get("status") in TERMINAL_STATUSES:
+            return jsonify(state)
+        if not Cancellation(job_dir).requested():
+            save_json(job_dir / "cancel_requested.json", {"requested_at": datetime.now().isoformat()})
+            _add_log(job_id, "system", "利用者がジョブ全体の中止を要求しました")
+        _set_job_state(job_id, status="cancelling",
+                       message="中止処理中です。送信済みの画像を保存して終了します。")
+        if job_id not in _active_jobs:
+            # An old queued/running record left by a server restart has no local worker.
+            _finish_cancelled(job_id)
+        state = _get_job_state(job_id)
+    return jsonify(state), 202 if state.get("status") == "cancelling" else 200
+
+
+@app.route("/api/restart-settings/<job_id>")
+@login_required
+def restart_settings(job_id):
+    job_dir = _job_dir_for(job_id)
+    if job_dir is None:
+        return jsonify({"error": "元のジョブが見つかりません"}), 404
+    try:
+        manuscript = (job_dir / "manuscript.txt").read_text(encoding="utf-8")
+    except OSError:
+        return jsonify({"error": "元の原稿が残っていません。原稿をもう一度入力してください。"}), 404
+    settings = load_json(job_dir / "request.json", {})
+    if not settings:  # Earlier jobs: completed manifests contain the original place count.
+        settings = {**_get_job_state(job_id), **load_json(job_dir / "manifest.json", {})}
+        instructions = job_dir / "user_instructions.txt"
+        if instructions.is_file():
+            settings["user_instructions"] = instructions.read_text(encoding="utf-8")
+    keys = ("target_count", "concurrency", "provider", "openai_quality", "openai_model",
+            "worldview_preset", "no_text_mode", "user_instructions", "candidate_mode", "map_mode")
+    return jsonify({"manuscript_text": manuscript, "settings": {k: settings[k] for k in keys if k in settings}})
 
 
 @app.route("/api/status/<job_id>")

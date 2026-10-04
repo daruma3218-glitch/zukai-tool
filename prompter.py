@@ -13,6 +13,7 @@ from typing import Callable, Optional
 import anthropic
 
 from utils import claude_query, parse_json_array
+from job_control import JobCancelled, check_cancel
 
 
 # プロンプト・図解設計はASTRA（センテンスつくーると同方針）。
@@ -135,6 +136,7 @@ def generate_prompts_batch(
     no_text_mode: bool = False,
     candidate_mode: str = "single",
     map_mode: str = "ai",
+    cancel_check=None,
 ) -> list:
     """1 バッチ（10 件程度）の視覚化ポイントを英文プロンプト化"""
     user_block = _build_user_block(user_instructions)
@@ -225,7 +227,7 @@ JSON配列のみで返すこと（マークダウン禁止）:
 
 必ず{len(excerpts_batch)}個出力すること（順序は入力と同じ）。"""
 
-    result = claude_query(client, query, system, max_tokens=8000, model=CLAUDE_MODEL)
+    result = claude_query(client, query, system, max_tokens=8000, model=CLAUDE_MODEL, cancel_check=cancel_check)
     prompts = parse_json_array(result)
 
     # 入力の excerpt 情報をマージ（プロンプト生成側で抜けても保持）
@@ -288,6 +290,7 @@ def generate_all_prompts(
     log: Optional[Callable] = None,
     candidate_mode: str = "single",
     map_mode: str = "ai",
+    cancel_check=None,
 ) -> list:
     """全視覚化ポイントを並列バッチで英文プロンプト化"""
     log = log or (lambda *a, **kw: None)
@@ -318,12 +321,13 @@ def generate_all_prompts(
         future_to_batch = {
             executor.submit(generate_prompts_batch, client, batch, title,
                             user_instructions, worldview_preset, no_text_mode,
-                            candidate_mode, map_mode): idx
+                            candidate_mode, map_mode, cancel_check): idx
             for idx, batch in enumerate(batches)
         }
         for future in as_completed(future_to_batch):
             batch_idx = future_to_batch[future]
             try:
+                check_cancel(cancel_check)
                 results = future.result()
                 # 元の順序に戻す
                 for r in results:
@@ -332,9 +336,14 @@ def generate_all_prompts(
                         all_results[orig_idx] = r
                 completed_batches += 1
                 log("prompter", f"バッチ {completed_batches}/{len(batches)} 完了（{len(results)} 件）")
+            except JobCancelled:
+                for pending in future_to_batch:
+                    pending.cancel()
+                raise
             except Exception as e:
                 log("error", f"バッチ {batch_idx} 失敗: {str(e)[:100]}")
 
+    check_cancel(cancel_check)
     # None を埋める（フォールバック）
     final = []
     for i, r in enumerate(all_results):

@@ -26,8 +26,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
-JOB_ID_RE = re.compile(r"^\d{8}_\d{6}$")
-TERMINAL_STATUSES = {"completed", "error"}
+JOB_ID_RE = re.compile(r"^\d{8}_\d{6}(?:_[0-9a-f]{6})?$")
+TERMINAL_STATUSES = {"completed", "error", "cancelled", "interrupted"}
 STALE_ACTIVE_DAYS = 3
 LOCK_NAME = ".retention.lock"
 LOCK_STALE_SECONDS = 30 * 60

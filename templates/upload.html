@@ -74,6 +74,8 @@
         {% endif %}
 
         <form id="uploadForm" enctype="multipart/form-data" class="space-y-6">
+          <p id="restoreJobNotice" class="hidden p-3 rounded-xl bg-purple-50 text-purple-800 text-sm" role="status"></p>
+          <label id="restoredNoText" class="hidden text-sm text-gray-600"><input type="checkbox" name="no_text_mode" id="noTextMode"> 元のジョブの「文字なし」を引き継ぐ</label>
 
           <!-- 原稿入力 -->
           <div>
@@ -355,6 +357,9 @@
                       {% else %}bg-gray-100 text-gray-600{% endif %}">
                       {% if job.status == 'completed' %}✓ {{ job.succeeded }}/{{ job.target }}
                       {% elif job.status == 'running' %}実行中
+                      {% elif job.status == 'cancelling' %}中止処理中
+                      {% elif job.status == 'cancelled' %}中止済み・{{ job.succeeded }}枚保存
+                      {% elif job.status == 'queued' %}待機中
                       {% elif job.status == 'error' %}エラー
                       {% else %}{{ job.status }}{% endif %}
                     </span>
@@ -479,9 +484,10 @@
     function writeStore(key, value) {
       try { localStorage.setItem(key, value); } catch (e) {}
     }
-    function restoreSettings() {
+    function restoreSettings(override = null) {
       let saved = {};
       try { saved = JSON.parse(readStore(SETTINGS_KEY) || '{}') || {}; } catch (e) { saved = {}; }
+      if (override) saved = override;
       ['provider', 'candidate_mode', 'openai_quality'].forEach(name => {
         const el = saved[name] && document.querySelector(`input[name="${name}"][value="${saved[name]}"]`);
         if (el) el.checked = true;
@@ -513,6 +519,34 @@
       userInstructions.value = readStore(INSTRUCTIONS_KEY) || '';
     });
     restoreSettings();
+
+    async function restoreJobSettings() {
+      const job = new URLSearchParams(window.location.search).get('retry');
+      if (!job) return;
+      submitBtn.disabled = true;
+      const note = document.getElementById('restoreJobNotice');
+      note.classList.remove('hidden');
+      note.textContent = '元の原稿と設定を読み込んでいます…';
+      try {
+        const res = await fetch(`/api/restart-settings/${encodeURIComponent(job)}`);
+        let data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!res.ok || !data.settings) throw new Error(data.error || '原稿と設定を読み込めませんでした。ログインし直してください。');
+        restoreSettings(data.settings);
+        manuscriptText.value = data.manuscript_text;
+        charCount.textContent = manuscriptText.value.length.toLocaleString();
+        userInstructions.value = data.settings.user_instructions || '';
+        if (data.settings.no_text_mode) {
+          document.getElementById('restoredNoText').classList.remove('hidden');
+          document.getElementById('noTextMode').checked = true;
+        }
+        note.textContent = '元の原稿と設定を引き継ぎました。設定を直して生成してください。新しいジョブとして最初から作り直します（画像の生成費用がかかります）。元の画像は残ります。';
+        submitBtn.disabled = false;
+      } catch (e) {
+        note.textContent = e.message + ' 新規ジョブから原稿を入力し直すこともできます。';
+      }
+    }
+    restoreJobSettings();
 
     // フォーム送信
     form.addEventListener('submit', async (e) => {

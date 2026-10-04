@@ -57,9 +57,16 @@ def claude_query(
     max_retries: int = 3,
     workload: str = "assets_plan",
     effort: str = "high",
+    cancel_check=None,
 ) -> str:
-    return _subscription.generate(system, query, tool='zukai', model=model, max_tokens=max_tokens,
-                                  workload=workload, effort=effort, timeout=900)[0]
+    if cancel_check:
+        cancel_check()
+    result = _subscription.generate(system, query, tool='zukai', model=model, max_tokens=max_tokens,
+                                    workload=workload, effort=effort, timeout=900,
+                                    cancel_check=cancel_check)[0]
+    if cancel_check:
+        cancel_check()
+    return result
 
 
 def parse_json_array(text: str) -> list:

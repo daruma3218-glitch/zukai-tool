@@ -26,6 +26,7 @@ from google.genai import types
 
 # Pillow（クロップ用）
 from PIL import Image
+from job_control import JobCancelled, check_cancel, wait_or_cancel
 
 
 # ===== モデル設定 =====
@@ -255,10 +256,12 @@ def _sync_generate_image_gemini(
     full_prompt: str,
     output_path: Path,
     model_name: str = DEFAULT_GEMINI_MODEL,
+    cancel_check=None,
 ) -> tuple:
     """1 枚の画像を同期生成（Gemini）"""
     last_error = ""
     for attempt in range(MAX_RETRIES):
+        check_cancel(cancel_check)
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -296,13 +299,13 @@ def _sync_generate_image_gemini(
             err = str(e)
             last_error = err[:200]
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                time.sleep(30 * (attempt + 1))
+                wait_or_cancel(30 * (attempt + 1), cancel_check)
                 continue
             if "safety" in err.lower() or "block" in err.lower():
                 return False, f"safety blocked: {err[:120]}"
             if "not found" in err.lower() or "404" in err:
                 return False, f"model not available: {model_name}"
-            time.sleep(3 + 2 * attempt)
+            wait_or_cancel(3 + 2 * attempt, cancel_check)
 
     return False, last_error or "max retries exceeded"
 
@@ -315,10 +318,12 @@ def _sync_generate_image_openai(
     model_name: str = DEFAULT_OPENAI_MODEL,
     size: str = "1536x1024",  # 3:2 横長（16:9 に最も近い）
     quality: str = "medium",  # low / medium / high
+    cancel_check=None,
 ) -> tuple:
     """1 枚の画像を同期生成（OpenAI gpt-image-2）"""
     last_error = ""
     for attempt in range(MAX_RETRIES):
+        check_cancel(cancel_check)
         try:
             response = client.images.generate(
                 model=model_name,
@@ -355,7 +360,7 @@ def _sync_generate_image_openai(
             last_error = err[:200]
             err_lower = err.lower()
             if "429" in err or "rate" in err_lower or "limit" in err_lower:
-                time.sleep(30 * (attempt + 1))
+                wait_or_cancel(30 * (attempt + 1), cancel_check)
                 continue
             if "safety" in err_lower or "policy" in err_lower or "moderation" in err_lower:
                 return False, f"content policy blocked: {err[:120]}"
@@ -363,7 +368,7 @@ def _sync_generate_image_openai(
                 return False, f"model not available: {model_name} ({err[:80]})"
             if "401" in err or "invalid api key" in err_lower:
                 return False, f"invalid OpenAI API key: {err[:80]}"
-            time.sleep(3 + 2 * attempt)
+            wait_or_cancel(3 + 2 * attempt, cancel_check)
 
     return False, last_error or "max retries exceeded"
 
@@ -455,12 +460,14 @@ class ParallelImageGenerator:
         openai_size: str = "1536x1024",
         concurrency: int = DEFAULT_CONCURRENCY,
         progress_callback: Optional[Callable[[dict], None]] = None,
+        cancel_check=None,
     ):
         if provider not in VALID_PROVIDERS:
             raise ValueError(f"unknown provider: {provider} (valid: {VALID_PROVIDERS})")
         self.provider = provider
         self.openai_quality = openai_quality
         self.openai_size = openai_size
+        self.cancel_check = cancel_check
 
         # クライアント初期化（必要な分だけ）
         self.gemini_client = None
@@ -471,12 +478,14 @@ class ParallelImageGenerator:
         if provider == PROVIDER_NANOBANANA:
             if not gemini_api_key:
                 raise RuntimeError("nanobanana を使うには GEMINI_API_KEY が必要です")
-            self.gemini_client = genai.Client(api_key=gemini_api_key)
+            self.gemini_client = genai.Client(api_key=gemini_api_key, http_options=types.HttpOptions(
+                timeout=180000, retry_options=types.HttpRetryOptions(attempts=1)))
         elif provider == PROVIDER_GPT_IMAGE:
             if not openai_api_key:
                 raise RuntimeError("gpt-image を使うには OPENAI_API_KEY が必要です")
             import openai  # 遅延 import
-            self.openai_client = openai.OpenAI(api_key=openai_api_key)
+            # Our retry loop checks cancellation; disable hidden SDK retries.
+            self.openai_client = openai.OpenAI(api_key=openai_api_key, timeout=180, max_retries=0)
 
         self.concurrency = max(1, min(concurrency, 32))
         self.progress_callback = progress_callback or (lambda info: None)
@@ -490,7 +499,7 @@ class ParallelImageGenerator:
         """provider に応じた同期生成関数を呼び分ける"""
         if self.provider == PROVIDER_NANOBANANA:
             return _sync_generate_image_gemini(
-                self.gemini_client, full_prompt, output_path, self.gemini_model
+                self.gemini_client, full_prompt, output_path, self.gemini_model, self.cancel_check
             )
         else:  # gpt-image
             return _sync_generate_image_openai(
@@ -498,6 +507,7 @@ class ParallelImageGenerator:
                 model_name=self.openai_model,
                 size=self.openai_size,
                 quality=self.openai_quality,
+                cancel_check=self.cancel_check,
             )
 
     async def _generate_one(
@@ -525,6 +535,12 @@ class ParallelImageGenerator:
         notes: list = []
 
         async with semaphore:
+            try:
+                check_cancel(self.cancel_check)
+            except JobCancelled:
+                result = dict(prompt_entry, status="cancelled", success=False, filename=None, error="")
+                self.progress_callback(result)
+                return result
             self.progress_callback({
                 "index": idx,
                 "status": "generating",
@@ -555,6 +571,10 @@ class ParallelImageGenerator:
                         full_prompt,
                         output_path,
                     )
+            except JobCancelled:
+                result = dict(prompt_entry, status="cancelled", success=False, filename=None, error="")
+                self.progress_callback(result)
+                return result
             except Exception as e:
                 success, error = False, str(e)[:200]
 
@@ -633,6 +653,7 @@ def run_parallel_generation(
     openai_size: str = "1536x1024",
     concurrency: int = DEFAULT_CONCURRENCY,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_check=None,
 ) -> list:
     """同期エントリポイント: pipeline から呼び出す"""
     # 環境変数からデフォルト補完
@@ -655,5 +676,6 @@ def run_parallel_generation(
         openai_size=openai_size,
         concurrency=concurrency,
         progress_callback=progress_callback,
+        cancel_check=cancel_check,
     )
     return asyncio.run(generator.generate_all(prompts, output_dir))

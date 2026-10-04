@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from unittest.mock import Mock
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,6 +55,34 @@ def test_idle_is_sealed_until_matching_replacement(guard):
         assert guard.file.exists()
     DeployGuard(guard.application, guard.root, "test-only", SHA, "new", lambda: False)
     assert not guard.file.exists()
+
+
+def test_waiting_deploy_allows_cancel_but_sealed_deploy_does_not(guard):
+    guard.jobs_busy.return_value = True
+    guard.drain(SHA)
+    assert request(guard)[0] == "503 Service Unavailable"
+    assert request(guard, path="/api/cancel/20261004_100000_abcdef")[0] == "200 OK"
+    assert request(guard, path="/api/cancel/../escape")[0] == "503 Service Unavailable"
+    assert guard.writes == 0
+    guard.jobs_busy.return_value = False
+    guard.drain(SHA)
+    assert request(guard, path="/api/cancel/20261004_100000_abcdef")[0] == "503 Service Unavailable"
+
+
+@pytest.mark.parametrize("edit_status,busy", [("running", True), ("ok", False), ("failed", False)])
+def test_completed_job_with_running_image_edit_still_blocks_deploy(tmp_path, monkeypatch, edit_status, busy):
+    from deploy_guard import install
+    monkeypatch.setenv("SECRET_KEY", "test-only")
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    output = tmp_path / "output"
+    job = output / "20261004_100000"
+    job.mkdir(parents=True)
+    (job / "job.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    (job / "edits.json").write_text(json.dumps({"edits": [{"status": edit_status}]}), encoding="utf-8")
+    module = SimpleNamespace(app=Mock(), _jobs_lock=threading.RLock(), _jobs={}, OUTPUT_DIR=output,
+                             _run_pipeline_thread=Mock())
+    guard = install(module, tmp_path)
+    assert guard._busy() is busy
 
 
 def test_generation_waits_without_render_timeout_then_retries_once(guard):
