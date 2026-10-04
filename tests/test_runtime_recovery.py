@@ -85,7 +85,40 @@ def test_factory_recovers_before_traffic_only_if_writable(tmp_path, monkeypatch,
         assert mod.recover_interrupted_jobs.call_count == expected
         return mod.app
     monkeypatch.setattr(deploy_guard, "install", install)
-    migration_entry.create_app()
+    gate = migration_entry.create_app()
+    assert module.recover_interrupted_jobs.call_count == 0  # Parent process must do no recovery.
+    gate({"REQUEST_METHOD": "GET", "PATH_INFO": "/version"}, Mock())
+    gate({"REQUEST_METHOD": "GET", "PATH_INFO": "/version"}, Mock())
+    assert module.recover_interrupted_jobs.call_count == expected
+
+
+def test_worker_replacement_reinitializes_recovery_and_watcher(tmp_path, monkeypatch):
+    module = SimpleNamespace(app=Mock(), recover_interrupted_jobs=Mock())
+    install = Mock(return_value=module.app)
+    monkeypatch.setattr(deploy_guard, "install", install)
+    pid = [100]
+    monkeypatch.setattr(migration_entry.os, "getpid", lambda: pid[0])
+    runtime = migration_entry.WorkerRuntime(module, tmp_path, "active")
+    runtime({}, Mock())
+    runtime({}, Mock())
+    assert module.recover_interrupted_jobs.call_count == 1 and install.call_count == 1
+    pid[0] = 101
+    runtime({}, Mock())
+    assert module.recover_interrupted_jobs.call_count == 2 and install.call_count == 2
+
+
+def test_forked_worker_gets_a_distinct_edit_owner(monkeypatch):
+    old = image_edit.PROCESS_OWNER
+    # Restore module globals after the simulated fork.
+    monkeypatch.setattr(image_edit, "PROCESS_OWNER", old)
+    monkeypatch.setattr(image_edit, "PROCESS_STARTED_AT", image_edit.PROCESS_STARTED_AT)
+    monkeypatch.setattr(image_edit, "_OWNER_PID", image_edit._OWNER_PID)
+    monkeypatch.setattr(image_edit.os, "getpid", lambda: 999999)
+    image_edit.bind_worker()
+    assert image_edit.PROCESS_OWNER != old
+    first = image_edit.PROCESS_OWNER
+    image_edit.bind_worker()
+    assert image_edit.PROCESS_OWNER == first
 
 
 def edit_job(tmp_path):

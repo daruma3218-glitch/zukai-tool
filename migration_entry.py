@@ -6,6 +6,7 @@ checkout on PYTHONPATH. Existing source files and stored jobs are unchanged.
 import importlib
 import json
 import os
+import threading
 from pathlib import Path
 
 
@@ -43,6 +44,30 @@ class MigrationGate:
         return self.application(environ, start_response)
 
 
+class WorkerRuntime:
+    """Initialize in the serving process, even when Gunicorn imports in parent.
+
+    Both recovery and the deployment watcher must start after the worker fork.
+    No request reaches the application until this initialization has finished.
+    """
+    def __init__(self, module, root, mode):
+        self.module, self.root, self.mode = module, root, mode
+        self.lock = threading.Lock()
+        self.pid = None
+        self.application = None
+
+    def __call__(self, environ, start_response):
+        with self.lock:
+            if self.pid != os.getpid():
+                from deploy_guard import install
+                if not MigrationGate(self.module.app, self.root, self.mode).read_only():
+                    self.module.recover_interrupted_jobs()
+                self.application = install(self.module, self.root)
+                self.pid = os.getpid()
+            application = self.application
+        return application(environ, start_response)
+
+
 def create_app():
     for key in ("APP_PASSWORD", "SECRET_KEY", "DATA_DIR"):
         if not os.environ.get(key, "").strip():
@@ -54,10 +79,7 @@ def create_app():
     if mode not in {"readonly", "active"}:
         raise RuntimeError("Invalid MIGRATION_ACCESS")
     module = importlib.import_module("app")
-    from deploy_guard import install
-    if not MigrationGate(module.app, root, mode).read_only():
-        module.recover_interrupted_jobs()
-    return MigrationGate(install(module, root), root, mode)
+    return MigrationGate(WorkerRuntime(module, root, mode), root, mode)
 
 
 # Gunicorn's factory syntax migration_entry:create_app() avoids import-time

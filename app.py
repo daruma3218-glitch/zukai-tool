@@ -342,8 +342,10 @@ def recover_interrupted_jobs():
     """
     root = OUTPUT_DIR.resolve()
     with _recovery_lock, _jobs_lock:
-        if root in _recovered_roots:
+        identity = (os.getpid(), root)
+        if identity in _recovered_roots:
             return
+        image_edit.bind_worker()
         image_edit.release_previous_worker_lock(root / retention.LOCK_NAME)
         recovered_jobs = recovered_edits = 0
         for directory in sorted(root.iterdir()):
@@ -380,7 +382,7 @@ def recover_interrupted_jobs():
             _add_log(directory.name, "system", "サーバー再起動による中断を検出。完成画像を保持しました。")
             _release_job_resources(directory.name, "startup")
             recovered_jobs += 1
-        _recovered_roots.add(root)
+        _recovered_roots.add(identity)
         resource_diagnostics.record("recovered", "startup", recovered_jobs=recovered_jobs,
                                     recovered_edits=recovered_edits)
 

@@ -39,6 +39,7 @@ ACTIVE_EDIT_STATUSES = {"queued", "running"}
 # The deployed service has one worker. A fresh worker cannot own old threads.
 PROCESS_OWNER = f"{os.getpid()}-{uuid.uuid4().hex}"
 PROCESS_STARTED_AT = time.time()
+_OWNER_PID = os.getpid()
 IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+\.(png|jpg|jpeg|webp)$")
 EDIT_SUFFIX_RE = re.compile(r"__e(\d+)$")
 
@@ -129,6 +130,15 @@ def _mark_stale(edits: list, job_dir: Path) -> bool:
                      finished_at=datetime.now().isoformat(timespec="seconds"))
         changed = True
     return changed
+
+
+def bind_worker():
+    """Gunicorn may import in its parent; identify the actual serving worker."""
+    global PROCESS_OWNER, PROCESS_STARTED_AT, _OWNER_PID
+    if _OWNER_PID != os.getpid():
+        _OWNER_PID = os.getpid()
+        PROCESS_OWNER = f"{_OWNER_PID}-{uuid.uuid4().hex}"
+        PROCESS_STARTED_AT = time.time()
 
 
 def release_previous_worker_lock(path: Path):
