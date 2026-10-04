@@ -219,6 +219,8 @@ def install(module, root):
                         os.environ.get("RENDER_INSTANCE_ID", f"local-{os.getpid()}"),
                         jobs_busy, os.environ.get("RENDER_DEPLOY_HOOK", ""))
     module._run_pipeline_thread = guard.background_task(module._run_pipeline_thread)
+    if hasattr(module, "_run_missing_thread"):
+        module._run_missing_thread = guard.background_task(module._run_missing_thread)
     threading.Thread(target=guard.watch, daemon=True, name="deployment-guard").start()
     return guard
 

@@ -461,6 +461,8 @@ class ParallelImageGenerator:
         concurrency: int = DEFAULT_CONCURRENCY,
         progress_callback: Optional[Callable[[dict], None]] = None,
         cancel_check=None,
+        skip_existing=False,
+        initialize_ai=True,
     ):
         if provider not in VALID_PROVIDERS:
             raise ValueError(f"unknown provider: {provider} (valid: {VALID_PROVIDERS})")
@@ -468,6 +470,7 @@ class ParallelImageGenerator:
         self.openai_quality = openai_quality
         self.openai_size = openai_size
         self.cancel_check = cancel_check
+        self.skip_existing = skip_existing
 
         # クライアント初期化（必要な分だけ）
         self.gemini_client = None
@@ -475,12 +478,12 @@ class ParallelImageGenerator:
         self.gemini_model = gemini_model or DEFAULT_GEMINI_MODEL
         self.openai_model = openai_model or DEFAULT_OPENAI_MODEL
 
-        if provider == PROVIDER_NANOBANANA:
+        if initialize_ai and provider == PROVIDER_NANOBANANA:
             if not gemini_api_key:
                 raise RuntimeError("nanobanana を使うには GEMINI_API_KEY が必要です")
             self.gemini_client = genai.Client(api_key=gemini_api_key, http_options=types.HttpOptions(
                 timeout=180000, retry_options=types.HttpRetryOptions(attempts=1)))
-        elif provider == PROVIDER_GPT_IMAGE:
+        elif initialize_ai and provider == PROVIDER_GPT_IMAGE:
             if not openai_api_key:
                 raise RuntimeError("gpt-image を使うには OPENAI_API_KEY が必要です")
             import openai  # 遅延 import
@@ -541,6 +544,13 @@ class ParallelImageGenerator:
                 result = dict(prompt_entry, status="cancelled", success=False, filename=None, error="")
                 self.progress_callback(result)
                 return result
+            if self.skip_existing and (output_path.exists() or output_path.is_symlink()):
+                if output_path.is_symlink() or not output_path.is_file():
+                    raise ValueError("画像の保存先を確認できません")
+                if output_path.stat().st_size > 0:
+                    result = dict(prompt_entry, status="ok", success=True, filename=filename, skipped=True)
+                    self.progress_callback(result)
+                    return result
             self.progress_callback({
                 "index": idx,
                 "status": "generating",
@@ -654,6 +664,7 @@ def run_parallel_generation(
     concurrency: int = DEFAULT_CONCURRENCY,
     progress_callback: Optional[Callable[[dict], None]] = None,
     cancel_check=None,
+    skip_existing=False,
 ) -> list:
     """同期エントリポイント: pipeline から呼び出す"""
     # 環境変数からデフォルト補完
@@ -677,5 +688,7 @@ def run_parallel_generation(
         concurrency=concurrency,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        skip_existing=skip_existing,
+        initialize_ai=any(p.get("render") != "map" for p in prompts),
     )
     return asyncio.run(generator.generate_all(prompts, output_dir))

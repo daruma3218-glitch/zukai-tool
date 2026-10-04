@@ -9,6 +9,7 @@ import functools
 import json
 import os
 import secrets
+import shutil
 import tempfile
 import threading
 import zipfile
@@ -34,12 +35,14 @@ from utils import load_env, load_json, save_json
 from pipeline import DiagramPipeline
 from job_control import Cancellation, JobCancelled
 from generator import (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS,
-                       OPENAI_IMAGE_MODEL_CHOICES, resolve_openai_image_model, resolve_edit_model)
+                       OPENAI_IMAGE_MODEL_CHOICES, DEFAULT_GEMINI_MODEL, resolve_openai_image_model, resolve_edit_model)
 from prompter import CANDIDATE_MODES, MAP_MODES
 import director_routes
 import image_edit
 import map_renderer
 import retention
+import retry_missing
+import job_health
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -135,6 +138,8 @@ def version():
         "partial_download_enabled": True,
         "job_cancellation": {"version": 1, "whole_job": True, "preserves_images": True,
                              "restart_settings": True, "inflight_requests_may_finish": True},
+        "missing_image_retry": {"version": 1, "preserves_completed": True, "confirmation_required": True},
+        "wait_guidance": {"version": 1, "after_seconds": job_health.WAIT_SECONDS, "automatic_cancel": False},
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
         # 従量APIへの明示の切り替え（既定オフ・2026-09-28）。ツール名・環境変数の名前・真偽値だけ
         "llm_api_switch": subscription_runtime.api_switch_status(),
@@ -211,6 +216,8 @@ def _set_job_state(job_id: str, **kwargs):
             Cancellation(OUTPUT_DIR / job_id).check()
         if state.get("status") in TERMINAL_STATUSES:
             return
+        if any(key in kwargs and kwargs[key] != state.get(key) for key in ("phase", "message", "percent")):
+            kwargs.setdefault("last_progress_at", datetime.now().isoformat())
         state.update(kwargs)
         state["updated_at"] = datetime.now().isoformat()
         save_json(OUTPUT_DIR / job_id / "job.json", state)
@@ -220,7 +227,8 @@ def _set_job_state(job_id: str, **kwargs):
 def _job_elapsed_seconds(job_id: str, state: dict):
     """開始から終了（実行中なら今）までの秒数。開始時刻が分からなければ None。"""
     try:
-        started = datetime.fromisoformat(state["started_at"]) if state.get("started_at")             else datetime.strptime(job_id[:15], "%Y%m%d_%H%M%S")
+        started_at = state.get("attempt_started_at") or state.get("started_at")
+        started = datetime.fromisoformat(started_at) if started_at else datetime.strptime(job_id[:15], "%Y%m%d_%H%M%S")
     except (ValueError, TypeError):
         return None
     end = datetime.now()
@@ -397,6 +405,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
 
         def on_log(category, message, detail=""):
             _add_log(job_id, category, message, detail)
+            if category in {"extractor", "prompter", "analyze", "generator"}:
+                _set_job_state(job_id, last_progress_at=datetime.now().isoformat())
 
         def on_item(info):
             # 個別画像の進捗は images_progress.json 経由でフロントへ
@@ -571,6 +581,7 @@ def start_job():
         "openai_quality": openai_quality, "openai_model": openai_model,
         "worldview_preset": worldview_preset, "no_text_mode": no_text_mode,
         "user_instructions": user_instructions, "candidate_mode": candidate_mode, "map_mode": map_mode,
+        "gemini_model": os.environ.get("GEMINI_IMAGE_MODEL") or DEFAULT_GEMINI_MODEL,
     })
 
     _set_job_state(
@@ -664,13 +675,102 @@ def restart_settings(job_id):
     return jsonify({"manuscript_text": manuscript, "settings": {k: settings[k] for k in keys if k in settings}})
 
 
+def _run_missing_thread(job_id, plan):
+    job_dir = OUTPUT_DIR / job_id
+    try:
+        _set_job_state(job_id, status="running", phase=3, message="不足分の画像を再生成しています。", percent=50)
+        manifest = retry_missing.generate(job_dir, plan,
+            lambda phase, msg, pct: _set_job_state(job_id, status="running", phase=phase, message=msg, percent=pct))
+        _set_job_state(job_id, status="completed", percent=100, title=manifest.get("title", ""),
+                       succeeded=manifest["succeeded"], failed=manifest["failed"], cancelled=0,
+                       message=f"再生成完了: 保存済み {manifest['succeeded']}/{manifest['images_planned']}枚（失敗 {manifest['failed']}枚）")
+        _add_log(job_id, "system", f"不足分の再生成が完了（画像AI {plan.public['ai_images']}枚・地図 {plan.public['maps']}枚が対象）")
+    except JobCancelled:
+        _finish_cancelled(job_id)
+    except Exception as exc:
+        if Cancellation(job_dir).requested():
+            _finish_cancelled(job_id)
+        else:
+            _set_job_state(job_id, status="error", message="再生成を停止しました。完成画像は残っています。")
+            _add_log(job_id, "error", "不足分の再生成エラー", str(exc)[:200])
+    finally:
+        with _jobs_lock:
+            _active_jobs.discard(job_id)
+        retention.run_in_background(OUTPUT_DIR)
+
+
+@app.route("/api/retry-missing/<job_id>", methods=["GET", "POST"])
+@login_required
+def retry_missing_images(job_id):
+    post = request.method == "POST"
+    if post:
+        expected = session.get("cancel_csrf", "")
+        if not request.is_json or not expected or not secrets.compare_digest(expected, request.headers.get("X-CSRF-Token", "")):
+            return jsonify({"error": "画面を再読み込みしてから操作してください。"}), 403
+    with _jobs_lock:
+        # Share the retention lock until the job is marked active, so cleanup cannot
+        # select it as a finished job while a new attempt is being prepared.
+        cleanup_lock = retention._acquire_lock(OUTPUT_DIR) if post else None
+        if post and cleanup_lock is None:
+            return jsonify({"error": "保存データの整理中です。少し待ってからもう一度お試しください。"}), 409
+        try:
+            job_dir = _job_dir_for(job_id)
+            if job_dir is None:
+                return jsonify({"error": "ジョブが見つかりません"}), 404
+            state = _get_job_state(job_id)
+            if job_id in _active_jobs or state.get("status") not in TERMINAL_STATUSES:
+                result = {"enabled": False, "code": "active", "reason": "実行中のジョブです。終了または中止後に操作してください。"}
+                return jsonify(result), 409 if post else 200
+            try:
+                plan = retry_missing.plan(job_dir, state)
+            except retry_missing.RetryUnavailable as exc:
+                return jsonify({"enabled": False, "code": exc.code, "reason": str(exc)}), 409 if post else 200
+            if not post:
+                return jsonify(plan.public)
+            body = request.get_json(silent=True)
+            supplied = body.get("plan_token") if isinstance(body, dict) else None
+            if not isinstance(supplied, str) or not re.fullmatch(r"[a-f0-9]{64}", supplied) or not secrets.compare_digest(plan.public["plan_token"], supplied):
+                return jsonify({"error": "対象や設定が変わりました。もう一度、枚数と設定を確認してください。"}), 409
+            run_id = secrets.token_hex(8)
+            history = job_dir / "retry_history" / run_id
+            history.mkdir(parents=True, exist_ok=False)
+            for name in ("job.json", "images_progress.json", "manifest.json", "cancel_requested.json"):
+                source = job_dir / name
+                if source.is_file():
+                    shutil.copy2(source, history / name)
+            save_json(history / "retry_plan.json", plan.public)
+            (job_dir / "cancel_requested.json").unlink(missing_ok=True)
+            now = datetime.now().isoformat()
+            new_state = dict(state, status="queued", phase=3, percent=50, run_id=run_id,
+                             attempt_started_at=now, last_progress_at=now, updated_at=now,
+                             retry_count=int(state.get("retry_count", 0)) + 1,
+                             retry_missing_count=plan.public["count"],
+                             message=f"不足分 {plan.public['count']}枚の再生成を準備しています。")
+            save_json(job_dir / "job.json", new_state)
+            _jobs[job_id] = new_state
+            _active_jobs.add(job_id)
+            try:
+                thread = threading.Thread(target=_run_missing_thread, args=(job_id, plan), daemon=True)
+                thread.start()
+            except Exception:
+                _active_jobs.discard(job_id)
+                _set_job_state(job_id, status="error", message="再生成を開始できませんでした。もう一度お試しください。")
+                return jsonify({"error": "再生成を開始できませんでした。少し待ってからもう一度お試しください。"}), 503
+            _add_log(job_id, "system", f"不足分 {plan.public['count']}枚の再生成を受付（完成済み {plan.public['kept']}枚を保持）")
+            return jsonify({"status": "queued", "run_id": run_id, "redirect": f"/progress/{job_id}"}), 202
+        finally:
+            if cleanup_lock is not None:
+                cleanup_lock.unlink(missing_ok=True)
+
+
 @app.route("/api/status/<job_id>")
 @login_required
 def api_status(job_id):
     state = _get_job_state(job_id)
     if not state:
         return jsonify({"status": "not_found"}), 404
-    return jsonify(dict(state, elapsed_seconds=_job_elapsed_seconds(job_id, state)))
+    wait = job_health.wait_info(OUTPUT_DIR / job_id, state, job_id in _active_jobs)
+    return jsonify(dict(state, elapsed_seconds=_job_elapsed_seconds(job_id, state), wait=wait))
 
 
 @app.route("/api/items/<job_id>")

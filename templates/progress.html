@@ -74,7 +74,25 @@
       <!-- 4つの段階 -->
       <div class="mb-4 flex flex-wrap items-center gap-3">
         <button id="cancelBtn" type="button" onclick="showCancelConfirmation()" class="hidden px-4 py-2 rounded-xl border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium">ジョブ全体を中止</button>
+        <button id="retryMissingBtn" type="button" onclick="showRetryConfirmation()" class="hidden px-4 py-2 rounded-xl bg-purple-700 text-white hover:bg-purple-800 disabled:opacity-50 text-sm font-medium">未生成分だけ再生成</button>
         <a id="restartBtn" href="/?retry={{ job_id }}" class="hidden px-4 py-2 rounded-xl border border-purple-300 text-purple-700 hover:bg-purple-50 text-sm font-medium">設定を直して作り直す</a>
+      </div>
+      <p id="retryReason" class="hidden mb-4 text-sm text-gray-600"></p>
+      <p id="retryError" class="hidden mb-4 text-sm text-red-700" role="alert"></p>
+      <div id="retryConfirmation" class="hidden mb-4 rounded-xl border border-purple-200 bg-purple-50 p-4" role="region" aria-labelledby="retryConfirmationTitle">
+        <p id="retryConfirmationTitle" class="font-semibold text-gray-900">未生成分だけ再生成しますか？</p>
+        <p id="retrySummary" class="mt-1 text-sm text-gray-800"></p>
+        <p id="retrySettings" class="mt-1 text-sm text-gray-700"></p>
+        <p class="mt-2 text-sm text-gray-700">保存済みの画像指示を使います。原稿の分析・候補の設計はやり直しません。完成画像・採用・手直しは残ります。</p>
+        <p id="retryCost" class="mt-1 text-sm text-gray-700"></p>
+        <div class="mt-3 flex flex-wrap gap-3">
+          <button id="dismissRetryBtn" type="button" onclick="hideRetryConfirmation()" class="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-700">やめる</button>
+          <button id="confirmRetryBtn" type="button" onclick="retryMissingImages()" class="rounded-lg bg-purple-700 px-4 py-2 text-sm font-medium text-white hover:bg-purple-800 disabled:opacity-50">この内容で再生成する</button>
+        </div>
+      </div>
+      <div id="waitNotice" class="hidden mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4" role="status" aria-live="polite">
+        <p id="waitTitle" class="text-sm font-semibold text-amber-900"></p>
+        <p id="waitMessage" class="mt-1 text-sm text-gray-700"></p>
       </div>
       <p id="cancelNotice" class="hidden mb-4 text-sm text-gray-600" role="status" aria-live="polite"></p>
       <p id="cancelError" class="hidden mb-4 text-sm text-red-700" role="alert"></p>
@@ -247,6 +265,7 @@
     let editPollTimer = null;
     let warnCount = 0;          // 記録の注意・エラーの件数
     let cancelBusy = false;
+    let retryBusy = false, retryPlan = null, retryChecked = false;
     const terminalStatuses = new Set(['completed', 'error', 'cancelled', 'interrupted']);
 
     const els = {
@@ -282,6 +301,18 @@
       cancelError: document.getElementById('cancelError'),
       cancelConfirmation: document.getElementById('cancelConfirmation'),
       keepGeneratingBtn: document.getElementById('keepGeneratingBtn'),
+      retryMissingBtn: document.getElementById('retryMissingBtn'),
+      retryReason: document.getElementById('retryReason'),
+      retryError: document.getElementById('retryError'),
+      retryConfirmation: document.getElementById('retryConfirmation'),
+      retrySummary: document.getElementById('retrySummary'),
+      retrySettings: document.getElementById('retrySettings'),
+      retryCost: document.getElementById('retryCost'),
+      dismissRetryBtn: document.getElementById('dismissRetryBtn'),
+      confirmRetryBtn: document.getElementById('confirmRetryBtn'),
+      waitNotice: document.getElementById('waitNotice'),
+      waitTitle: document.getElementById('waitTitle'),
+      waitMessage: document.getElementById('waitMessage'),
     };
 
     // ===== 採用・手直しの記録 =====
@@ -546,6 +577,93 @@
       els.keepGeneratingBtn.focus();
     }
 
+    function updateWaitNotice(info) {
+      const show = !!info?.show && !terminalStatuses.has(jobStatus);
+      els.waitNotice.classList.toggle('hidden', !show);
+      if (!show) return;
+      const age = info.seconds_since_progress;
+      els.waitTitle.textContent = `${info.stage}：${Number.isFinite(age) ? Math.floor(age / 60) + '分以上、進捗の更新がありません' : '進捗を確認しています'}`;
+      els.waitMessage.textContent = info.message;
+    }
+
+    async function loadRetryPlan() {
+      retryPlan = null;
+      const res = await fetch(`/api/retry-missing/${JOB_ID}`);
+      const data = await res.json();
+      if (!res.ok || typeof data.enabled !== 'boolean') throw new Error(data.error || '再生成の対象を確認できませんでした。もう一度ボタンを押してください。');
+      retryPlan = data.enabled ? data : null;
+      // A terminal status may arrive just before the background thread releases ownership.
+      els.retryMissingBtn.classList.toggle('hidden', !data.enabled && data.code !== 'active');
+      els.retryReason.textContent = data.reason || '';
+      els.retryReason.classList.toggle('hidden', data.enabled || data.code === 'nothing_missing');
+      return retryPlan;
+    }
+
+    function retryError(error) {
+      els.retryError.textContent = error.message;
+      els.retryError.classList.toggle('hidden', false);
+      els.retryMissingBtn.classList.toggle('hidden', false);
+    }
+
+    async function showRetryConfirmation() {
+      if (retryBusy || !terminalStatuses.has(jobStatus)) return;
+      retryBusy = true;
+      els.retryMissingBtn.disabled = true;
+      els.retryError.classList.toggle('hidden', true);
+      els.retryConfirmation.classList.toggle('hidden', true);
+      try {
+        const plan = await loadRetryPlan();
+        if (!plan) return;
+        els.retrySummary.textContent = `再生成 ${plan.count}枚（画像AI ${plan.ai_images}枚・地図 ${plan.maps}枚）／完成済み ${plan.kept}枚を保持`;
+        const quality = {low: '低', medium: '中', high: '高'}[plan.quality];
+        els.retrySettings.textContent = `モデル：${plan.model}${quality ? ' ／ 画質：' + quality : ''} ／ 並列：${plan.concurrency}枚`;
+        els.retryCost.textContent = plan.ai_images > 0
+          ? '画像AIの再生成には追加の画像生成料金がかかります。'
+          : '今回は地図のみのため、画像AIの生成料金はかかりません。';
+        els.retryConfirmation.classList.toggle('hidden', false);
+        els.dismissRetryBtn.focus();
+      } catch (e) { retryError(e); }
+      finally { retryBusy = false; els.retryMissingBtn.disabled = false; }
+    }
+
+    function hideRetryConfirmation() {
+      if (retryBusy) return;
+      els.retryConfirmation.classList.toggle('hidden', true);
+      retryPlan = null;
+      els.retryMissingBtn.focus();
+    }
+
+    async function retryMissingImages() {
+      if (retryBusy || !retryPlan || !terminalStatuses.has(jobStatus) || els.retryConfirmation.classList.contains('hidden')) return;
+      retryBusy = true;
+      els.confirmRetryBtn.disabled = true;
+      els.dismissRetryBtn.disabled = true;
+      els.retryMissingBtn.disabled = true;
+      els.retryError.classList.toggle('hidden', true);
+      let accepted = false;
+      try {
+        const res = await fetch(`/api/retry-missing/${JOB_ID}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': '{{ cancel_csrf }}' },
+          body: JSON.stringify({plan_token: retryPlan.plan_token})
+        });
+        const data = await res.json();
+        if (!res.ok || !data.run_id) throw new Error(data.error || data.reason || '再生成の開始を確認できませんでした。画面を再読み込みして状況をご確認ください。');
+        accepted = true;
+        window.location.reload();
+      } catch (e) {
+        retryPlan = null;
+        els.retryConfirmation.classList.toggle('hidden', true);
+        retryError(e); // Require a fresh preview and explicit confirmation before any retry.
+      } finally {
+        if (!accepted) {
+          retryBusy = false;
+          els.confirmRetryBtn.disabled = false;
+          els.dismissRetryBtn.disabled = false;
+          els.retryMissingBtn.disabled = false;
+        }
+      }
+    }
+
     function hideCancelConfirmation() {
       els.cancelConfirmation.classList.toggle('hidden', true);
       els.cancelBtn.focus();
@@ -669,6 +787,7 @@
         jobStatus = state.status;
         updateJobControls();
         updateDownload();
+        updateWaitNotice(state.wait);
 
         // ヘッダ更新
         els.jobMessage.textContent = state.message || '...';
@@ -699,6 +818,10 @@
         }
         if (terminalStatuses.has(state.status)) {
           stopped = true;
+          if (!retryChecked) {
+            retryChecked = true;
+            try { await loadRetryPlan(); } catch (e) { retryError(e); }
+          }
         }
       } catch (e) {
         console.error('status error', e);

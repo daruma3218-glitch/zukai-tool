@@ -99,6 +99,23 @@ def test_generation_waits_without_render_timeout_then_retries_once(guard):
     assert request(guard)[0] == "503 Service Unavailable"
 
 
+def test_missing_retry_thread_is_counted_until_it_returns(tmp_path, monkeypatch):
+    from deploy_guard import install
+    monkeypatch.setenv("SECRET_KEY", "test-only")
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    output = tmp_path / "output"
+    output.mkdir()
+    observations = []
+    def retry():
+        observations.append(guard._busy())
+    module = SimpleNamespace(app=Mock(), _jobs_lock=threading.RLock(), _jobs={}, OUTPUT_DIR=output,
+                             _run_pipeline_thread=Mock(), _run_missing_thread=retry)
+    guard = install(module, tmp_path)
+    module._run_missing_thread()
+    assert observations == [True]
+    assert not guard._busy()
+
+
 def test_synchronous_regeneration_and_background_tail_are_protected(guard):
     entered, release = threading.Event(), threading.Event()
     def app(env, start):
