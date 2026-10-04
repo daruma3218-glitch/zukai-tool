@@ -5,9 +5,10 @@ app.py への変更を小さく保ち、既存の生成・ダウンロードの�
 """
 
 import re
+import secrets
 from pathlib import Path
 
-from flask import jsonify, request, send_file
+from flask import jsonify, request, send_file, session
 
 import image_edit
 from utils import load_json
@@ -23,7 +24,7 @@ def register(app, login_required, output_dir_getter, items_getter):
         if not JOB_NAME_RE.match(job_id or ""):
             raise image_edit.EditError("ジョブの指定が不正です")
         path = Path(output_dir_getter()) / job_id
-        if not path.is_dir():
+        if path.is_symlink() or not path.is_dir():
             raise FileNotFoundError(job_id)
         return path
 
@@ -65,6 +66,22 @@ def register(app, login_required, output_dir_getter, items_getter):
         except (image_edit.EditError, FileNotFoundError, TimeoutError) as exc:
             return fail(exc)
         return jsonify({"adopted": sorted(table)})
+
+    @app.route("/api/selection/<job_id>", methods=["POST"], endpoint="director_selection")
+    @login_required
+    def director_selection(job_id):
+        expected = session.get("cancel_csrf", "")
+        actual = request.headers.get("X-CSRF-Token", "")
+        if not expected or not secrets.compare_digest(expected, actual):
+            return jsonify({"error": "画面を開き直してから、もう一度お試しください。"}), 403
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or not isinstance(body.get("needed"), bool):
+            return jsonify({"error": "要修正の指定が不正です"}), 400
+        try:
+            table = image_edit.set_revision_needed(job_dir_for(job_id), body.get("filename"), body["needed"])
+        except (image_edit.EditError, FileNotFoundError, TimeoutError) as exc:
+            return fail(exc)
+        return jsonify({"needs_revision": sorted(table)})
 
     @app.route("/download-adopted/<job_id>", endpoint="director_download_adopted")
     @login_required

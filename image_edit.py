@@ -33,6 +33,7 @@ import retention
 
 EDITS_NAME = "edits.json"
 ADOPTION_NAME = "adoption.json"
+SELECTION_NAME = "selection.json"
 LOCK_TIMEOUT = 10.0
 MAX_RUNNING_EDITS_PER_JOB = 3
 ACTIVE_EDIT_STATUSES = {"queued", "running"}
@@ -151,7 +152,7 @@ def release_previous_worker_lock(path: Path):
 
 
 def recover_interrupted_edits(job_dir: Path) -> int:
-    for name in (EDITS_NAME, ADOPTION_NAME):
+    for name in (EDITS_NAME, ADOPTION_NAME, SELECTION_NAME):
         release_previous_worker_lock(Path(job_dir) / f".{name}.lock")
     path = Path(job_dir) / EDITS_NAME
     if not path.is_file():
@@ -178,6 +179,42 @@ def load_adoption(job_dir: Path) -> dict:
     data = _read(Path(job_dir) / ADOPTION_NAME, {"version": 1, "adopted": {}})
     adopted = data.get("adopted", {}) if isinstance(data, dict) else {}
     return adopted if isinstance(adopted, dict) else {}
+
+
+def load_revision_marks(job_dir: Path) -> dict:
+    """Human flags belong to the candidate, independently of adoption and edits."""
+    data = _read(Path(job_dir) / SELECTION_NAME, {})
+    marks = data.get("needs_revision", {}) if isinstance(data, dict) else {}
+    return marks if isinstance(marks, dict) else {}
+
+
+def set_revision_needed(job_dir: Path, filename: str, needed: bool) -> dict:
+    job_dir = Path(job_dir)
+    if (not isinstance(filename, str) or not IMAGE_NAME_RE.fullmatch(filename)
+            or is_edit_file(filename) or not isinstance(needed, bool)):
+        raise EditError("要修正の指定が不正です")
+    # Keep retention from removing a candidate during this small metadata write.
+    cleanup_lock = retention._acquire_lock(job_dir.parent)
+    if cleanup_lock is None:
+        raise TimeoutError("保存画像を整理中です。少し待ってからやり直してください。")
+    try:
+        path = _image_path(job_dir, filename)
+        if path.is_symlink():
+            raise EditError("画像の指定が不正です")
+        with _JobLock(job_dir, SELECTION_NAME):
+            data = _read(job_dir / SELECTION_NAME, None) if (job_dir / SELECTION_NAME).exists() else {
+                "version": 1, "needs_revision": {}}
+            if not isinstance(data, dict) or not isinstance(data.get("needs_revision"), dict):
+                raise EditError("要修正の記録を読めません。記録を保全しているため更新できません。")
+            marks = data["needs_revision"]
+            if needed:
+                marks[filename] = {"at": datetime.now().isoformat(timespec="seconds")}
+            else:
+                marks.pop(filename, None)
+            _write(job_dir / SELECTION_NAME, data)
+            return dict(marks)
+    finally:
+        cleanup_lock.unlink(missing_ok=True)
 
 
 # ===== ファイル名 =====

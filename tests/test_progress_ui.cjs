@@ -42,7 +42,8 @@ test('生成途中の保存済み画像を、照合表示なしですぐダウ�
   assert.equal(p.element('actions').classList.contains('hidden'), false);
   assert.match(p.element('downloadLabel').textContent, /完成済み 1枚/);
   assert.match(p.element('downloadBtn').href, /^\/download\//);
-  assert.doesNotMatch(p.element('imgGrid').innerHTML, /内容検査|未確認|要修正/);
+  assert.doesNotMatch(p.element('imgGrid').innerHTML, /内容検査|未確認/);
+  assert.match(p.element('imgGrid').innerHTML, /要修正にする/); // 任意の手動印。DLの条件にはしない
 });
 
 test('エラーになっても完成済み画像のダウンロードを維持する', async () => {

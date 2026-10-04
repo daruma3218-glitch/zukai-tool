@@ -149,6 +149,8 @@ def version():
                              "restart_settings": True, "inflight_requests_may_finish": True},
         "missing_image_retry": {"version": 1, "preserves_completed": True, "confirmation_required": True},
         "wait_guidance": {"version": 1, "after_seconds": job_health.WAIT_SECONDS, "automatic_cancel": False},
+        "selection_workflow": {"version": 1, "chapter_filter": True, "unselected_groups": True,
+                               "revision_marks": True, "browser_resume": True},
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
         # 従量APIへの明示の切り替え（既定オフ・2026-09-28）。ツール名・環境変数の名前・真偽値だけ
         "llm_api_switch": subscription_runtime.api_switch_status(),
@@ -444,6 +446,7 @@ def _image_snapshot(result_dir: Path, images=None) -> dict:
     snapshot["available_images"] = len(images)
     snapshot["edits"] = edits
     snapshot["adopted"] = sorted(image_edit.load_adoption(result_dir))
+    snapshot["needs_revision"] = sorted(image_edit.load_revision_marks(result_dir))
     expires = retention.expires_at(result_dir) if result_dir.is_dir() else None
     snapshot["retention"] = {"days": retention.retention_days(), "trimmed": trimmed,
                              "expires_at": expires.isoformat(timespec="minutes") if expires else None}

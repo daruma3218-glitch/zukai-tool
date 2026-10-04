@@ -34,6 +34,8 @@
     .scroll-y::-webkit-scrollbar { width: 6px; }
     .scroll-y::-webkit-scrollbar-track { background: transparent; }
     .scroll-y::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+    .selection-tools { position: sticky; top: 3.5rem; z-index: 20; }
+    .selection-resumed { outline: 3px solid #a78bfa; outline-offset: 3px; }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -187,6 +189,28 @@
               <span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-red-500"></span>失敗</span>
             </div>
           </div>
+          <div id="selectionTools" class="selection-tools hidden bg-white/95 backdrop-blur border border-purple-100 rounded-xl p-3 mb-4 shadow-sm">
+            <div class="flex flex-wrap items-end gap-3">
+              <label class="text-xs text-gray-600">章
+                <select id="chapterFilter" onchange="changeSelectionFilter()" class="block mt-1 max-w-full sm:max-w-64 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900">
+                  <option value="">すべての章</option>
+                </select>
+              </label>
+              <label class="text-xs text-gray-600">選定状況
+                <select id="selectionFilter" onchange="changeSelectionFilter()" class="block mt-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900">
+                  <option value="all">すべて</option>
+                  <option value="unselected">未選定だけ</option>
+                  <option value="revision">要修正だけ</option>
+                </select>
+              </label>
+              <button id="resetSelectionBtn" type="button" onclick="resetSelectionFilters()" class="hidden rounded-lg px-3 py-2 text-sm text-purple-700 hover:bg-purple-50">絞り込みを解除</button>
+              <button id="resumeSelectionBtn" type="button" onclick="resumeSelection()" class="hidden rounded-lg border border-purple-200 px-3 py-2 text-sm text-purple-700 hover:bg-purple-50">前回の位置へ</button>
+            </div>
+            <p id="selectionCount" class="mt-2 text-xs font-medium text-gray-700" aria-live="polite"></p>
+            <p class="mt-1 text-xs text-gray-500">同じ箇所の候補はまとめて表示。未選定＝どの候補も未採用。要修正＝自分で付けた印。</p>
+            <p id="selectionResumeNote" class="mt-1 text-xs text-gray-500" role="status">表示位置と絞り込みは、このブラウザに保存します。</p>
+            <p id="selectionError" class="hidden mt-2 text-xs text-red-700" role="alert"></p>
+          </div>
           <div id="imgGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-3">
             <!-- 動的に生成 -->
             <div class="col-span-full text-center text-sm text-gray-400 py-12">
@@ -232,6 +256,7 @@
       <div class="px-5 py-3 border-t border-gray-200">
         <div class="flex flex-wrap items-center gap-2">
           <button id="modalAdopt" onclick="toggleShownAdopted()" class="px-3 py-1.5 rounded-lg text-sm font-medium border border-amber-400 text-amber-700 hover:bg-amber-50">☆ この版を採用</button>
+          <button id="modalRevision" type="button" onclick="toggleRevision(modalState.idx)" class="px-3 py-1.5 rounded-lg text-sm border border-orange-300 text-orange-800">要修正にする</button>
           <span class="text-gray-300">|</span>
           <button onclick="editImage('flip')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">左右反転</button>
           <button onclick="editImage('remove_text')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">文字を全部消す</button>
@@ -240,6 +265,7 @@
         </div>
         <p class="text-[11px] text-gray-400 mt-1">左右反転は費用なし。文字消し・指示直しは画像1枚分の費用（GPT Image 2.5 Sunburst）。元の画像は残り、直した画像は別の版として下に並びます。</p>
         <p id="editStatus" class="text-xs mt-1"></p>
+        <p id="modalRevisionError" class="hidden mt-1 text-xs text-red-700" role="alert"></p>
         <div id="versionStrip" class="mt-2 flex gap-2 overflow-x-auto"></div>
       </div>
       <div class="px-5 py-3 border-t border-gray-200 bg-gray-50">
@@ -258,6 +284,8 @@
     let availableImages = 0;
     let knownItems = {}; // index -> item
     let adoptedSet = new Set();   // 採用したファイル名（元画像または手直し版）
+    let revisionSet = new Set();  // 要修正は手動の印。手直しの完了や採用では解除しない
+    let revisionBusy = false, revisionEpoch = 0;
     let editsList = [];           // 手直しの記録（edits.json）
     let retentionInfo = null;     // 自動削除の予定
     let lastStructure = '';       // 画像の並び（候補の組）が変わった時だけ全体を描き直す
@@ -332,7 +360,112 @@
     }
     function cardSignature(item) {
       const edits = item.filename ? editsFor(item.filename).map(e => e.status).join('') : '';
-      return `${item.status}|${item.filename || ''}|${isAdopted(item)}|${edits}`;
+      return `${item.status}|${item.filename || ''}|${isAdopted(item)}|${edits}|${revisionSet.has(item.filename)}|${revisionBusy}`;
+    }
+
+    // ===== 選定の絞り込み・前回の位置 =====
+    const SELECTION_KEY = `zukai.selection.v1.${JOB_ID}`;
+    let selectionView = { chapter: '', status: 'all', anchor: null, offset: 0 };
+    let selectionRestorePending = true, selectionScrollTimer = null;
+    let chapterSignature = '', visibleSelectionItems = [];
+    try {
+      const saved = JSON.parse(localStorage.getItem(SELECTION_KEY));
+      if (saved && typeof saved === 'object') {
+        selectionView.chapter = typeof saved.chapter === 'string' ? saved.chapter : '';
+        selectionView.status = ['all', 'unselected', 'revision'].includes(saved.status) ? saved.status : 'all';
+        selectionView.anchor = Number.isInteger(saved.anchor) && saved.anchor > 0 ? saved.anchor : null;
+        selectionView.offset = Number.isFinite(saved.offset) ? Math.max(-1500, Math.min(1500, saved.offset)) : 0;
+      }
+    } catch (e) {}
+    const previousSelectionView = { ...selectionView };
+
+    function saveSelectionView() {
+      try { localStorage.setItem(SELECTION_KEY, JSON.stringify(selectionView)); } catch (e) {}
+    }
+    function selectionGroups(items) {
+      const groups = new Map();
+      items.forEach(item => {
+        const key = String(item.group ?? item.index);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(item);
+      });
+      return [...groups.values()];
+    }
+    function chapterOf(item) { return String(item.section || '').trim(); }
+    function selectedGroups(items) {
+      return selectionGroups(items).filter(list => {
+        if (selectionView.chapter && !list.some(i => (chapterOf(i) || '__none__') === selectionView.chapter)) return false;
+        if (selectionView.status === 'unselected') return !list.some(isAdopted);
+        if (selectionView.status === 'revision') return list.some(i => revisionSet.has(i.filename));
+        return true;
+      });
+    }
+    function selectionTopGap() {
+      return 72 + (document.getElementById('selectionTools').offsetHeight || 160);
+    }
+    function rememberSelectionPosition() {
+      if (selectionRestorePending) return;
+      const anchors = [...els.imgGrid.querySelectorAll('[data-selection-anchor]')];
+      const top = selectionTopGap();
+      const anchor = anchors.find(node => {
+        const rect = node.getBoundingClientRect();
+        return rect.bottom > top && rect.top < window.innerHeight;
+      });
+      if (!anchor) return;
+      selectionView.anchor = Number(anchor.getAttribute('data-selection-anchor'));
+      selectionView.offset = anchor.getBoundingClientRect().top - top;
+      saveSelectionView();
+    }
+    function restoreSelectionPosition(view) {
+      if (!view.anchor) return;
+      const anchors = [...els.imgGrid.querySelectorAll('[data-selection-anchor]')];
+      const node = anchors.find(el => Number(el.getAttribute('data-selection-anchor')) === view.anchor)
+        || anchors.find(el => Number(el.getAttribute('data-selection-anchor')) >= view.anchor)
+        || anchors[anchors.length - 1];
+      if (!node) return;
+      const exact = Number(node.getAttribute('data-selection-anchor')) === view.anchor;
+      window.scrollBy({ top: node.getBoundingClientRect().top - selectionTopGap() - (exact ? view.offset : 0), behavior: 'instant' });
+      node.classList.add('selection-resumed');
+      setTimeout(() => node.classList.remove('selection-resumed'), 2200);
+      document.getElementById('selectionResumeNote').textContent = exact
+        ? '前回の位置から再開しました。表示位置と絞り込みは、このブラウザに保存します。'
+        : '前回の箇所が表示対象にないため、近くの箇所を表示しました。';
+    }
+    function changeSelectionFilter() {
+      selectionView.chapter = document.getElementById('chapterFilter').value;
+      selectionView.status = document.getElementById('selectionFilter').value;
+      selectionView.anchor = null;
+      selectionView.offset = 0;
+      saveSelectionView();
+      rebuildGrid(Object.values(knownItems));
+      scrollToSelectionStart();
+    }
+    function resetSelectionFilters() {
+      selectionView.chapter = '';
+      selectionView.status = 'all';
+      selectionView.anchor = null;
+      selectionView.offset = 0;
+      saveSelectionView();
+      rebuildGrid(Object.values(knownItems));
+      scrollToSelectionStart();
+    }
+    function scrollToSelectionStart() {
+      const first = [...els.imgGrid.querySelectorAll('[data-selection-anchor]')][0];
+      if (first && window.scrollBy) window.scrollBy({ top: first.getBoundingClientRect().top - selectionTopGap(), behavior: 'instant' });
+    }
+    function resumeSelection() {
+      selectionView = { ...previousSelectionView };
+      rebuildGrid(Object.values(knownItems));
+      restoreSelectionPosition(previousSelectionView);
+      saveSelectionView();
+    }
+    if (window.addEventListener) {
+      window.addEventListener('scroll', () => {
+        if (selectionScrollTimer) clearTimeout(selectionScrollTimer);
+        selectionScrollTimer = setTimeout(rememberSelectionPosition, 180);
+      }, { passive: true });
+      window.addEventListener('pagehide', rememberSelectionPosition);
+      document.addEventListener('visibilitychange', () => { if (document.hidden) rememberSelectionPosition(); });
     }
 
     function escapeHtml(s) {
@@ -356,7 +489,7 @@
       return `<span class="w-2 h-2 ${v.dot} rounded-full"></span><span>${v.label}</span>`;
     }
 
-    function renderItem(item) {
+    function renderItem(item, grouped = false) {
       const idx = item.index;
       const status = item.status || 'pending';
       const filename = item.filename;
@@ -413,16 +546,20 @@
       const edits = filename ? editsFor(filename) : [];
       const running = edits.some(e => ['queued', 'running'].includes(e.status));
       const typeBadge = (item.variant || item.render === 'map') && item.variant_label
-        ? `<span class="absolute bottom-10 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(item.variant_label)}</span>` : '';
+        ? `<span class="absolute bottom-20 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(item.variant_label)}</span>` : '';
       const adoptBtn = status === 'ok' && filename
         ? `<button type="button" title="採用する（もう一度押すと取り消し）" onclick="event.stopPropagation(); toggleCardAdopted(${idx})" class="absolute top-1 right-1 z-10 w-7 h-7 rounded-full ${adopted ? 'bg-amber-400 text-white' : 'bg-black/40 text-white hover:bg-amber-400'} text-sm leading-7 text-center">${adopted ? '★' : '☆'}</button>` : '';
       const editBadge = edits.length
         ? `<span class="absolute top-1.5 right-9 z-10 ${running ? 'bg-yellow-400' : 'bg-purple-600'} text-white text-[10px] px-1.5 py-0.5 rounded">${running ? '直し中' : '直し' + edits.filter(e => e.status === 'ok').length}</span>` : '';
+      const needsRevision = revisionSet.has(filename);
+      const revisionButton = status === 'ok' && filename
+        ? `<button type="button" onclick="toggleRevision(${idx})" aria-pressed="${needsRevision}" ${revisionBusy ? 'disabled' : ''} title="この候補に要修正の印を付けます。手直しや採用のあとも、自分で解除するまで残ります。" class="w-full border-t px-2 py-2 text-xs disabled:opacity-50 ${needsRevision ? 'bg-orange-100 border-orange-200 text-orange-900 font-semibold' : 'bg-gray-50 border-gray-100 text-gray-600 hover:bg-orange-50'}">${needsRevision ? '要修正 ✓（解除）' : '要修正にする'}</button>` : '';
       return `
-        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border ${adopted ? 'border-amber-400 ring-2 ring-amber-300' : 'border-gray-200'} bg-white" data-status="${status}" data-sig="${escapeHtml(cardSignature(item))}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
+        <div id="card-${idx}" ${grouped ? '' : `data-selection-anchor="${idx}"`} class="grid-card relative rounded-lg overflow-hidden border ${adopted ? 'border-amber-400 ring-2 ring-amber-300' : 'border-gray-200'} bg-white" data-status="${status}" data-sig="${escapeHtml(cardSignature(item))}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
           <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${number}</span>
           ${adoptBtn}${editBadge}${typeBadge}
           ${inner}
+          ${revisionButton}
         </div>`;
     }
 
@@ -438,18 +575,49 @@
         list.sort((a, b) => (a.variant || '').localeCompare(b.variant || ''));
         const first = list[0];
         return `
-          <div class="border border-gray-100 rounded-xl p-3">
+          <div data-selection-anchor="${first.index}" class="border border-gray-100 rounded-xl p-3">
             <div class="flex items-baseline gap-2 mb-1">
               <span class="font-mono text-xs font-semibold text-purple-700">No.${String(g).padStart(3, '0')}</span>
               <span class="text-[11px] text-gray-400 truncate">${escapeHtml(first.section || '')}</span>
             </div>
             <p class="text-xs text-gray-700 mb-2">${escapeHtml(first.excerpt || '')}</p>
-            <div class="grid grid-cols-2 md:grid-cols-3 gap-3">${list.map(renderItem).join('')}</div>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-3">${list.map(item => renderItem(item, true)).join('')}</div>
           </div>`;
       }).join('');
     }
 
     function rebuildGrid(items) {
+      const allItems = [...items].sort((a, b) => (a.index || 0) - (b.index || 0));
+      const groups = selectionGroups(allItems);
+      const visibleGroups = selectedGroups(allItems);
+      visibleSelectionItems = visibleGroups.flat();
+      const chapters = [...new Set(allItems.map(i => chapterOf(i) || '__none__'))];
+      if (selectionView.chapter && !chapters.includes(selectionView.chapter)) chapters.push(selectionView.chapter);
+      const chapterOptions = JSON.stringify(chapters);
+      const chapterFilter = document.getElementById('chapterFilter');
+      if (chapterOptions !== chapterSignature) {
+        chapterSignature = chapterOptions;
+        chapterFilter.innerHTML = '<option value="">すべての章</option>' + chapters.map(c =>
+          `<option value="${escapeHtml(c)}">${escapeHtml(c === '__none__' ? '章の情報なし' : c)}</option>`).join('');
+      }
+      chapterFilter.value = selectionView.chapter;
+      document.getElementById('selectionFilter').value = selectionView.status;
+      document.getElementById('selectionTools').classList.toggle('hidden', !allItems.length);
+      document.getElementById('resetSelectionBtn').classList.toggle('hidden', !selectionView.chapter && selectionView.status === 'all');
+      document.getElementById('resumeSelectionBtn').classList.toggle('hidden', !previousSelectionView.anchor);
+      const unselected = groups.filter(list => !list.some(isAdopted)).length;
+      const flagged = allItems.filter(i => revisionSet.has(i.filename)).length;
+      document.getElementById('selectionCount').textContent = `表示 ${visibleGroups.length} / ${groups.length}箇所（${visibleSelectionItems.length}枚） · 全体の未選定 ${unselected}箇所 · 要修正 ${flagged}枚`;
+      rebuildVisibleGrid(visibleSelectionItems);
+      if (selectionRestorePending && allItems.length) {
+        selectionRestorePending = false;
+        const restore = () => restoreSelectionPosition(previousSelectionView);
+        if (window.requestAnimationFrame) window.requestAnimationFrame(restore);
+        else restore();
+      }
+    }
+
+    function rebuildVisibleGrid(items) {
       // ソート
       items.sort((a, b) => (a.index || 0) - (b.index || 0));
       const grid = els.imgGrid;
@@ -458,12 +626,21 @@
       // 部分更新: 既存と差分があるカードのみ書き換える
       const existingIds = new Set(Array.from(grid.querySelectorAll('[id^="card-"]')).map(e => parseInt(e.id.replace('card-', ''))));
 
+      if (!items.length) {
+        lastStructure = '';
+        grid.className = '';
+        grid.innerHTML = `<div class="text-center text-sm text-gray-500 py-12">${Object.keys(knownItems).length
+          ? '条件に合う箇所はありません。章や選定状況を変えるか、絞り込みを解除してください。'
+          : '抽出が完了するとここに図解が並びます。'}</div>`;
+        return;
+      }
+
       // 初回、または候補の組み方が変わった時は全体を描き直す
       if ((existingIds.size === 0 || structure !== lastStructure) && items.length > 0) {
         lastStructure = structure;
         grid.className = grouped ? 'space-y-3'
           : 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-3';
-        grid.innerHTML = grouped ? renderGroups(items) : items.map(renderItem).join('');
+        grid.innerHTML = grouped ? renderGroups(items) : items.map(item => renderItem(item)).join('');
         return;
       }
 
@@ -471,7 +648,7 @@
       items.forEach(item => {
         const card = document.getElementById(`card-${item.index}`);
         if (card && card.getAttribute('data-sig') !== cardSignature(item)) {
-          card.outerHTML = renderItem(item);
+          card.outerHTML = renderItem(item, grouped);
         }
       });
     }
@@ -702,6 +879,39 @@
       if (modalState) renderModal();
     }
 
+    async function toggleRevision(idx) {
+      const item = knownItems[idx];
+      if (!item || item.status !== 'ok' || !item.filename || revisionBusy) return;
+      revisionBusy = true;
+      revisionEpoch++;
+      const error = document.getElementById('selectionError');
+      const modalError = document.getElementById('modalRevisionError');
+      error.classList.toggle('hidden', true);
+      modalError.classList.toggle('hidden', true);
+      rebuildGrid(Object.values(knownItems));
+      if (modalState) renderModal();
+      try {
+        const res = await fetch(`/api/selection/${JOB_ID}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': '{{ cancel_csrf }}' },
+          body: JSON.stringify({ filename: item.filename, needed: !revisionSet.has(item.filename) })
+        });
+        let data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!res.ok || !Array.isArray(data.needs_revision)) throw new Error(data.error || '要修正の印を保存できませんでした。もう一度お試しください。');
+        revisionSet = new Set(data.needs_revision);
+      } catch (e) {
+        error.textContent = e.message;
+        error.classList.toggle('hidden', false);
+        modalError.textContent = e.message;
+        modalError.classList.toggle('hidden', false);
+      } finally {
+        revisionBusy = false;
+        revisionEpoch++;
+        rebuildGrid(Object.values(knownItems));
+        if (modalState) renderModal();
+      }
+    }
+
     async function toggleCardAdopted(idx) {
       const item = knownItems[idx];
       if (!item || !item.filename) return;
@@ -831,25 +1041,23 @@
 
     async function pollItems() {
       try {
+        const requestedRevision = revisionEpoch;
         const res = await fetch(`/api/items/${JOB_ID}`);
         if (!res.ok) return;
         const data = await res.json();
         const items = data.items || [];
         availableImages = data.available_images ?? items.filter(i => i.status === 'ok' && i.filename).length;
         adoptedSet = new Set(data.adopted || []);
+        if (!revisionBusy && requestedRevision === revisionEpoch) revisionSet = new Set(data.needs_revision || []);
         editsList = data.edits || [];
         retentionInfo = data.retention || null;
-        if (items.length > 0) {
-          // 内部キャッシュ（採用の内訳の計算にも使うので、ボタンの更新より先に入れる）
-          knownItems = {};
-          items.forEach(i => { knownItems[i.index] = i; });
-        }
+        // 全体の採用数・ZIP対象は絞り込まない。
+        knownItems = {};
+        items.forEach(i => { knownItems[i.index] = i; });
         updateDownload();
         updateRetention();
-        if (items.length > 0) {
-          rebuildGrid(items);
-          updateSummary(items);
-        }
+        rebuildGrid(items);
+        updateSummary(items);
         scheduleEditPoll();
       } catch (e) {
         console.error('items error', e);
@@ -908,6 +1116,7 @@
       const card = document.getElementById(`card-${idx}`);
       const filename = (item && item.filename) || (card && card.getAttribute('data-filename'));
       if (!filename) return;
+      rememberSelectionPosition();
       modalState = { idx, source: filename, shown: filename, pending: null };
       const title = (item && (item.keypoint || (item.excerpt || '').substring(0, 30))) || `図 ${idx}`;
       const prefix = item && item.variant
@@ -919,6 +1128,7 @@
       document.getElementById('modalNotes').textContent = notes.length ? '地図のメモ: ' + notes.join(' / ') : '';
       document.getElementById('instructText').value = '';
       document.getElementById('editStatus').textContent = '';
+      document.getElementById('modalRevisionError').classList.toggle('hidden', true);
       renderModal();
       document.getElementById('modal').classList.remove('hidden');
     }
@@ -945,6 +1155,12 @@
       adoptBtn.textContent = adopted ? '★ 採用中（押すと取り消し）' : '☆ この版を採用';
       adoptBtn.className = 'px-3 py-1.5 rounded-lg text-sm font-medium border ' +
         (adopted ? 'bg-amber-400 border-amber-400 text-white' : 'border-amber-400 text-amber-700 hover:bg-amber-50');
+      const revisionBtn = document.getElementById('modalRevision');
+      const flagged = revisionSet.has(source);
+      revisionBtn.textContent = flagged ? '要修正 ✓（解除）' : '要修正にする';
+      revisionBtn.disabled = revisionBusy;
+      revisionBtn.setAttribute('aria-pressed', String(flagged));
+      revisionBtn.className = 'px-3 py-1.5 rounded-lg text-sm border border-orange-300 text-orange-800 disabled:opacity-50 ' + (flagged ? 'bg-orange-100' : 'hover:bg-orange-50');
       const versions = [{ output: source, label: '元の画像', status: 'ok' }, ...edits];
       document.getElementById('versionStrip').innerHTML = versions.map(v => {
         const active = v.output === shown;

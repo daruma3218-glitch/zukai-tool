@@ -19,6 +19,7 @@ function page(itemsPayload, status = 'completed', statusPayload = null) {
           contains: name => classes.has(name),
         },
         querySelectorAll: () => [],
+        setAttribute() {},
       });
     }
     return elements.get(id);
