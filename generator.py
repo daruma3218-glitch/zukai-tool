@@ -13,9 +13,11 @@ asyncio + Semaphore で同時 N 枚を並列生成する。
 import asyncio
 import base64
 import functools
+import logging
 import os
 import tempfile
 import time
+from contextlib import closing
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, Optional
@@ -27,6 +29,7 @@ from google.genai import types
 # Pillow（クロップ用）
 from PIL import Image
 from job_control import JobCancelled, check_cancel, wait_or_cancel
+from image_resources import IMAGE_TASK_LIMIT, limited_image_task
 
 
 # ===== モデル設定 =====
@@ -60,7 +63,7 @@ def resolve_openai_image_model(*candidates) -> str:
     return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_OPENAI_MODEL
 
 
-DEFAULT_CONCURRENCY = 12
+DEFAULT_CONCURRENCY = IMAGE_TASK_LIMIT
 MAX_RETRIES = 3
 
 # 出力アスペクト比（16:9 に統一）
@@ -114,36 +117,28 @@ def _save_as_16_9(image_bytes: bytes, output_path: Path) -> None:
     - 横長すぎ（例 OpenAI 3:2）→ 上下に余白を足す
     - 縦長すぎ → 左右に余白を足す
     """
-    img = Image.open(BytesIO(image_bytes))
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
-    w, h = img.size
-    current = w / h if h else 1.0
-
-    if abs(current - TARGET_RATIO) < 0.01:
-        _save_png(img, output_path)
-        return
-
-    bg = _detect_background_color(img)
-
-    if current > TARGET_RATIO:
-        # 横長すぎ → 幅基準でキャンバスを作り、上下に余白
-        canvas_w = w
-        canvas_h = int(round(w / TARGET_RATIO))
-    else:
-        # 縦長すぎ → 高さ基準でキャンバスを作り、左右に余白
-        canvas_h = h
-        canvas_w = int(round(h * TARGET_RATIO))
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
-    offset_x = (canvas_w - w) // 2
-    offset_y = (canvas_h - h) // 2
-    if img.mode == "RGBA":
-        canvas.paste(img, (offset_x, offset_y), img)
-    else:
-        canvas.paste(img, (offset_x, offset_y))
-
-    _save_png(canvas, output_path)
+    # Close native pixel buffers immediately, including on save failures.
+    with BytesIO(image_bytes) as buffer, closing(Image.open(buffer)) as source:
+        converted = source.convert("RGB") if source.mode not in ("RGB", "RGBA") else None
+        img = converted if converted is not None else source
+        try:
+            w, h = img.size
+            current = w / h if h else 1.0
+            if abs(current - TARGET_RATIO) < 0.01:
+                _save_png(img, output_path)
+                return
+            bg = _detect_background_color(img)
+            if current > TARGET_RATIO:
+                canvas_w, canvas_h = w, int(round(w / TARGET_RATIO))
+            else:
+                canvas_w, canvas_h = int(round(h * TARGET_RATIO)), h
+            with closing(Image.new("RGB", (canvas_w, canvas_h), bg)) as canvas:
+                offset = ((canvas_w - w) // 2, (canvas_h - h) // 2)
+                canvas.paste(img, offset, img if img.mode == "RGBA" else None)
+                _save_png(canvas, output_path)
+        finally:
+            if converted is not None:
+                converted.close()
 
 # プロバイダ識別子
 PROVIDER_NANOBANANA = "nanobanana"
@@ -251,6 +246,7 @@ def _build_full_prompt(
 
 
 # ===== Gemini (nanobanana) =====
+@limited_image_task
 def _sync_generate_image_gemini(
     client: genai.Client,
     full_prompt: str,
@@ -311,6 +307,7 @@ def _sync_generate_image_gemini(
 
 
 # ===== OpenAI (gpt-image-2) =====
+@limited_image_task
 def _sync_generate_image_openai(
     client,  # openai.OpenAI
     full_prompt: str,
@@ -383,32 +380,39 @@ def _pad_to_ratio(img: "Image.Image", ratio: float) -> tuple:
     box は元画像が置かれた範囲で、編集結果をこの範囲に切り戻すと元の構図に揃う。
     """
     w, h = img.size
-    bg = _detect_background_color(img.convert("RGB"))
-    if w / h > ratio:
-        canvas_w, canvas_h = w, int(round(w / ratio))
-    else:
-        canvas_w, canvas_h = int(round(h * ratio)), h
-    canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
-    left, top = (canvas_w - w) // 2, (canvas_h - h) // 2
-    canvas.paste(img.convert("RGB"), (left, top))
+    with closing(img.convert("RGB")) as rgb:
+        bg = _detect_background_color(rgb)
+        if w / h > ratio:
+            canvas_w, canvas_h = w, int(round(w / ratio))
+        else:
+            canvas_w, canvas_h = int(round(h * ratio)), h
+        canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
+        left, top = (canvas_w - w) // 2, (canvas_h - h) // 2
+        try:
+            canvas.paste(rgb, (left, top))
+        except BaseException:
+            canvas.close()
+            raise
     return canvas, (left, top, left + w, top + h)
 
 
+@limited_image_task
 def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_path: Path,
                             model_name: str = DEFAULT_EDIT_MODEL, quality: str = "medium") -> tuple:
     """元画像を OpenAI の画像編集で直し、元と同じ範囲・大きさで別ファイルに保存する。"""
-    src = Image.open(source_path)
-    src.load()
-    canvas, box = _pad_to_ratio(src, EDIT_SIZE[0] / EDIT_SIZE[1])
-    sent = canvas.resize(EDIT_SIZE, Image.LANCZOS)
-    buffer = BytesIO()
-    sent.save(buffer, format="PNG")
+    with closing(Image.open(source_path)) as src:
+        canvas, box = _pad_to_ratio(src, EDIT_SIZE[0] / EDIT_SIZE[1])
+    with closing(canvas):
+        canvas_size = canvas.size
+        with closing(canvas.resize(EDIT_SIZE, Image.LANCZOS)) as sent, BytesIO() as buffer:
+            sent.save(buffer, format="PNG")
+            upload = buffer.getvalue()
     last_error = ""
     for attempt in range(MAX_RETRIES):
         try:
             response = client.images.edit(
                 model=model_name,
-                image=("image.png", buffer.getvalue(), "image/png"),
+                image=("image.png", upload, "image/png"),
                 prompt=instruction,
                 size=f"{EDIT_SIZE[0]}x{EDIT_SIZE[1]}",
                 quality=quality,
@@ -419,9 +423,10 @@ def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_
             if not b64:
                 last_error = "no image in response"
                 continue
-            edited = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-            edited = edited.resize(canvas.size, Image.LANCZOS).crop(box)
-            _save_png(edited, output_path)
+            with BytesIO(base64.b64decode(b64)) as decoded, closing(Image.open(decoded)) as source:
+                with closing(source.convert("RGB")) as rgb, closing(rgb.resize(canvas_size, Image.LANCZOS)) as resized:
+                    with closing(resized.crop(box)) as edited:
+                        _save_png(edited, output_path)
             return True, ""
         except Exception as e:
             err = str(e)
@@ -490,7 +495,7 @@ class ParallelImageGenerator:
             # Our retry loop checks cancellation; disable hidden SDK retries.
             self.openai_client = openai.OpenAI(api_key=openai_api_key, timeout=180, max_retries=0)
 
-        self.concurrency = max(1, min(concurrency, 32))
+        self.concurrency = max(1, min(concurrency, IMAGE_TASK_LIMIT))
         self.progress_callback = progress_callback or (lambda info: None)
         # Lock は async 関数内で生成する（Python 3.9 対策）
         self._counter_lock: Optional[asyncio.Lock] = None
@@ -570,7 +575,7 @@ class ParallelImageGenerator:
                         None,
                         functools.partial(map_renderer.render_map_file, prompt_entry.get("map_spec") or {},
                                           output_path, excerpt=excerpt, allowed_terms=allowed_terms,
-                                          no_text=no_text),
+                                          no_text=no_text, cancel_check=self.cancel_check),
                     )
                 else:
                     full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms,
@@ -691,4 +696,14 @@ def run_parallel_generation(
         skip_existing=skip_existing,
         initialize_ai=any(p.get("render") != "map" for p in prompts),
     )
-    return asyncio.run(generator.generate_all(prompts, output_dir))
+    try:
+        return asyncio.run(generator.generate_all(prompts, output_dir))
+    finally:
+        # A job must not leave SDK connection pools waiting for garbage collection.
+        for client in (generator.gemini_client, generator.openai_client):
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logging.warning("Image client cleanup failed")

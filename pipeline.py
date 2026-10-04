@@ -21,6 +21,7 @@ from prompter import generate_all_prompts, CANDIDATE_MODES, MAP_MODES
 import candidates
 import map_renderer
 from job_control import check_cancel
+from image_resources import IMAGE_TASK_LIMIT
 from generator import (
     run_parallel_generation,
     DEFAULT_CONCURRENCY,
@@ -61,7 +62,7 @@ class DiagramPipeline:
         self.user_instructions = user_instructions
         self.worldview_preset = (worldview_preset or "").strip()
         self.no_text_mode = bool(no_text_mode)
-        self.concurrency = concurrency
+        self.concurrency = max(1, min(concurrency, IMAGE_TASK_LIMIT))
         self.provider = provider if provider in VALID_PROVIDERS else PROVIDER_NANOBANANA
         self.openai_quality = openai_quality
         self.openai_model = (openai_model or "").strip() or None

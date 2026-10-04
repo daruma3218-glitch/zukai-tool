@@ -99,6 +99,8 @@ def plan(job_dir, state):
     concurrency = settings["concurrency"]
     if not isinstance(concurrency, int) or isinstance(concurrency, bool) or not 1 <= concurrency <= 32:
         raise RetryUnavailable("missing_settings", "生成時の並列数を確認できません。設定を直して作り直してください。")
+    # Honor the current process-wide memory limit for historical high-concurrency jobs too.
+    concurrency = settings["concurrency"] = min(concurrency, generator.IMAGE_TASK_LIMIT)
     revision = {"prompts": prompts, "settings": settings, "missing": [p["index"] for p in pending],
                 "updated_at": state.get("updated_at"), "run_id": state.get("run_id"), "status": state.get("status")}
     token = hashlib.sha256(json.dumps(revision, ensure_ascii=False, sort_keys=True).encode()).hexdigest()

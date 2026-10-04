@@ -213,6 +213,18 @@ def test_thread_start_failure_releases_ownership_and_cleanup_lock(client, saved_
     assert preview(client, saved_job).json["enabled"]
 
 
+def test_old_high_parallel_setting_obeys_current_memory_limit(client, saved_job, monkeypatch):
+    capture_thread(monkeypatch)
+    settings = load_json(saved_job / "request.json")
+    settings["concurrency"] = 24
+    save_json(saved_job / "request.json", settings)
+    p = preview(client, saved_job).json
+    assert p["concurrency"] == generator.IMAGE_TASK_LIMIT
+    submit(client, saved_job, p["plan_token"])
+    assert service._get_job_state(saved_job.name)["concurrency"] == generator.IMAGE_TASK_LIMIT
+    assert load_json(saved_job / "request.json")["concurrency"] == 24
+
+
 def test_map_only_needs_no_image_ai_key(tmp_path, monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

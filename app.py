@@ -43,6 +43,7 @@ import map_renderer
 import retention
 import retry_missing
 import job_health
+from image_resources import IMAGE_TASK_LIMIT
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -136,6 +137,8 @@ def version():
         "image_review_enabled": False,
         "pipeline_phases": 3,
         "partial_download_enabled": True,
+        "memory_safety": {"version": 1, "image_task_limit": IMAGE_TASK_LIMIT,
+                          "scope": "process", "explicit_image_close": True},
         "job_cancellation": {"version": 1, "whole_job": True, "preserves_images": True,
                              "restart_settings": True, "inflight_requests_may_finish": True},
         "missing_image_retry": {"version": 1, "preserves_completed": True, "confirmation_required": True},
@@ -501,6 +504,7 @@ def index():
         default_openai_model=resolve_openai_image_model(),
         past_jobs=past_jobs[:30],
         last_run=last_run,
+        image_task_limit=IMAGE_TASK_LIMIT,
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
         has_openai=bool(os.environ.get("OPENAI_API_KEY")),
@@ -553,10 +557,10 @@ def start_job():
     target_count = max(5, min(target_count, 200))
 
     try:
-        concurrency = int(request.form.get("concurrency", "12"))
+        concurrency = int(request.form.get("concurrency", str(IMAGE_TASK_LIMIT)))
     except ValueError:
-        concurrency = 12
-    concurrency = max(1, min(concurrency, 24))
+        concurrency = IMAGE_TASK_LIMIT
+    concurrency = max(1, min(concurrency, IMAGE_TASK_LIMIT))
 
     user_instructions = request.form.get("user_instructions", "").strip()
     worldview_preset = request.form.get("worldview_preset", "").strip()
@@ -743,6 +747,7 @@ def retry_missing_images(job_id):
             now = datetime.now().isoformat()
             new_state = dict(state, status="queued", phase=3, percent=50, run_id=run_id,
                              attempt_started_at=now, last_progress_at=now, updated_at=now,
+                             concurrency=plan.settings["concurrency"],
                              retry_count=int(state.get("retry_count", 0)) + 1,
                              retry_missing_count=plan.public["count"],
                              message=f"不足分 {plan.public['count']}枚の再生成を準備しています。")
