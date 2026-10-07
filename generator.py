@@ -33,7 +33,13 @@ from image_resources import IMAGE_TASK_LIMIT, limited_image_task
 
 
 # ===== モデル設定 =====
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-image-preview"
+# 2026-10-07 社長指示: Google の画像生成は Nano Banana 2.1（最新）を使う。
+DEFAULT_GEMINI_MODEL = "gemini-nano-banana-2.1"
+# 以前の既定・終了予定のモデル。Render の GEMINI_IMAGE_MODEL に残っていても既定へ読み替える。
+LEGACY_GEMINI_IMAGE_MODELS = {
+    "gemini-3.1-flash-image-preview", "gemini-3.1-flash-image", "gemini-2.5-flash-image",
+    "gemini-3-pro-image-preview", "gemini-3-pro-image",
+}
 # 2026-09-24: 既定を gpt-image-2.5 Flare へ（OpenAI公式: gpt-image-2より高品質・待ち時間は約半分・トークン単価は同じ）。
 # 環境変数 OPENAI_IMAGE_MODEL=gpt-image-2 で従来に戻せる。
 DEFAULT_OPENAI_MODEL = "gpt-image-2.5-flare"
@@ -51,6 +57,12 @@ DEFAULT_EDIT_MODEL = "gpt-image-2.5-sunburst"
 def resolve_edit_model() -> str:
     env = os.environ.get("ZUKAI_EDIT_MODEL", "").strip()
     return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_EDIT_MODEL
+
+
+def resolve_gemini_image_model(model: str | None) -> str:
+    """空・旧モデル名なら既定（Nano Banana 2.1）を返す。"""
+    model = (model or "").strip()
+    return DEFAULT_GEMINI_MODEL if not model or model in LEGACY_GEMINI_IMAGE_MODELS else model
 
 
 def resolve_openai_image_model(*candidates) -> str:
@@ -482,7 +494,7 @@ class ParallelImageGenerator:
         # クライアント初期化（必要な分だけ）
         self.gemini_client = None
         self.openai_client = None
-        self.gemini_model = gemini_model or DEFAULT_GEMINI_MODEL
+        self.gemini_model = resolve_gemini_image_model(gemini_model)
         self.openai_model = openai_model or DEFAULT_OPENAI_MODEL
 
         if initialize_ai and provider == PROVIDER_NANOBANANA:
@@ -680,7 +692,7 @@ def run_parallel_generation(
     if openai_api_key is None:
         openai_api_key = os.environ.get("OPENAI_API_KEY", "")
     if gemini_model is None:
-        gemini_model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_GEMINI_MODEL)
+        gemini_model = resolve_gemini_image_model(os.environ.get("GEMINI_IMAGE_MODEL"))
     if openai_model is None:
         openai_model = os.environ.get("OPENAI_IMAGE_MODEL", DEFAULT_OPENAI_MODEL)
 
