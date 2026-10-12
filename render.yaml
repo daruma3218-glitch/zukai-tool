@@ -14,7 +14,7 @@ services:
       - key: OPENAI_IMAGE_MODEL
         value: "gpt-image-2"
       - key: GEMINI_IMAGE_MODEL
-        value: "gemini-3.1-flash-image-preview"
+        value: "gemini-nano-banana-2.1"
       - key: APP_PASSWORD
         sync: false
       - key: SECRET_KEY

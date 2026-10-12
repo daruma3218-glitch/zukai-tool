@@ -4,16 +4,20 @@
 asyncio + Semaphore で同時 N 枚を並列生成する。
 プロバイダは 2 種類から選択可:
   - "nanobanana": Google Gemini Flash Image（高速・安価・16:9 自然）
-  - "gpt-image":  OpenAI gpt-image-2（高品質・テキスト精度高）
+  - "gpt-image":  OpenAI gpt-image-2.5 Flare（既定。高品質・テキスト精度高）
+種類が「地図」で map_spec がある項目は、画像AIを使わず map_renderer で実データから描く。
 
 両 SDK は同期 API なので loop.run_in_executor で thread pool に委譲する。
 """
 
 import asyncio
 import base64
+import functools
+import logging
 import os
 import tempfile
 import time
+from contextlib import closing
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, Optional
@@ -24,18 +28,41 @@ from google.genai import types
 
 # Pillow（クロップ用）
 from PIL import Image
+from job_control import JobCancelled, check_cancel, wait_or_cancel
+from image_resources import IMAGE_TASK_LIMIT, limited_image_task
 
 
 # ===== モデル設定 =====
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-image-preview"
-DEFAULT_OPENAI_MODEL = "gpt-image-2"
-# UI で選べる OpenAI 画像モデル（順序=表示順）。2026-09-08 公開の gpt-image-2.5 系を追加。
+# 2026-10-07 社長指示: Google の画像生成は Nano Banana 2.1（最新）を使う。
+DEFAULT_GEMINI_MODEL = "gemini-nano-banana-2.1"
+# 以前の既定・終了予定のモデル。Render の GEMINI_IMAGE_MODEL に残っていても既定へ読み替える。
+LEGACY_GEMINI_IMAGE_MODELS = {
+    "gemini-3.1-flash-image-preview", "gemini-3.1-flash-image", "gemini-2.5-flash-image",
+    "gemini-3-pro-image-preview", "gemini-3-pro-image",
+}
+# 2026-09-24: 既定を gpt-image-2.5 Flare へ（OpenAI公式: gpt-image-2より高品質・待ち時間は約半分・トークン単価は同じ）。
+# 環境変数 OPENAI_IMAGE_MODEL=gpt-image-2 で従来に戻せる。
+DEFAULT_OPENAI_MODEL = "gpt-image-2.5-flare"
+# UI で選べる OpenAI 画像モデル（順序=表示順）。
 OPENAI_IMAGE_MODEL_CHOICES = [
-    ("gpt-image-2", "gpt-image-2（標準）"),
-    ("gpt-image-2.5-flare", "gpt-image-2.5 Flare（高品質・低遅延）"),
+    ("gpt-image-2.5-flare", "gpt-image-2.5 Flare（標準・高品質・低遅延）"),
     ("gpt-image-2.5-sunburst", "gpt-image-2.5 Sunburst（編集制御向け・プレミアム）"),
+    ("gpt-image-2", "gpt-image-2（従来）"),
 ]
 VALID_OPENAI_IMAGE_MODELS = {m for m, _ in OPENAI_IMAGE_MODEL_CHOICES}
+# 1枚ずつの手直し（文字消し・指示直し）は、編集の精度を重視した Sunburst を既定にする。
+DEFAULT_EDIT_MODEL = "gpt-image-2.5-sunburst"
+
+
+def resolve_edit_model() -> str:
+    env = os.environ.get("ZUKAI_EDIT_MODEL", "").strip()
+    return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_EDIT_MODEL
+
+
+def resolve_gemini_image_model(model: str | None) -> str:
+    """空・旧モデル名なら既定（Nano Banana 2.1）を返す。"""
+    model = (model or "").strip()
+    return DEFAULT_GEMINI_MODEL if not model or model in LEGACY_GEMINI_IMAGE_MODELS else model
 
 
 def resolve_openai_image_model(*candidates) -> str:
@@ -48,7 +75,7 @@ def resolve_openai_image_model(*candidates) -> str:
     return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_OPENAI_MODEL
 
 
-DEFAULT_CONCURRENCY = 12
+DEFAULT_CONCURRENCY = IMAGE_TASK_LIMIT
 MAX_RETRIES = 3
 
 # 出力アスペクト比（16:9 に統一）
@@ -102,36 +129,28 @@ def _save_as_16_9(image_bytes: bytes, output_path: Path) -> None:
     - 横長すぎ（例 OpenAI 3:2）→ 上下に余白を足す
     - 縦長すぎ → 左右に余白を足す
     """
-    img = Image.open(BytesIO(image_bytes))
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
-    w, h = img.size
-    current = w / h if h else 1.0
-
-    if abs(current - TARGET_RATIO) < 0.01:
-        _save_png(img, output_path)
-        return
-
-    bg = _detect_background_color(img)
-
-    if current > TARGET_RATIO:
-        # 横長すぎ → 幅基準でキャンバスを作り、上下に余白
-        canvas_w = w
-        canvas_h = int(round(w / TARGET_RATIO))
-    else:
-        # 縦長すぎ → 高さ基準でキャンバスを作り、左右に余白
-        canvas_h = h
-        canvas_w = int(round(h * TARGET_RATIO))
-
-    canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
-    offset_x = (canvas_w - w) // 2
-    offset_y = (canvas_h - h) // 2
-    if img.mode == "RGBA":
-        canvas.paste(img, (offset_x, offset_y), img)
-    else:
-        canvas.paste(img, (offset_x, offset_y))
-
-    _save_png(canvas, output_path)
+    # Close native pixel buffers immediately, including on save failures.
+    with BytesIO(image_bytes) as buffer, closing(Image.open(buffer)) as source:
+        converted = source.convert("RGB") if source.mode not in ("RGB", "RGBA") else None
+        img = converted if converted is not None else source
+        try:
+            w, h = img.size
+            current = w / h if h else 1.0
+            if abs(current - TARGET_RATIO) < 0.01:
+                _save_png(img, output_path)
+                return
+            bg = _detect_background_color(img)
+            if current > TARGET_RATIO:
+                canvas_w, canvas_h = w, int(round(w / TARGET_RATIO))
+            else:
+                canvas_w, canvas_h = int(round(h * TARGET_RATIO)), h
+            with closing(Image.new("RGB", (canvas_w, canvas_h), bg)) as canvas:
+                offset = ((canvas_w - w) // 2, (canvas_h - h) // 2)
+                canvas.paste(img, offset, img if img.mode == "RGBA" else None)
+                _save_png(canvas, output_path)
+        finally:
+            if converted is not None:
+                converted.close()
 
 # プロバイダ識別子
 PROVIDER_NANOBANANA = "nanobanana"
@@ -239,15 +258,18 @@ def _build_full_prompt(
 
 
 # ===== Gemini (nanobanana) =====
+@limited_image_task
 def _sync_generate_image_gemini(
     client: genai.Client,
     full_prompt: str,
     output_path: Path,
     model_name: str = DEFAULT_GEMINI_MODEL,
+    cancel_check=None,
 ) -> tuple:
     """1 枚の画像を同期生成（Gemini）"""
     last_error = ""
     for attempt in range(MAX_RETRIES):
+        check_cancel(cancel_check)
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -285,18 +307,19 @@ def _sync_generate_image_gemini(
             err = str(e)
             last_error = err[:200]
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                time.sleep(30 * (attempt + 1))
+                wait_or_cancel(30 * (attempt + 1), cancel_check)
                 continue
             if "safety" in err.lower() or "block" in err.lower():
                 return False, f"safety blocked: {err[:120]}"
             if "not found" in err.lower() or "404" in err:
                 return False, f"model not available: {model_name}"
-            time.sleep(3 + 2 * attempt)
+            wait_or_cancel(3 + 2 * attempt, cancel_check)
 
     return False, last_error or "max retries exceeded"
 
 
 # ===== OpenAI (gpt-image-2) =====
+@limited_image_task
 def _sync_generate_image_openai(
     client,  # openai.OpenAI
     full_prompt: str,
@@ -304,10 +327,12 @@ def _sync_generate_image_openai(
     model_name: str = DEFAULT_OPENAI_MODEL,
     size: str = "1536x1024",  # 3:2 横長（16:9 に最も近い）
     quality: str = "medium",  # low / medium / high
+    cancel_check=None,
 ) -> tuple:
     """1 枚の画像を同期生成（OpenAI gpt-image-2）"""
     last_error = ""
     for attempt in range(MAX_RETRIES):
+        check_cancel(cancel_check)
         try:
             response = client.images.generate(
                 model=model_name,
@@ -344,7 +369,85 @@ def _sync_generate_image_openai(
             last_error = err[:200]
             err_lower = err.lower()
             if "429" in err or "rate" in err_lower or "limit" in err_lower:
-                time.sleep(30 * (attempt + 1))
+                wait_or_cancel(30 * (attempt + 1), cancel_check)
+                continue
+            if "safety" in err_lower or "policy" in err_lower or "moderation" in err_lower:
+                return False, f"content policy blocked: {err[:120]}"
+            if "404" in err or "model_not_found" in err_lower or "does not exist" in err_lower:
+                return False, f"model not available: {model_name} ({err[:80]})"
+            if "401" in err or "invalid api key" in err_lower:
+                return False, f"invalid OpenAI API key: {err[:80]}"
+            wait_or_cancel(3 + 2 * attempt, cancel_check)
+
+    return False, last_error or "max retries exceeded"
+
+
+# ===== OpenAI 画像編集（1枚ずつの手直し） =====
+EDIT_SIZE = (1536, 1024)  # gpt-image の横長サイズ（3:2）
+
+
+def _pad_to_ratio(img: "Image.Image", ratio: float) -> tuple:
+    """16:9 の画像を上下（または左右）の余白で ratio に広げる。戻り値は (canvas, box)。
+
+    box は元画像が置かれた範囲で、編集結果をこの範囲に切り戻すと元の構図に揃う。
+    """
+    w, h = img.size
+    with closing(img.convert("RGB")) as rgb:
+        bg = _detect_background_color(rgb)
+        if w / h > ratio:
+            canvas_w, canvas_h = w, int(round(w / ratio))
+        else:
+            canvas_w, canvas_h = int(round(h * ratio)), h
+        canvas = Image.new("RGB", (canvas_w, canvas_h), bg)
+        left, top = (canvas_w - w) // 2, (canvas_h - h) // 2
+        try:
+            canvas.paste(rgb, (left, top))
+        except BaseException:
+            canvas.close()
+            raise
+    return canvas, (left, top, left + w, top + h)
+
+
+@limited_image_task
+def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_path: Path,
+                            model_name: str = DEFAULT_EDIT_MODEL, quality: str = "medium", on_start=None) -> tuple:
+    """元画像を OpenAI の画像編集で直し、元と同じ範囲・大きさで別ファイルに保存する。"""
+    if on_start:
+        on_start()  # The shared image slot has been acquired by the decorator.
+    with closing(Image.open(source_path)) as src:
+        canvas, box = _pad_to_ratio(src, EDIT_SIZE[0] / EDIT_SIZE[1])
+    with closing(canvas):
+        canvas_size = canvas.size
+        with closing(canvas.resize(EDIT_SIZE, Image.LANCZOS)) as sent, BytesIO() as buffer:
+            sent.save(buffer, format="PNG")
+            upload = buffer.getvalue()
+    last_error = ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.images.edit(
+                model=model_name,
+                image=("image.png", upload, "image/png"),
+                prompt=instruction,
+                size=f"{EDIT_SIZE[0]}x{EDIT_SIZE[1]}",
+                quality=quality,
+                n=1,
+            )
+            datum = response.data[0] if response and response.data else None
+            b64 = getattr(datum, "b64_json", None) if datum else None
+            if not b64:
+                last_error = "no image in response"
+                continue
+            with BytesIO(base64.b64decode(b64)) as decoded, closing(Image.open(decoded)) as source:
+                with closing(source.convert("RGB")) as rgb, closing(rgb.resize(canvas_size, Image.LANCZOS)) as resized:
+                    with closing(resized.crop(box)) as edited:
+                        _save_png(edited, output_path)
+            return True, ""
+        except Exception as e:
+            err = str(e)
+            last_error = err[:200]
+            err_lower = err.lower()
+            if "429" in err or "rate" in err_lower:
+                time.sleep(20 * (attempt + 1))
                 continue
             if "safety" in err_lower or "policy" in err_lower or "moderation" in err_lower:
                 return False, f"content policy blocked: {err[:120]}"
@@ -353,8 +456,12 @@ def _sync_generate_image_openai(
             if "401" in err or "invalid api key" in err_lower:
                 return False, f"invalid OpenAI API key: {err[:80]}"
             time.sleep(3 + 2 * attempt)
-
     return False, last_error or "max retries exceeded"
+
+
+def image_filename(index: int, variant: str = "") -> str:
+    """1案なら従来の diagram_004.png、複数案なら diagram_004_a.png。"""
+    return f"diagram_{index:03d}_{variant}.png" if variant else f"diagram_{index:03d}.png"
 
 
 # ===== 並列ジェネレータ =====
@@ -372,30 +479,37 @@ class ParallelImageGenerator:
         openai_size: str = "1536x1024",
         concurrency: int = DEFAULT_CONCURRENCY,
         progress_callback: Optional[Callable[[dict], None]] = None,
+        cancel_check=None,
+        skip_existing=False,
+        initialize_ai=True,
     ):
         if provider not in VALID_PROVIDERS:
             raise ValueError(f"unknown provider: {provider} (valid: {VALID_PROVIDERS})")
         self.provider = provider
         self.openai_quality = openai_quality
         self.openai_size = openai_size
+        self.cancel_check = cancel_check
+        self.skip_existing = skip_existing
 
         # クライアント初期化（必要な分だけ）
         self.gemini_client = None
         self.openai_client = None
-        self.gemini_model = gemini_model or DEFAULT_GEMINI_MODEL
+        self.gemini_model = resolve_gemini_image_model(gemini_model)
         self.openai_model = openai_model or DEFAULT_OPENAI_MODEL
 
-        if provider == PROVIDER_NANOBANANA:
+        if initialize_ai and provider == PROVIDER_NANOBANANA:
             if not gemini_api_key:
                 raise RuntimeError("nanobanana を使うには GEMINI_API_KEY が必要です")
-            self.gemini_client = genai.Client(api_key=gemini_api_key)
-        elif provider == PROVIDER_GPT_IMAGE:
+            self.gemini_client = genai.Client(api_key=gemini_api_key, http_options=types.HttpOptions(
+                timeout=180000, retry_options=types.HttpRetryOptions(attempts=1)))
+        elif initialize_ai and provider == PROVIDER_GPT_IMAGE:
             if not openai_api_key:
                 raise RuntimeError("gpt-image を使うには OPENAI_API_KEY が必要です")
             import openai  # 遅延 import
-            self.openai_client = openai.OpenAI(api_key=openai_api_key)
+            # Our retry loop checks cancellation; disable hidden SDK retries.
+            self.openai_client = openai.OpenAI(api_key=openai_api_key, timeout=180, max_retries=0)
 
-        self.concurrency = max(1, min(concurrency, 32))
+        self.concurrency = max(1, min(concurrency, IMAGE_TASK_LIMIT))
         self.progress_callback = progress_callback or (lambda info: None)
         # Lock は async 関数内で生成する（Python 3.9 対策）
         self._counter_lock: Optional[asyncio.Lock] = None
@@ -407,7 +521,7 @@ class ParallelImageGenerator:
         """provider に応じた同期生成関数を呼び分ける"""
         if self.provider == PROVIDER_NANOBANANA:
             return _sync_generate_image_gemini(
-                self.gemini_client, full_prompt, output_path, self.gemini_model
+                self.gemini_client, full_prompt, output_path, self.gemini_model, self.cancel_check
             )
         else:  # gpt-image
             return _sync_generate_image_openai(
@@ -415,6 +529,7 @@ class ParallelImageGenerator:
                 model_name=self.openai_model,
                 size=self.openai_size,
                 quality=self.openai_quality,
+                cancel_check=self.cancel_check,
             )
 
     async def _generate_one(
@@ -432,30 +547,63 @@ class ParallelImageGenerator:
         keypoint = prompt_entry.get("keypoint", "")
         allowed_terms = prompt_entry.get("allowed_terms", [])
         no_text = bool(prompt_entry.get("no_text"))
-        filename = f"diagram_{idx:03d}.png"
+        filename = prompt_entry.get("filename") or image_filename(idx)
         output_path = output_dir / filename
+        # 候補（複数案）の情報は画面でまとめて並べるために、そのまま結果へ引き継ぐ。
+        extra = {k: prompt_entry[k] for k in ("group", "variant", "variant_label", "render")
+                 if prompt_entry.get(k) not in (None, "")}
+        is_map = prompt_entry.get("render") == "map"
+        provider = "map-data" if is_map else self.provider
+        notes: list = []
 
         async with semaphore:
+            try:
+                check_cancel(self.cancel_check)
+            except JobCancelled:
+                result = dict(prompt_entry, status="cancelled", success=False, filename=None, error="")
+                self.progress_callback(result)
+                return result
+            if self.skip_existing and (output_path.exists() or output_path.is_symlink()):
+                if output_path.is_symlink() or not output_path.is_file():
+                    raise ValueError("画像の保存先を確認できません")
+                if output_path.stat().st_size > 0:
+                    result = dict(prompt_entry, status="ok", success=True, filename=filename, skipped=True)
+                    self.progress_callback(result)
+                    return result
             self.progress_callback({
                 "index": idx,
                 "status": "generating",
                 "section": section,
                 "keypoint": keypoint,
                 "excerpt": excerpt,
-                "provider": self.provider,
+                "provider": provider,
+                **extra,
             })
 
-            full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms,
-                                             no_text=no_text)
             loop = asyncio.get_running_loop()
-
             try:
-                success, error = await loop.run_in_executor(
-                    None,
-                    self._dispatch_sync_generate,
-                    full_prompt,
-                    output_path,
-                )
+                if is_map:
+                    # 地図は画像AIを使わず、国境データから描く（形・位置を誤らない・画像代なし）。
+                    import map_renderer
+                    success, error, notes = await loop.run_in_executor(
+                        None,
+                        functools.partial(map_renderer.render_map_file, prompt_entry.get("map_spec") or {},
+                                          output_path, excerpt=excerpt, allowed_terms=allowed_terms,
+                                          no_text=no_text, cancel_check=self.cancel_check),
+                    )
+                else:
+                    full_prompt = _build_full_prompt(prompt_text, prompt_type, allowed_terms=allowed_terms,
+                                                     no_text=no_text)
+                    success, error = await loop.run_in_executor(
+                        None,
+                        self._dispatch_sync_generate,
+                        full_prompt,
+                        output_path,
+                    )
+            except JobCancelled:
+                result = dict(prompt_entry, status="cancelled", success=False, filename=None, error="")
+                self.progress_callback(result)
+                return result
             except Exception as e:
                 success, error = False, str(e)[:200]
 
@@ -476,10 +624,15 @@ class ParallelImageGenerator:
                 "allowed_terms": allowed_terms,
                 "type": prompt_type,
                 "prompt": prompt_text,
-                "provider": self.provider,
+                "provider": provider,
                 "success": success,
                 "error": error if not success else "",
+                **extra,
             }
+            if is_map:
+                result["map_spec"] = prompt_entry.get("map_spec") or {}
+            if notes:
+                result["notes"] = notes
 
             self.progress_callback({
                 "index": idx,
@@ -489,10 +642,12 @@ class ParallelImageGenerator:
                 "excerpt": excerpt,
                 "filename": filename if success else None,
                 "error": error if not success else "",
-                "provider": self.provider,
+                "provider": provider,
                 "completed_total": completed_now,
                 "failed_total": failed_now,
                 "grand_total": self._total,
+                **extra,
+                **({"notes": notes} if notes else {}),
             })
 
             return result
@@ -527,6 +682,8 @@ def run_parallel_generation(
     openai_size: str = "1536x1024",
     concurrency: int = DEFAULT_CONCURRENCY,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_check=None,
+    skip_existing=False,
 ) -> list:
     """同期エントリポイント: pipeline から呼び出す"""
     # 環境変数からデフォルト補完
@@ -535,7 +692,7 @@ def run_parallel_generation(
     if openai_api_key is None:
         openai_api_key = os.environ.get("OPENAI_API_KEY", "")
     if gemini_model is None:
-        gemini_model = os.environ.get("GEMINI_IMAGE_MODEL", DEFAULT_GEMINI_MODEL)
+        gemini_model = resolve_gemini_image_model(os.environ.get("GEMINI_IMAGE_MODEL"))
     if openai_model is None:
         openai_model = os.environ.get("OPENAI_IMAGE_MODEL", DEFAULT_OPENAI_MODEL)
 
@@ -549,5 +706,18 @@ def run_parallel_generation(
         openai_size=openai_size,
         concurrency=concurrency,
         progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        skip_existing=skip_existing,
+        initialize_ai=any(p.get("render") != "map" for p in prompts),
     )
-    return asyncio.run(generator.generate_all(prompts, output_dir))
+    try:
+        return asyncio.run(generator.generate_all(prompts, output_dir))
+    finally:
+        # A job must not leave SDK connection pools waiting for garbage collection.
+        for client in (generator.gemini_client, generator.openai_client):
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logging.warning("Image client cleanup failed")

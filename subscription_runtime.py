@@ -60,6 +60,10 @@ _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _PUMP_THREAD = None
 
 
+class RequestCancelled(RuntimeError):
+    """An explicit user stop, never a routing failure or a failure notification."""
+
+
 class SubscriptionUnavailable(RuntimeError):
     def __init__(self, reason, *, attempts=None, request_id="", checkpoint="", notified=False):
         self.reason = reason
@@ -678,7 +682,8 @@ def _invoke(provider, request):
         return text,payload
 
 
-def run_local_request(request):
+def run_local_request(request, cancel_check=None):
+    _cancel_checkpoint(cancel_check)
     if not isinstance(request.get("allow_fallback", True), bool):
         raise ValueError("allow_fallback must be a boolean")
     primary=request.get("primary","claude")
@@ -691,14 +696,16 @@ def run_local_request(request):
     providers = (primary,"codex" if primary=="claude" else "claude") if request.get("allow_fallback", True) else (primary,)
     for provider in providers:
         for index in range(ATTEMPTS_PER_PROVIDER):
+            _cancel_checkpoint(cancel_check)
             if index:
                 # 直前が利用上限なら長め(30秒/90秒)に待つ。一時的な 429 はこの間に解けることが多い。
                 delays=USAGE_LIMIT_DELAYS if attempts and attempts[-1].get("reason")=="usage_limit" else RETRY_DELAYS
-                time.sleep(delays[index-1])
+                _cancel_wait(delays[index-1], cancel_check)
             started=time.monotonic()
             try:
                 text,payload=_invoke(provider,request)
             except Exception as exc:
+                _cancel_checkpoint(cancel_check)
                 reason=getattr(exc,"code","local_execution_error")
                 # 2026-09-28: 経過秒数を残す(制限時間まで待った時間切れか、途中の失敗かを数字で見分ける)
                 item={"provider":provider,"attempt":index+1,"reason":reason,
@@ -709,11 +716,13 @@ def run_local_request(request):
                               "timeout"}:
                     break
             else:
+                _cancel_checkpoint(cancel_check)
                 _record(request,outcome="completed",provider=provider,attempt=index+1,
                         elapsed_s=round(time.monotonic()-started,1),total_elapsed_s=round(time.monotonic()-request_started,1),
                         requested_model=request.get("model"), **routes[provider], usage=payload.get("usage",{}))
                 payload["_attempts"]=attempts
                 return text,payload
+    _cancel_checkpoint(cancel_check)
     _terminal(request,attempts,"both_cli_unavailable" if len(providers)==2 else "primary_cli_unavailable")
 
 
@@ -761,12 +770,32 @@ def _worker_heartbeat():
     return True,""
 
 
-def _gateway_generate(request):
+def _cancel_checkpoint(check):
+    if check:
+        check()
+
+
+def _cancel_wait(seconds, check):
+    if not check:
+        time.sleep(seconds)
+        return
+    until = time.monotonic() + seconds
+    while True:
+        check()
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
+
+
+def _gateway_generate(request, cancel_check=None):
     attempts=[]
     for index in range(len(WORKER_CHECK_DELAYS)+1):
+        _cancel_checkpoint(cancel_check)
         if index:
-            time.sleep(WORKER_CHECK_DELAYS[index-1])
+            _cancel_wait(WORKER_CHECK_DELAYS[index-1], cancel_check)
         alive,detail=_worker_heartbeat()
+        _cancel_checkpoint(cancel_check)
         if alive:
             if attempts:
                 # 一瞬の途切れで止めずに済んだ記録（通知は出さない）。
@@ -779,7 +808,9 @@ def _gateway_generate(request):
     payload={**request,"kind":"research" if request["use_search"] else "query","created":time.time(),
              "policy_version":POLICY_VERSION,"max_tokens":request.get("max_tokens",4096)}
     try:
+        _cancel_checkpoint(cancel_check)
         code,_=_storage("POST",path,payload)
+        _cancel_checkpoint(cancel_check)
         if code not in {200,201}:
             raise CliFailure("queue_write_failed")
         # Worker retries both CLIs. Never time out before that retry budget has elapsed.
@@ -787,7 +818,7 @@ def _gateway_generate(request):
         last_health=time.monotonic()
         missed_health=0
         while time.monotonic()<deadline:
-            time.sleep(3)
+            _cancel_wait(3, cancel_check)
             if time.monotonic()-last_health > 30:
                 last_health=time.monotonic()
                 try:
@@ -795,6 +826,7 @@ def _gateway_generate(request):
                     healthy=hcode==200 and time.time()-float(hb.get("ts",0))<90
                 except (OSError,ValueError,CliFailure):
                     healthy=False
+                _cancel_checkpoint(cancel_check)
                 missed_health=0 if healthy else missed_health+1
                 if missed_health>=3:
                     _terminal(request,attempts,"worker_disconnected")
@@ -802,6 +834,7 @@ def _gateway_generate(request):
                 code,result=_storage("GET","res/"+request["id"]+".json")
             except OSError:
                 continue
+            _cancel_checkpoint(cancel_check)
             if code!=200:
                 continue
             if result.get("ok") and result.get("text"):
@@ -816,6 +849,14 @@ def _gateway_generate(request):
             _terminal(request,result.get("attempts",[]),result.get("reason","worker_failed"),
                       already_notified=bool(result.get("notification_queued")))
         _terminal(request,attempts,"worker_response_timeout")
+    except RequestCancelled:
+        # Remove this request only. A worker that already claimed it may finish;
+        # its late response cannot advance the cancelled diagram pipeline.
+        try:
+            _storage("DELETE", path)
+        except (OSError, ValueError, CliFailure):
+            pass
+        raise
     except SubscriptionUnavailable:
         raise
     except (OSError,CliFailure,ValueError):
@@ -979,9 +1020,10 @@ def _api_failure_code(exc):
     return "api_error"
 
 
-def run_api_request(request, conf=None):
+def run_api_request(request, conf=None, cancel_check=None):
     """切り替え済みツールの要求を、専用キーの従量APIで実行する。キーが無い提供元は使わない。"""
     conf = conf or _api_switch_config()
+    _cancel_checkpoint(cancel_check)
     primary = request.get("primary", "claude")
     other = "codex" if primary == "claude" else "claude"
     providers = [primary] + ([other] if request.get("allow_fallback", True) else [])
@@ -992,18 +1034,21 @@ def run_api_request(request, conf=None):
         _terminal(request, attempts, "api_key_missing")
     started_all = time.monotonic()
     for provider in providers:
+        _cancel_checkpoint(cancel_check)
         route = resolve_route(request, provider)
         started = time.monotonic()
         try:
             call = _api_claude if provider == "claude" else _api_openai
             text, result = call(request, route, _api_key(conf, provider))
         except Exception as exc:
+            _cancel_checkpoint(cancel_check)
             reason = _api_failure_code(exc)
             item = {"provider": provider, "attempt": 1, "reason": reason, "billing": "api_key",
                     "elapsed_s": round(time.monotonic()-started, 1), "error": type(exc).__name__, **route}
             attempts.append(item)
             _record(request, outcome="retry_failed", **item)
             continue
+        _cancel_checkpoint(cancel_check)
         if request.get("protocol_tools"):
             _parse_protocol(text, request["protocol_tools"])
         # outcome は "completed_api"（サブスク利用量の画面は "completed" だけをサブスク分として数える）
@@ -1015,12 +1060,14 @@ def run_api_request(request, conf=None):
                    "_requested_model": request.get("model"), "_model": result["model"], "_effort": route["effort"],
                    "_workload": route["workload"], "_routing_version": ROUTING_VERSION, "_attempts": attempts}
         return text, payload
+    _cancel_checkpoint(cancel_check)
     _terminal(request, attempts, "api_unavailable")
 
 
 def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900,
              tool="workflow",label="",channel="",job_id="",attachments=None,effort=None,max_tokens=4096,protocol_tools=None,
-              workload="",fallback_model=None,allow_fallback=True,notify=True):
+              workload="",fallback_model=None,allow_fallback=True,notify=True,cancel_check=None):
+    _cancel_checkpoint(cancel_check)
     if not isinstance(allow_fallback, bool):
         raise ValueError("allow_fallback must be a boolean")
     if primary is not None and primary not in {"claude", "codex"}:
@@ -1041,12 +1088,12 @@ def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900
     start_notification_pump()
     conf=_api_switch_config()
     if _api_enabled_for(request,conf):
-        return run_api_request(request,conf)
+        return run_api_request(request,conf,cancel_check=cancel_check)
     if cli_path("claude") or cli_path("codex"):
-        return run_local_request(request)
+        return run_local_request(request,cancel_check=cancel_check)
     if _gateway_conf():
-        return _gateway_generate(request)
-    return run_local_request(request)  # records both missing binaries and notifies
+        return _gateway_generate(request, cancel_check=cancel_check)
+    return run_local_request(request,cancel_check=cancel_check)  # records both missing binaries and notifies
 
 
 def notify_group_stopped(*, tool, label, job_id, reason, attempts):

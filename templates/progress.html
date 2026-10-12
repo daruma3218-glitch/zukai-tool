@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>生成中... - 図解つくーる</title>
+  <title>生成中... - 図解スタジオ</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -34,6 +34,8 @@
     .scroll-y::-webkit-scrollbar { width: 6px; }
     .scroll-y::-webkit-scrollbar-track { background: transparent; }
     .scroll-y::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+    .selection-tools { position: sticky; top: 3.5rem; z-index: 20; }
+    .selection-resumed { outline: 3px solid #a78bfa; outline-offset: 3px; }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -47,7 +49,7 @@
             <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 3v11.25A2.25 2.25 0 006 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0118 16.5h-2.25"/>
           </svg>
         </div>
-        <span class="font-bold text-gray-900 text-base">図解つくーる</span>
+        <span class="font-bold text-gray-900 text-base">図解スタジオ</span>
       </a>
       <div class="flex items-center gap-3">
         <span class="text-xs text-gray-400 font-mono">{{ job_id }}</span>
@@ -71,11 +73,51 @@
         </div>
       </div>
 
+      <!-- 4つの段階 -->
+      <div class="mb-4 flex flex-wrap items-center gap-3">
+        <button id="cancelBtn" type="button" onclick="showCancelConfirmation()" class="hidden px-4 py-2 rounded-xl border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium">ジョブ全体を中止</button>
+        <button id="retryMissingBtn" type="button" onclick="showRetryConfirmation()" class="hidden px-4 py-2 rounded-xl bg-purple-700 text-white hover:bg-purple-800 disabled:opacity-50 text-sm font-medium">未生成分だけ再生成</button>
+        <a id="restartBtn" href="/?retry={{ job_id }}" class="hidden px-4 py-2 rounded-xl border border-purple-300 text-purple-700 hover:bg-purple-50 text-sm font-medium">設定を直して作り直す</a>
+      </div>
+      <p id="retryReason" class="hidden mb-4 text-sm text-gray-600"></p>
+      <p id="retryError" class="hidden mb-4 text-sm text-red-700" role="alert"></p>
+      <div id="retryConfirmation" class="hidden mb-4 rounded-xl border border-purple-200 bg-purple-50 p-4" role="region" aria-labelledby="retryConfirmationTitle">
+        <p id="retryConfirmationTitle" class="font-semibold text-gray-900">未生成分だけ再生成しますか？</p>
+        <p id="retrySummary" class="mt-1 text-sm text-gray-800"></p>
+        <p id="retrySettings" class="mt-1 text-sm text-gray-700"></p>
+        <p class="mt-2 text-sm text-gray-700">保存済みの画像指示を使います。原稿の分析・候補の設計はやり直しません。完成画像・採用・手直しは残ります。</p>
+        <p id="retryCost" class="mt-1 text-sm text-gray-700"></p>
+        <div class="mt-3 flex flex-wrap gap-3">
+          <button id="dismissRetryBtn" type="button" onclick="hideRetryConfirmation()" class="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-700">やめる</button>
+          <button id="confirmRetryBtn" type="button" onclick="retryMissingImages()" class="rounded-lg bg-purple-700 px-4 py-2 text-sm font-medium text-white hover:bg-purple-800 disabled:opacity-50">この内容で再生成する</button>
+        </div>
+      </div>
+      <div id="waitNotice" class="hidden mb-4 rounded-xl border border-amber-200 bg-amber-50 p-4" role="status" aria-live="polite">
+        <p id="waitTitle" class="text-sm font-semibold text-amber-900"></p>
+        <p id="waitMessage" class="mt-1 text-sm text-gray-700"></p>
+      </div>
+      <p id="cancelNotice" class="hidden mb-4 text-sm text-gray-600" role="status" aria-live="polite"></p>
+      <p id="cancelError" class="hidden mb-4 text-sm text-red-700" role="alert"></p>
+      <div id="cancelConfirmation" class="hidden mb-4 rounded-xl border border-red-200 bg-red-50 p-4" role="region" aria-labelledby="cancelConfirmationTitle">
+        <p id="cancelConfirmationTitle" class="font-semibold text-gray-900">このジョブ全体を中止しますか？</p>
+        <p class="mt-1 text-sm text-gray-700">完成済みの画像は残ります。送信済みの処理が終わるまで少し待つことがあります。</p>
+        <div class="mt-3 flex flex-wrap gap-3">
+          <button id="keepGeneratingBtn" type="button" onclick="hideCancelConfirmation()" class="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-700">生成を続ける</button>
+          <button type="button" onclick="cancelJob()" class="rounded-lg bg-red-700 px-4 py-2 text-sm font-medium text-white hover:bg-red-800">ジョブを中止する</button>
+        </div>
+      </div>
+      <ol id="stepper" class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-xs">
+        <li id="step1" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">① 原稿の分析</li>
+        <li id="step2" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">② 図にする箇所の抽出</li>
+        <li id="step3" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">③ 候補の設計</li>
+        <li id="step4" class="rounded-lg border border-gray-200 px-3 py-2 text-gray-400">④ 画像づくり</li>
+      </ol>
+
       <!-- 全体進捗バー -->
       <div class="mb-4">
         <div class="flex items-center justify-between mb-2">
           <div class="flex gap-3 text-xs text-gray-500">
-            <span>Phase <span id="phaseNum" class="font-semibold text-gray-900">0</span>/3</span>
+            <span id="elapsedNote">経過 --</span>
             <span class="text-gray-300">|</span>
             <span class="font-semibold text-purple-600" id="overallPercent">0%</span>
           </div>
@@ -115,17 +157,28 @@
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
           <span id="downloadLabel">ZIP でダウンロード</span>
         </a>
+        <a id="adoptedBtn" href="" class="hidden inline-flex items-center gap-2 px-5 py-2.5 bg-amber-500 text-white font-medium rounded-xl hover:bg-amber-600 transition shadow-md">
+          ★ <span id="adoptedLabel">採用分だけZIP</span>
+        </a>
         <a href="/" class="inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition">
           + 新しいジョブを作成
         </a>
       </div>
+      <div id="adoptTools" class="hidden mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-600">
+        <label class="inline-flex items-center gap-1.5">採用分ZIPの番号の開始
+          <input id="adoptStart" type="number" min="1" max="99999" value="1" class="w-20 px-2 py-1 border border-gray-300 rounded-md text-xs">
+        </label>
+        <span id="adoptSummary"></span>
+      </div>
+      <p id="adoptHint" class="hidden mt-2 text-xs text-gray-500">画像の右上の ☆ を押すと「採用」になり、採用した画像だけをZIPで取り出せます（章・抜粋との対応表つき）。</p>
+      <p id="retentionNote" class="hidden mt-2 text-xs text-gray-500"></p>
     </div>
 
-    <!-- メイン: グリッド + サイドログ -->
-    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+    <!-- メイン: グリッド（横幅いっぱい）+ 畳んだ記録 -->
+    <div class="space-y-6">
 
       <!-- 画像グリッド -->
-      <div class="lg:col-span-3">
+      <div>
         <div class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
           <div class="flex items-center justify-between mb-4">
             <h2 class="text-sm font-semibold text-gray-900">図解グリッド</h2>
@@ -136,6 +189,28 @@
               <span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-red-500"></span>失敗</span>
             </div>
           </div>
+          <div id="selectionTools" class="selection-tools hidden bg-white/95 backdrop-blur border border-purple-100 rounded-xl p-3 mb-4 shadow-sm">
+            <div class="flex flex-wrap items-end gap-3">
+              <label class="text-xs text-gray-600">章
+                <select id="chapterFilter" onchange="changeSelectionFilter()" class="block mt-1 max-w-full sm:max-w-64 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900">
+                  <option value="">すべての章</option>
+                </select>
+              </label>
+              <label class="text-xs text-gray-600">選定状況
+                <select id="selectionFilter" onchange="changeSelectionFilter()" class="block mt-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900">
+                  <option value="all">すべて</option>
+                  <option value="unselected">未選定だけ</option>
+                  <option value="revision">要修正だけ</option>
+                </select>
+              </label>
+              <button id="resetSelectionBtn" type="button" onclick="resetSelectionFilters()" class="hidden rounded-lg px-3 py-2 text-sm text-purple-700 hover:bg-purple-50">絞り込みを解除</button>
+              <button id="resumeSelectionBtn" type="button" onclick="resumeSelection()" class="hidden rounded-lg border border-purple-200 px-3 py-2 text-sm text-purple-700 hover:bg-purple-50">前回の位置へ</button>
+            </div>
+            <p id="selectionCount" class="mt-2 text-xs font-medium text-gray-700" aria-live="polite"></p>
+            <p class="mt-1 text-xs text-gray-500">同じ箇所の候補はまとめて表示。未選定＝どの候補も未採用。要修正＝自分で付けた印。</p>
+            <p id="selectionResumeNote" class="mt-1 text-xs text-gray-500" role="status">表示位置と絞り込みは、このブラウザに保存します。</p>
+            <p id="selectionError" class="hidden mt-2 text-xs text-red-700" role="alert"></p>
+          </div>
           <div id="imgGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-3">
             <!-- 動的に生成 -->
             <div class="col-span-full text-center text-sm text-gray-400 py-12">
@@ -145,17 +220,18 @@
         </div>
       </div>
 
-      <!-- アクティビティログ -->
-      <div class="lg:col-span-1">
-        <div class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm sticky top-20">
-          <h2 class="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
+      <!-- 詳しい記録（ふだんは畳む） -->
+      <div>
+        <details id="logDetails" class="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
+          <summary class="text-sm font-semibold text-gray-900 cursor-pointer select-none flex items-center gap-2">
             <svg class="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 9v.776"/></svg>
-            アクティビティ
-          </h2>
-          <div id="logsContainer" class="space-y-2 max-h-[600px] overflow-y-auto scroll-y text-xs">
+            詳しい記録 <span class="text-xs font-normal text-gray-400">（技術的な内容・ふだんは見なくて大丈夫）</span>
+            <span id="logAlert" class="hidden text-[10px] px-1.5 py-0.5 rounded-full bg-yellow-100 text-yellow-800 font-medium"></span>
+          </summary>
+          <div id="logsContainer" class="mt-3 space-y-2 max-h-[600px] overflow-y-auto scroll-y text-xs">
             <p class="text-gray-400 text-center py-6">起動を待機しています...</p>
           </div>
-        </div>
+        </details>
       </div>
 
     </div>
@@ -175,11 +251,27 @@
         </div>
       </div>
       <div class="bg-gray-100 flex items-center justify-center p-4">
-        <img id="modalImg" src="" class="max-w-full max-h-[70vh] object-contain rounded-lg shadow">
+        <img id="modalImg" src="" class="max-w-full max-h-[56vh] object-contain rounded-lg shadow">
+      </div>
+      <div class="px-5 py-3 border-t border-gray-200">
+        <div class="flex flex-wrap items-center gap-2">
+          <button id="modalAdopt" onclick="toggleShownAdopted()" class="px-3 py-1.5 rounded-lg text-sm font-medium border border-amber-400 text-amber-700 hover:bg-amber-50">☆ この版を採用</button>
+          <button id="modalRevision" type="button" onclick="toggleRevision(modalState.idx)" class="px-3 py-1.5 rounded-lg text-sm border border-orange-300 text-orange-800">要修正にする</button>
+          <span class="text-gray-300">|</span>
+          <button onclick="editImage('flip')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">左右反転</button>
+          <button onclick="editImage('remove_text')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">文字を全部消す</button>
+          <input id="instructText" type="text" maxlength="1000" placeholder="例: 背景をもっと暗く / 右の人物を消して" class="flex-1 min-w-[12rem] px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
+          <button onclick="editImage('instruct')" class="px-3 py-1.5 rounded-lg text-sm border border-purple-400 text-purple-700 hover:bg-purple-50">指示して直す</button>
+        </div>
+        <p class="text-[11px] text-gray-400 mt-1">左右反転は費用なし。文字消し・指示直しは画像1枚分の費用（GPT Image 2.5 Sunburst）。元の画像は残り、直した画像は別の版として下に並びます。</p>
+        <p id="editStatus" class="text-xs mt-1"></p>
+        <p id="modalRevisionError" class="hidden mt-1 text-xs text-red-700" role="alert"></p>
+        <div id="versionStrip" class="mt-2 flex gap-2 overflow-x-auto"></div>
       </div>
       <div class="px-5 py-3 border-t border-gray-200 bg-gray-50">
         <p class="text-xs text-gray-500 mb-1">対応する原稿の抜粋:</p>
         <p id="modalExcerpt" class="text-sm text-gray-800"></p>
+        <p id="modalNotes" class="text-xs text-amber-700 mt-1"></p>
       </div>
     </div>
   </div>
@@ -191,12 +283,29 @@
     let jobStatus = 'running';
     let availableImages = 0;
     let knownItems = {}; // index -> item
+    let adoptedSet = new Set();   // 採用したファイル名（元画像または手直し版）
+    let revisionSet = new Set();  // 要修正は手動の印。手直しの完了や採用では解除しない
+    let revisionBusy = false, revisionEpoch = 0;
+    let editsList = [];           // 手直しの記録（edits.json）
+    let retentionInfo = null;     // 自動削除の予定
+    let lastStructure = '';       // 画像の並び（候補の組）が変わった時だけ全体を描き直す
+    let modalState = null;        // {idx, source, shown}
+    let editPollTimer = null;
+    let warnCount = 0;          // 記録の注意・エラーの件数
+    let cancelBusy = false;
+    let retryBusy = false, retryPlan = null, retryChecked = false;
+    const terminalStatuses = new Set(['completed', 'error', 'cancelled', 'interrupted']);
 
     const els = {
       jobTitle: document.getElementById('jobTitle'),
       jobMessage: document.getElementById('jobMessage'),
       statusBadge: document.getElementById('statusBadge'),
-      phaseNum: document.getElementById('phaseNum'),
+      elapsedNote: document.getElementById('elapsedNote'),
+      steps: [1, 2, 3, 4].map(n => document.getElementById(`step${n}`)),
+      adoptTools: document.getElementById('adoptTools'),
+      adoptStart: document.getElementById('adoptStart'),
+      adoptSummary: document.getElementById('adoptSummary'),
+      logAlert: document.getElementById('logAlert'),
       overallBar: document.getElementById('overallBar'),
       overallPercent: document.getElementById('overallPercent'),
       targetCountVal: document.getElementById('targetCountVal'),
@@ -210,7 +319,154 @@
       actions: document.getElementById('actions'),
       downloadBtn: document.getElementById('downloadBtn'),
       downloadLabel: document.getElementById('downloadLabel'),
+      adoptedBtn: document.getElementById('adoptedBtn'),
+      adoptedLabel: document.getElementById('adoptedLabel'),
+      adoptHint: document.getElementById('adoptHint'),
+      retentionNote: document.getElementById('retentionNote'),
+      cancelBtn: document.getElementById('cancelBtn'),
+      restartBtn: document.getElementById('restartBtn'),
+      cancelNotice: document.getElementById('cancelNotice'),
+      cancelError: document.getElementById('cancelError'),
+      cancelConfirmation: document.getElementById('cancelConfirmation'),
+      keepGeneratingBtn: document.getElementById('keepGeneratingBtn'),
+      retryMissingBtn: document.getElementById('retryMissingBtn'),
+      retryReason: document.getElementById('retryReason'),
+      retryError: document.getElementById('retryError'),
+      retryConfirmation: document.getElementById('retryConfirmation'),
+      retrySummary: document.getElementById('retrySummary'),
+      retrySettings: document.getElementById('retrySettings'),
+      retryCost: document.getElementById('retryCost'),
+      dismissRetryBtn: document.getElementById('dismissRetryBtn'),
+      confirmRetryBtn: document.getElementById('confirmRetryBtn'),
+      waitNotice: document.getElementById('waitNotice'),
+      waitTitle: document.getElementById('waitTitle'),
+      waitMessage: document.getElementById('waitMessage'),
     };
+
+    // ===== 採用・手直しの記録 =====
+    function stemOf(name) {
+      return (name || '').replace(/\.[^.]+$/, '').replace(/__e\d+$/, '');
+    }
+    function editsFor(filename) {
+      const stem = stemOf(filename);
+      return editsList.filter(e => stemOf(e.source) === stem);
+    }
+    function adoptedVersionsOf(filename) {
+      const stem = stemOf(filename);
+      return [...adoptedSet].filter(f => stemOf(f) === stem);
+    }
+    function isAdopted(item) {
+      return !!item.filename && adoptedVersionsOf(item.filename).length > 0;
+    }
+    function cardSignature(item) {
+      const edits = item.filename ? editsFor(item.filename).map(e => e.status).join('') : '';
+      return `${item.status}|${item.filename || ''}|${isAdopted(item)}|${edits}|${revisionSet.has(item.filename)}|${revisionBusy}`;
+    }
+
+    // ===== 選定の絞り込み・前回の位置 =====
+    const SELECTION_KEY = `zukai.selection.v1.${JOB_ID}`;
+    let selectionView = { chapter: '', status: 'all', anchor: null, offset: 0 };
+    let selectionRestorePending = true, selectionScrollTimer = null;
+    let chapterSignature = '', visibleSelectionItems = [];
+    try {
+      const saved = JSON.parse(localStorage.getItem(SELECTION_KEY));
+      if (saved && typeof saved === 'object') {
+        selectionView.chapter = typeof saved.chapter === 'string' ? saved.chapter : '';
+        selectionView.status = ['all', 'unselected', 'revision'].includes(saved.status) ? saved.status : 'all';
+        selectionView.anchor = Number.isInteger(saved.anchor) && saved.anchor > 0 ? saved.anchor : null;
+        selectionView.offset = Number.isFinite(saved.offset) ? Math.max(-1500, Math.min(1500, saved.offset)) : 0;
+      }
+    } catch (e) {}
+    const previousSelectionView = { ...selectionView };
+
+    function saveSelectionView() {
+      try { localStorage.setItem(SELECTION_KEY, JSON.stringify(selectionView)); } catch (e) {}
+    }
+    function selectionGroups(items) {
+      const groups = new Map();
+      items.forEach(item => {
+        const key = String(item.group ?? item.index);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(item);
+      });
+      return [...groups.values()];
+    }
+    function chapterOf(item) { return String(item.section || '').trim(); }
+    function selectedGroups(items) {
+      return selectionGroups(items).filter(list => {
+        if (selectionView.chapter && !list.some(i => (chapterOf(i) || '__none__') === selectionView.chapter)) return false;
+        if (selectionView.status === 'unselected') return !list.some(isAdopted);
+        if (selectionView.status === 'revision') return list.some(i => revisionSet.has(i.filename));
+        return true;
+      });
+    }
+    function selectionTopGap() {
+      return 72 + (document.getElementById('selectionTools').offsetHeight || 160);
+    }
+    function rememberSelectionPosition() {
+      if (selectionRestorePending) return;
+      const anchors = [...els.imgGrid.querySelectorAll('[data-selection-anchor]')];
+      const top = selectionTopGap();
+      const anchor = anchors.find(node => {
+        const rect = node.getBoundingClientRect();
+        return rect.bottom > top && rect.top < window.innerHeight;
+      });
+      if (!anchor) return;
+      selectionView.anchor = Number(anchor.getAttribute('data-selection-anchor'));
+      selectionView.offset = anchor.getBoundingClientRect().top - top;
+      saveSelectionView();
+    }
+    function restoreSelectionPosition(view) {
+      if (!view.anchor) return;
+      const anchors = [...els.imgGrid.querySelectorAll('[data-selection-anchor]')];
+      const node = anchors.find(el => Number(el.getAttribute('data-selection-anchor')) === view.anchor)
+        || anchors.find(el => Number(el.getAttribute('data-selection-anchor')) >= view.anchor)
+        || anchors[anchors.length - 1];
+      if (!node) return;
+      const exact = Number(node.getAttribute('data-selection-anchor')) === view.anchor;
+      window.scrollBy({ top: node.getBoundingClientRect().top - selectionTopGap() - (exact ? view.offset : 0), behavior: 'instant' });
+      node.classList.add('selection-resumed');
+      setTimeout(() => node.classList.remove('selection-resumed'), 2200);
+      document.getElementById('selectionResumeNote').textContent = exact
+        ? '前回の位置から再開しました。表示位置と絞り込みは、このブラウザに保存します。'
+        : '前回の箇所が表示対象にないため、近くの箇所を表示しました。';
+    }
+    function changeSelectionFilter() {
+      selectionView.chapter = document.getElementById('chapterFilter').value;
+      selectionView.status = document.getElementById('selectionFilter').value;
+      selectionView.anchor = null;
+      selectionView.offset = 0;
+      saveSelectionView();
+      rebuildGrid(Object.values(knownItems));
+      scrollToSelectionStart();
+    }
+    function resetSelectionFilters() {
+      selectionView.chapter = '';
+      selectionView.status = 'all';
+      selectionView.anchor = null;
+      selectionView.offset = 0;
+      saveSelectionView();
+      rebuildGrid(Object.values(knownItems));
+      scrollToSelectionStart();
+    }
+    function scrollToSelectionStart() {
+      const first = [...els.imgGrid.querySelectorAll('[data-selection-anchor]')][0];
+      if (first && window.scrollBy) window.scrollBy({ top: first.getBoundingClientRect().top - selectionTopGap(), behavior: 'instant' });
+    }
+    function resumeSelection() {
+      selectionView = { ...previousSelectionView };
+      rebuildGrid(Object.values(knownItems));
+      restoreSelectionPosition(previousSelectionView);
+      saveSelectionView();
+    }
+    if (window.addEventListener) {
+      window.addEventListener('scroll', () => {
+        if (selectionScrollTimer) clearTimeout(selectionScrollTimer);
+        selectionScrollTimer = setTimeout(rememberSelectionPosition, 180);
+      }, { passive: true });
+      window.addEventListener('pagehide', rememberSelectionPosition);
+      document.addEventListener('visibilitychange', () => { if (document.hidden) rememberSelectionPosition(); });
+    }
 
     function escapeHtml(s) {
       if (!s) return '';
@@ -224,13 +480,16 @@
         queued:     { color: 'bg-gray-100 text-gray-700',  dot: 'bg-gray-400',             label: '待機中' },
         completed:  { color: 'bg-green-50 text-green-700', dot: 'bg-green-500',            label: '完了' },
         error:      { color: 'bg-red-50 text-red-700',     dot: 'bg-red-500',              label: 'エラー' },
+        cancelling: { dot: 'bg-amber-500 ring-pulse', label: '中止処理中' },
+        cancelled:  { dot: 'bg-gray-500', label: '中止済み' },
+        interrupted:{ dot: 'bg-gray-500', label: '中断' },
         not_found:  { color: 'bg-gray-100 text-gray-500',  dot: 'bg-gray-300',             label: '見つかりません' },
       };
       const v = map[status] || map.running;
       return `<span class="w-2 h-2 ${v.dot} rounded-full"></span><span>${v.label}</span>`;
     }
 
-    function renderItem(item) {
+    function renderItem(item, grouped = false) {
       const idx = item.index;
       const status = item.status || 'pending';
       const filename = item.filename;
@@ -273,7 +532,7 @@
         // pending
         inner = `
           <div class="aspect-video bg-gray-50 flex items-center justify-center">
-            <span class="text-xs text-gray-300">待機中</span>
+            <span class="text-xs text-gray-400">${status === 'cancelled' ? '中止（未生成）' : status === 'interrupted' ? '中断（未生成）' : '待機中'}</span>
           </div>
           <div class="px-2 py-1.5 bg-white">
             <p class="text-[10px] text-gray-400 truncate">${section}</p>
@@ -281,37 +540,115 @@
           </div>`;
       }
 
-      // フッター: 番号
+      // 番号（候補は「箇所番号＋案」）・採用の☆・手直しの版数
+      const number = `${String(item.group ?? idx).padStart(3, '0')}${item.variant || ''}`;
+      const adopted = isAdopted(item);
+      const edits = filename ? editsFor(filename) : [];
+      const running = edits.some(e => ['queued', 'running'].includes(e.status));
+      const typeBadge = (item.variant || item.render === 'map') && item.variant_label
+        ? `<span class="absolute bottom-20 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(item.variant_label)}</span>` : '';
+      const adoptBtn = status === 'ok' && filename
+        ? `<button type="button" title="採用する（もう一度押すと取り消し）" onclick="event.stopPropagation(); toggleCardAdopted(${idx})" class="absolute top-1 right-1 z-10 w-7 h-7 rounded-full ${adopted ? 'bg-amber-400 text-white' : 'bg-black/40 text-white hover:bg-amber-400'} text-sm leading-7 text-center">${adopted ? '★' : '☆'}</button>` : '';
+      const editBadge = edits.length
+        ? `<span class="absolute top-1.5 right-9 z-10 ${running ? 'bg-yellow-400' : 'bg-purple-600'} text-white text-[10px] px-1.5 py-0.5 rounded">${running ? '直し中' : '直し' + edits.filter(e => e.status === 'ok').length}</span>` : '';
+      const needsRevision = revisionSet.has(filename);
+      const revisionButton = status === 'ok' && filename
+        ? `<button type="button" onclick="toggleRevision(${idx})" aria-pressed="${needsRevision}" ${revisionBusy ? 'disabled' : ''} title="この候補に要修正の印を付けます。手直しや採用のあとも、自分で解除するまで残ります。" class="w-full border-t px-2 py-2 text-xs disabled:opacity-50 ${needsRevision ? 'bg-orange-100 border-orange-200 text-orange-900 font-semibold' : 'bg-gray-50 border-gray-100 text-gray-600 hover:bg-orange-50'}">${needsRevision ? '要修正 ✓（解除）' : '要修正にする'}</button>` : '';
       return `
-        <div id="card-${idx}" class="grid-card relative rounded-lg overflow-hidden border border-gray-200 bg-white" data-status="${status}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
-          <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${String(idx).padStart(3, '0')}</span>
+        <div id="card-${idx}" ${grouped ? '' : `data-selection-anchor="${idx}"`} class="grid-card relative rounded-lg overflow-hidden border ${adopted ? 'border-amber-400 ring-2 ring-amber-300' : 'border-gray-200'} bg-white" data-status="${status}" data-sig="${escapeHtml(cardSignature(item))}" data-excerpt="${excerpt}" data-section="${section}" data-keypoint="${keypoint}" data-filename="${filename || ''}">
+          <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${number}</span>
+          ${adoptBtn}${editBadge}${typeBadge}
           ${inner}
+          ${revisionButton}
         </div>`;
     }
 
+    function renderGroups(items) {
+      // 候補（複数案）は、同じ抜粋の案を横に並べて見比べられるようにする
+      const byGroup = new Map();
+      items.forEach(item => {
+        const g = item.group ?? item.index;
+        if (!byGroup.has(g)) byGroup.set(g, []);
+        byGroup.get(g).push(item);
+      });
+      return [...byGroup.entries()].sort((a, b) => a[0] - b[0]).map(([g, list]) => {
+        list.sort((a, b) => (a.variant || '').localeCompare(b.variant || ''));
+        const first = list[0];
+        return `
+          <div data-selection-anchor="${first.index}" class="border border-gray-100 rounded-xl p-3">
+            <div class="flex items-baseline gap-2 mb-1">
+              <span class="font-mono text-xs font-semibold text-purple-700">No.${String(g).padStart(3, '0')}</span>
+              <span class="text-[11px] text-gray-400 truncate">${escapeHtml(first.section || '')}</span>
+            </div>
+            <p class="text-xs text-gray-700 mb-2">${escapeHtml(first.excerpt || '')}</p>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-3">${list.map(item => renderItem(item, true)).join('')}</div>
+          </div>`;
+      }).join('');
+    }
+
     function rebuildGrid(items) {
+      const allItems = [...items].sort((a, b) => (a.index || 0) - (b.index || 0));
+      const groups = selectionGroups(allItems);
+      const visibleGroups = selectedGroups(allItems);
+      visibleSelectionItems = visibleGroups.flat();
+      const chapters = [...new Set(allItems.map(i => chapterOf(i) || '__none__'))];
+      if (selectionView.chapter && !chapters.includes(selectionView.chapter)) chapters.push(selectionView.chapter);
+      const chapterOptions = JSON.stringify(chapters);
+      const chapterFilter = document.getElementById('chapterFilter');
+      if (chapterOptions !== chapterSignature) {
+        chapterSignature = chapterOptions;
+        chapterFilter.innerHTML = '<option value="">すべての章</option>' + chapters.map(c =>
+          `<option value="${escapeHtml(c)}">${escapeHtml(c === '__none__' ? '章の情報なし' : c)}</option>`).join('');
+      }
+      chapterFilter.value = selectionView.chapter;
+      document.getElementById('selectionFilter').value = selectionView.status;
+      document.getElementById('selectionTools').classList.toggle('hidden', !allItems.length);
+      document.getElementById('resetSelectionBtn').classList.toggle('hidden', !selectionView.chapter && selectionView.status === 'all');
+      document.getElementById('resumeSelectionBtn').classList.toggle('hidden', !previousSelectionView.anchor);
+      const unselected = groups.filter(list => !list.some(isAdopted)).length;
+      const flagged = allItems.filter(i => revisionSet.has(i.filename)).length;
+      document.getElementById('selectionCount').textContent = `表示 ${visibleGroups.length} / ${groups.length}箇所（${visibleSelectionItems.length}枚） · 全体の未選定 ${unselected}箇所 · 要修正 ${flagged}枚`;
+      rebuildVisibleGrid(visibleSelectionItems);
+      if (selectionRestorePending && allItems.length) {
+        selectionRestorePending = false;
+        const restore = () => restoreSelectionPosition(previousSelectionView);
+        if (window.requestAnimationFrame) window.requestAnimationFrame(restore);
+        else restore();
+      }
+    }
+
+    function rebuildVisibleGrid(items) {
       // ソート
       items.sort((a, b) => (a.index || 0) - (b.index || 0));
       const grid = els.imgGrid;
+      const grouped = items.some(i => i.variant);
+      const structure = `${grouped}|` + items.map(i => `${i.index}:${i.group ?? ''}:${i.variant ?? ''}`).join(',');
       // 部分更新: 既存と差分があるカードのみ書き換える
       const existingIds = new Set(Array.from(grid.querySelectorAll('[id^="card-"]')).map(e => parseInt(e.id.replace('card-', ''))));
-      const newIds = new Set(items.map(i => i.index));
 
-      // 全て新規（初回）
-      if (existingIds.size === 0 && items.length > 0) {
-        grid.innerHTML = items.map(renderItem).join('');
+      if (!items.length) {
+        lastStructure = '';
+        grid.className = '';
+        grid.innerHTML = `<div class="text-center text-sm text-gray-500 py-12">${Object.keys(knownItems).length
+          ? '条件に合う箇所はありません。章や選定状況を変えるか、絞り込みを解除してください。'
+          : '抽出が完了するとここに図解が並びます。'}</div>`;
         return;
       }
 
-      // 既存のうち、ステータスが変わったものだけ書き換え
+      // 初回、または候補の組み方が変わった時は全体を描き直す
+      if ((existingIds.size === 0 || structure !== lastStructure) && items.length > 0) {
+        lastStructure = structure;
+        grid.className = grouped ? 'space-y-3'
+          : 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-3';
+        grid.innerHTML = grouped ? renderGroups(items) : items.map(item => renderItem(item)).join('');
+        return;
+      }
+
+      // 既存のうち、状態・採用・手直しが変わったものだけ書き換え
       items.forEach(item => {
         const card = document.getElementById(`card-${item.index}`);
-        const prevStatus = card?.getAttribute('data-status');
-        if (!card) {
-          // 新規追加
-          grid.insertAdjacentHTML('beforeend', renderItem(item));
-        } else if (prevStatus !== item.status || card.getAttribute('data-filename') !== (item.filename || '')) {
-          card.outerHTML = renderItem(item);
+        if (card && card.getAttribute('data-sig') !== cardSignature(item)) {
+          card.outerHTML = renderItem(item, grouped);
         }
       });
     }
@@ -333,6 +670,271 @@
       els.downloadLabel.textContent = jobStatus === 'completed'
         ? `ZIP でダウンロード（${availableImages}枚）`
         : `完成済み ${availableImages}枚をZIPでダウンロード`;
+      const adoptedCount = adoptedSet.size;
+      els.adoptedBtn.classList.toggle('hidden', adoptedCount === 0);
+      const start = Math.min(Math.max(parseInt(els.adoptStart.value, 10) || 1, 1), 99999);
+      els.adoptedBtn.href = `/download-adopted/${JOB_ID}?start=${start}`;
+      els.adoptedLabel.textContent = `採用分だけZIP（${adoptedCount}枚）`;
+      els.adoptTools.classList.toggle('hidden', adoptedCount === 0);
+      els.adoptSummary.textContent = adoptedCount ? adoptSummaryText() : '';
+      els.adoptHint.classList.toggle('hidden', availableImages === 0 || adoptedCount > 0);
+    }
+
+    // 採用した画像の種類の内訳と、採用が決まった箇所の数
+    function adoptSummaryText() {
+      const byStem = {};
+      Object.values(knownItems).forEach(i => { if (i.filename) byStem[stemOf(i.filename)] = i; });
+      const counts = {};
+      const groups = new Set();
+      adoptedSet.forEach(f => {
+        const item = byStem[stemOf(f)] || {};
+        const label = item.variant_label || 'その他';
+        counts[label] = (counts[label] || 0) + 1;
+        groups.add(item.group ?? item.index);
+      });
+      const total = new Set(Object.values(knownItems).map(i => i.group ?? i.index)).size;
+      const parts = Object.entries(counts).map(([k, v]) => `${k} ${v}`).join('・');
+      return `採用 ${adoptedSet.size}枚（${parts}）／ 採用が決まった箇所 ${groups.size} / ${total}`;
+    }
+    const ADOPT_START_KEY = `zukai.adoptStart.${JOB_ID}`;
+    try { const saved = localStorage.getItem(ADOPT_START_KEY); if (saved) els.adoptStart.value = saved; } catch (e) {}
+    if (els.adoptStart.addEventListener) {
+      els.adoptStart.addEventListener('input', () => {
+        try { localStorage.setItem(ADOPT_START_KEY, els.adoptStart.value); } catch (e) {}
+        updateDownload();
+      });
+    }
+
+    function updateRetention() {
+      const info = retentionInfo;
+      if (info && info.trimmed && info.days) {
+        els.retentionNote.textContent = `保存期限（完了から${info.days}日）を過ぎたため、☆で採用した画像だけを残しています。`;
+        els.retentionNote.classList.toggle('hidden', false);
+        return;
+      }
+      if (!info || !info.expires_at || !info.days) {
+        els.retentionNote.classList.toggle('hidden', true);
+        return;
+      }
+      const d = new Date(info.expires_at);
+      const label = isNaN(d) ? info.expires_at : `${d.getMonth() + 1}月${d.getDate()}日`;
+      els.retentionNote.textContent = adoptedSet.size > 0
+        ? `${label} ごろに、採用していない画像が自動で削除されます（完了から${info.days}日）。☆で採用した画像（${adoptedSet.size}枚）は残ります。`
+        : `この結果は ${label} ごろに自動で削除されます（完了から${info.days}日）。残したい画像は☆で採用してください（採用した画像は消えません）。`;
+      els.retentionNote.classList.toggle('hidden', false);
+    }
+
+    async function postJson(url, body) {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                     body: JSON.stringify(body) });
+      let data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (!res.ok) throw new Error(data.error || `エラー（${res.status}）`);
+      return data;
+    }
+
+    function updateJobControls() {
+      const active = ['queued', 'running', 'cancelling'].includes(jobStatus);
+      els.cancelBtn.classList.toggle('hidden', !active);
+      els.cancelBtn.disabled = cancelBusy || jobStatus === 'cancelling';
+      els.cancelBtn.textContent = cancelBusy ? '中止を送信中…' : jobStatus === 'cancelling' ? '中止処理中…' : 'ジョブ全体を中止';
+      if (cancelBusy || !['running', 'queued'].includes(jobStatus)) els.cancelConfirmation.classList.toggle('hidden', true);
+      els.restartBtn.classList.toggle('hidden', !terminalStatuses.has(jobStatus));
+      els.cancelNotice.classList.toggle('hidden', !active && jobStatus !== 'cancelled');
+      els.cancelNotice.textContent = jobStatus === 'cancelling'
+        ? '中止を受け付けました。新しい生成・再試行を止め、送信済みの画像の応答を待っています。戻ってきた画像は保存します。'
+        : jobStatus === 'cancelled'
+          ? 'ジョブを中止しました。完成した画像はこの画面から保存できます。送信済みのAI処理・料金は取り消せない場合があります。'
+          : '設定を間違えたときや、生成をやめたいときにジョブ全体を中止できます。完成済み画像は残ります。送信済みのAI処理・料金は取り消せない場合があります。';
+    }
+
+    function showCancelConfirmation() {
+      if (cancelBusy || !['running', 'queued'].includes(jobStatus)) return;
+      els.cancelConfirmation.classList.toggle('hidden', false);
+      els.keepGeneratingBtn.focus();
+    }
+
+    function updateWaitNotice(info) {
+      const show = !!info?.show && !terminalStatuses.has(jobStatus);
+      els.waitNotice.classList.toggle('hidden', !show);
+      if (!show) return;
+      const age = info.seconds_since_progress;
+      els.waitTitle.textContent = `${info.stage}：${Number.isFinite(age) ? Math.floor(age / 60) + '分以上、進捗の更新がありません' : '進捗を確認しています'}`;
+      els.waitMessage.textContent = info.message;
+    }
+
+    async function loadRetryPlan() {
+      retryPlan = null;
+      const res = await fetch(`/api/retry-missing/${JOB_ID}`);
+      const data = await res.json();
+      if (!res.ok || typeof data.enabled !== 'boolean') throw new Error(data.error || '再生成の対象を確認できませんでした。もう一度ボタンを押してください。');
+      retryPlan = data.enabled ? data : null;
+      // A terminal status may arrive just before the background thread releases ownership.
+      els.retryMissingBtn.classList.toggle('hidden', !data.enabled && data.code !== 'active');
+      els.retryReason.textContent = data.reason || '';
+      els.retryReason.classList.toggle('hidden', data.enabled || data.code === 'nothing_missing');
+      return retryPlan;
+    }
+
+    function retryError(error) {
+      els.retryError.textContent = error.message;
+      els.retryError.classList.toggle('hidden', false);
+      els.retryMissingBtn.classList.toggle('hidden', false);
+    }
+
+    async function showRetryConfirmation() {
+      if (retryBusy || !terminalStatuses.has(jobStatus)) return;
+      retryBusy = true;
+      els.retryMissingBtn.disabled = true;
+      els.retryError.classList.toggle('hidden', true);
+      els.retryConfirmation.classList.toggle('hidden', true);
+      try {
+        const plan = await loadRetryPlan();
+        if (!plan) return;
+        els.retrySummary.textContent = `再生成 ${plan.count}枚（画像AI ${plan.ai_images}枚・地図 ${plan.maps}枚）／完成済み ${plan.kept}枚を保持`;
+        const quality = {low: '低', medium: '中', high: '高'}[plan.quality];
+        els.retrySettings.textContent = `モデル：${plan.model}${quality ? ' ／ 画質：' + quality : ''} ／ 並列：${plan.concurrency}枚`;
+        els.retryCost.textContent = plan.ai_images > 0
+          ? '画像AIの再生成には追加の画像生成料金がかかります。'
+          : '今回は地図のみのため、画像AIの生成料金はかかりません。';
+        els.retryConfirmation.classList.toggle('hidden', false);
+        els.dismissRetryBtn.focus();
+      } catch (e) { retryError(e); }
+      finally { retryBusy = false; els.retryMissingBtn.disabled = false; }
+    }
+
+    function hideRetryConfirmation() {
+      if (retryBusy) return;
+      els.retryConfirmation.classList.toggle('hidden', true);
+      retryPlan = null;
+      els.retryMissingBtn.focus();
+    }
+
+    async function retryMissingImages() {
+      if (retryBusy || !retryPlan || !terminalStatuses.has(jobStatus) || els.retryConfirmation.classList.contains('hidden')) return;
+      retryBusy = true;
+      els.confirmRetryBtn.disabled = true;
+      els.dismissRetryBtn.disabled = true;
+      els.retryMissingBtn.disabled = true;
+      els.retryError.classList.toggle('hidden', true);
+      let accepted = false;
+      try {
+        const res = await fetch(`/api/retry-missing/${JOB_ID}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': '{{ cancel_csrf }}' },
+          body: JSON.stringify({plan_token: retryPlan.plan_token})
+        });
+        const data = await res.json();
+        if (!res.ok || !data.run_id) throw new Error(data.error || data.reason || '再生成の開始を確認できませんでした。画面を再読み込みして状況をご確認ください。');
+        accepted = true;
+        window.location.reload();
+      } catch (e) {
+        retryPlan = null;
+        els.retryConfirmation.classList.toggle('hidden', true);
+        retryError(e); // Require a fresh preview and explicit confirmation before any retry.
+      } finally {
+        if (!accepted) {
+          retryBusy = false;
+          els.confirmRetryBtn.disabled = false;
+          els.dismissRetryBtn.disabled = false;
+          els.retryMissingBtn.disabled = false;
+        }
+      }
+    }
+
+    function hideCancelConfirmation() {
+      els.cancelConfirmation.classList.toggle('hidden', true);
+      els.cancelBtn.focus();
+    }
+
+    async function cancelJob() {
+      if (cancelBusy || !['running', 'queued'].includes(jobStatus) || els.cancelConfirmation.classList.contains('hidden')) return;
+      cancelBusy = true;
+      els.cancelError.classList.toggle('hidden', true);
+      updateJobControls();
+      try {
+        const res = await fetch(`/api/cancel/${JOB_ID}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': '{{ cancel_csrf }}' }, body: '{}'
+        });
+        let data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!res.ok || !data.status) throw new Error(data.error || '中止を確認できませんでした。ログイン状態や通信を確認して、もう一度押してください。');
+        if (!terminalStatuses.has(jobStatus) || terminalStatuses.has(data.status)) jobStatus = data.status;
+        await pollStatus();
+        await pollItems();
+      } catch (e) {
+        els.cancelError.textContent = e.message;
+        els.cancelError.classList.toggle('hidden', false);
+      } finally {
+        cancelBusy = false;
+        updateJobControls();
+      }
+    }
+
+    async function setAdopted(filename, adopted, group) {
+      const data = await postJson(`/api/adopt/${JOB_ID}`, { filename, adopted, group });
+      adoptedSet = new Set(data.adopted || []);
+      rebuildGrid(Object.values(knownItems));
+      updateDownload();
+      updateRetention();
+      if (modalState) renderModal();
+    }
+
+    async function toggleRevision(idx) {
+      const item = knownItems[idx];
+      if (!item || item.status !== 'ok' || !item.filename || revisionBusy) return;
+      revisionBusy = true;
+      revisionEpoch++;
+      const error = document.getElementById('selectionError');
+      const modalError = document.getElementById('modalRevisionError');
+      error.classList.toggle('hidden', true);
+      modalError.classList.toggle('hidden', true);
+      rebuildGrid(Object.values(knownItems));
+      if (modalState) renderModal();
+      try {
+        const res = await fetch(`/api/selection/${JOB_ID}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': '{{ cancel_csrf }}' },
+          body: JSON.stringify({ filename: item.filename, needed: !revisionSet.has(item.filename) })
+        });
+        let data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!res.ok || !Array.isArray(data.needs_revision)) throw new Error(data.error || '要修正の印を保存できませんでした。もう一度お試しください。');
+        revisionSet = new Set(data.needs_revision);
+      } catch (e) {
+        error.textContent = e.message;
+        error.classList.toggle('hidden', false);
+        modalError.textContent = e.message;
+        modalError.classList.toggle('hidden', false);
+      } finally {
+        revisionBusy = false;
+        revisionEpoch++;
+        rebuildGrid(Object.values(knownItems));
+        if (modalState) renderModal();
+      }
+    }
+
+    async function toggleCardAdopted(idx) {
+      const item = knownItems[idx];
+      if (!item || !item.filename) return;
+      try {
+        const versions = adoptedVersionsOf(item.filename);
+        if (versions.length) {
+          for (const f of versions) await setAdopted(f, false, item.group ?? item.index);
+        } else {
+          await setAdopted(item.filename, true, item.group ?? item.index);
+        }
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    function scheduleEditPoll() {
+      // 手直しが進行中の間は、生成が終わった後も状態を取りに行く
+      if (editPollTimer || !editsList.some(e => ['queued', 'running'].includes(e.status))) return;
+      editPollTimer = setTimeout(async () => {
+        editPollTimer = null;
+        await pollItems();
+        if (modalState) renderModal();
+      }, 2000);
     }
 
     // ===== 完了通知（別タブ・他作業中でもデスクトップ通知を出す） =====
@@ -343,10 +945,10 @@
     function notifyCompleted(state) {
       if (_notified) return;
       _notified = true;
-      document.title = "✅ 生成完了 - 図解つくーる";
+      document.title = "✅ 生成完了 - 図解スタジオ";
       try {
         if ("Notification" in window && Notification.permission === "granted") {
-          const n = new Notification("図解つくーる ✅ 生成完了", {
+          const n = new Notification("図解スタジオ ✅ 生成完了", {
             body: `成功 ${state.succeeded ?? "?"} 枚。ZIPのダウンロードを忘れずに！`,
           });
           n.onclick = () => { window.focus(); n.close(); };
@@ -354,22 +956,60 @@
       } catch (e) {}
     }
 
+    // ===== 4つの段階と経過時間 =====
+    function currentStep(state) {
+      if (state.status === 'completed') return 5;
+      const phase = state.phase || 0;
+      if (phase >= 3) return 4;
+      if (phase === 2) return 3;
+      if (phase === 1) return /抽出/.test(state.message || '') ? 2 : 1;
+      return 0;
+    }
+    function formatDuration(seconds) {
+      const m = Math.floor(seconds / 60), s = seconds % 60;
+      return m ? `${m}分${String(s).padStart(2, '0')}秒` : `${s}秒`;
+    }
+    function updateStepper(state) {
+      const step = currentStep(state);
+      const failed = ['error', 'interrupted'].includes(state.status);
+      els.steps.forEach((el, i) => {
+        const n = i + 1;
+        const base = 'rounded-lg border px-3 py-2 ';
+        if (n < step) el.className = base + 'border-green-200 bg-green-50 text-green-700';
+        else if (n === step) el.className = base + (failed ? 'border-red-300 bg-red-50 text-red-700 font-semibold'
+                                                             : 'border-purple-400 bg-purple-50 text-purple-700 font-semibold');
+        else el.className = base + 'border-gray-200 text-gray-400';
+      });
+      if (typeof state.elapsed_seconds === 'number') {
+        const label = state.status === 'completed' ? '所要' : terminalStatuses.has(state.status) ? '停止まで' : '経過';
+        els.elapsedNote.textContent = `${label} ${formatDuration(state.elapsed_seconds)}`;
+      }
+    }
+
     async function pollStatus() {
       try {
         const res = await fetch(`/api/status/${JOB_ID}`);
         if (!res.ok) return;
         const state = await res.json();
+        // Ignore a running poll that was already in flight when cancel was accepted.
+        if ((jobStatus === 'cancelling' || terminalStatuses.has(jobStatus)) && ['running', 'queued'].includes(state.status)) return;
+        if (terminalStatuses.has(jobStatus) && !terminalStatuses.has(state.status)) return;
         jobStatus = state.status;
+        updateJobControls();
         updateDownload();
+        updateWaitNotice(state.wait);
 
         // ヘッダ更新
         els.jobMessage.textContent = state.message || '...';
-        els.phaseNum.textContent = Math.min(state.phase || 0, 3);
+        updateStepper(state);
         els.overallBar.style.width = `${state.percent || 0}%`;
         els.overallPercent.textContent = `${state.percent || 0}%`;
         if (state.target_count) els.targetCountVal.textContent = state.target_count;
         if (state.concurrency) els.concurrencyVal.textContent = state.concurrency;
         if (state.title) els.jobTitle.textContent = state.title;
+        else if (state.status === 'cancelled') els.jobTitle.textContent = '中止したジョブ';
+        else if (state.status === 'interrupted') els.jobTitle.textContent = '中断したジョブ';
+        document.title = `${state.status === 'interrupted' ? '中断' : state.status === 'error' ? 'エラー' : state.status === 'cancelled' ? '中止済み' : state.status === 'cancelling' ? '中止処理中' : state.status === 'completed' ? '生成完了' : '生成中'} - 図解スタジオ`;
 
         // ステータスバッジ
         els.statusBadge.innerHTML = statusBadgeHtml(state.status);
@@ -378,6 +1018,8 @@
           queued: 'bg-gray-100 text-gray-700',
           completed: 'bg-green-50 text-green-700',
           error: 'bg-red-50 text-red-700',
+          cancelling: 'bg-amber-50 text-amber-700',
+          cancelled: 'bg-gray-100 text-gray-700',
         };
         els.statusBadge.className = `flex-shrink-0 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${colorMap[state.status] || 'bg-gray-100 text-gray-700'}`;
 
@@ -385,8 +1027,12 @@
           stopped = true;
           notifyCompleted(state);
         }
-        if (state.status === 'error') {
+        if (terminalStatuses.has(state.status)) {
           stopped = true;
+          if (!retryChecked) {
+            retryChecked = true;
+            try { await loadRetryPlan(); } catch (e) { retryError(e); }
+          }
         }
       } catch (e) {
         console.error('status error', e);
@@ -395,18 +1041,24 @@
 
     async function pollItems() {
       try {
+        const requestedRevision = revisionEpoch;
         const res = await fetch(`/api/items/${JOB_ID}`);
         if (!res.ok) return;
         const data = await res.json();
         const items = data.items || [];
         availableImages = data.available_images ?? items.filter(i => i.status === 'ok' && i.filename).length;
+        adoptedSet = new Set(data.adopted || []);
+        if (!revisionBusy && requestedRevision === revisionEpoch) revisionSet = new Set(data.needs_revision || []);
+        editsList = data.edits || [];
+        retentionInfo = data.retention || null;
+        // 全体の採用数・ZIP対象は絞り込まない。
+        knownItems = {};
+        items.forEach(i => { knownItems[i.index] = i; });
         updateDownload();
-        if (items.length > 0) {
-          rebuildGrid(items);
-          updateSummary(items);
-          // 内部キャッシュ
-          items.forEach(i => { knownItems[i.index] = i; });
-        }
+        updateRetention();
+        rebuildGrid(items);
+        updateSummary(items);
+        scheduleEditPoll();
       } catch (e) {
         console.error('items error', e);
       }
@@ -435,6 +1087,11 @@
           setup: 'bg-gray-50 text-gray-700',
         };
 
+        warnCount += newLogs.filter(l => l.category === 'warn' || l.category === 'error').length;
+        if (warnCount) {
+          els.logAlert.textContent = `注意 ${warnCount}件`;
+          els.logAlert.classList.toggle('hidden', false);
+        }
         newLogs.forEach(log => {
           const div = document.createElement('div');
           div.className = `p-2 rounded-md ${colorMap[log.category] || 'bg-gray-50 text-gray-700'}`;
@@ -455,20 +1112,122 @@
     }
 
     function openModal(idx) {
+      const item = knownItems[idx];
       const card = document.getElementById(`card-${idx}`);
-      if (!card) return;
-      const filename = card.getAttribute('data-filename');
+      const filename = (item && item.filename) || (card && card.getAttribute('data-filename'));
       if (!filename) return;
-      document.getElementById('modalImg').src = `/results/${JOB_ID}/images/${filename}`;
-      document.getElementById('modalDownload').href = `/results/${JOB_ID}/images/${filename}`;
-      document.getElementById('modalTitle').textContent = card.getAttribute('data-keypoint') || `図 ${idx}`;
-      document.getElementById('modalSection').textContent = card.getAttribute('data-section') || '';
-      document.getElementById('modalExcerpt').textContent = card.getAttribute('data-excerpt') || '';
+      rememberSelectionPosition();
+      modalState = { idx, source: filename, shown: filename, pending: null };
+      const title = (item && (item.keypoint || (item.excerpt || '').substring(0, 30))) || `図 ${idx}`;
+      const prefix = item && item.variant
+        ? `No.${String(item.group ?? idx).padStart(3, '0')}${item.variant} ${item.variant_label || ''}　` : '';
+      document.getElementById('modalTitle').textContent = prefix + title;
+      document.getElementById('modalSection').textContent = (item && item.section) || '';
+      document.getElementById('modalExcerpt').textContent = (item && item.excerpt) || '';
+      const notes = (item && item.notes) || [];
+      document.getElementById('modalNotes').textContent = notes.length ? '地図のメモ: ' + notes.join(' / ') : '';
+      document.getElementById('instructText').value = '';
+      document.getElementById('editStatus').textContent = '';
+      document.getElementById('modalRevisionError').classList.toggle('hidden', true);
+      renderModal();
       document.getElementById('modal').classList.remove('hidden');
     }
+
+    function renderModal() {
+      if (!modalState) return;
+      const source = modalState.source;
+      const edits = editsFor(source);
+      // 頼んだ手直しが終わったら、その版を表示する
+      const pending = modalState.pending && edits.find(e => e.output === modalState.pending);
+      if (pending && !['queued', 'running'].includes(pending.status)) {
+        if (pending.status === 'ok') modalState.shown = pending.output;
+        modalState.pending = null;
+      }
+      const shownEdit = edits.find(e => e.output === modalState.shown);
+      if (shownEdit && shownEdit.status !== 'ok') modalState.shown = source;
+      const shown = modalState.shown;
+      const url = `/results/${JOB_ID}/images/${shown}`;
+      const img = document.getElementById('modalImg');
+      if (!img.src.endsWith(url)) img.src = url;
+      document.getElementById('modalDownload').href = url;
+      const adopted = adoptedSet.has(shown);
+      const adoptBtn = document.getElementById('modalAdopt');
+      adoptBtn.textContent = adopted ? '★ 採用中（押すと取り消し）' : '☆ この版を採用';
+      adoptBtn.className = 'px-3 py-1.5 rounded-lg text-sm font-medium border ' +
+        (adopted ? 'bg-amber-400 border-amber-400 text-white' : 'border-amber-400 text-amber-700 hover:bg-amber-50');
+      const revisionBtn = document.getElementById('modalRevision');
+      const flagged = revisionSet.has(source);
+      revisionBtn.textContent = flagged ? '要修正 ✓（解除）' : '要修正にする';
+      revisionBtn.disabled = revisionBusy;
+      revisionBtn.setAttribute('aria-pressed', String(flagged));
+      revisionBtn.className = 'px-3 py-1.5 rounded-lg text-sm border border-orange-300 text-orange-800 disabled:opacity-50 ' + (flagged ? 'bg-orange-100' : 'hover:bg-orange-50');
+      const versions = [{ output: source, label: '元の画像', status: 'ok' }, ...edits];
+      document.getElementById('versionStrip').innerHTML = versions.map(v => {
+        const active = v.output === shown;
+        const star = adoptedSet.has(v.output) ? '★ ' : '';
+        if (['queued', 'running'].includes(v.status)) {
+          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-yellow-50 border border-yellow-300 flex items-center justify-center text-[11px] text-yellow-700">${escapeHtml(v.label)}：${v.status === 'queued' ? '順番待ち' : '処理中'}…</div>`;
+        }
+        if (['failed', 'interrupted'].includes(v.status)) {
+          return `<div class="flex-shrink-0 w-32 h-20 rounded-lg bg-red-50 border border-red-300 p-1 text-[10px] text-red-700 overflow-hidden" title="${escapeHtml(v.error || '')}">${escapeHtml(v.label)}：${v.status === 'interrupted' ? '中断' : '失敗'}<br>${escapeHtml((v.error || '').substring(0, 60))}</div>`;
+        }
+        return `<button type="button" onclick="showVersion('${v.output}')" class="flex-shrink-0 w-32 rounded-lg overflow-hidden border-2 ${active ? 'border-purple-500' : 'border-transparent'}"><img src="/results/${JOB_ID}/images/${v.output}" class="w-32 h-[4.5rem] object-cover" loading="lazy"><span class="block text-[10px] text-gray-600 py-0.5">${star}${escapeHtml(v.label)}</span></button>`;
+      }).join('');
+      const running = edits.filter(e => e.status === 'running').length;
+      const queued = edits.filter(e => e.status === 'queued').length;
+      const status = document.getElementById('editStatus');
+      if (running || queued) {
+        status.textContent = `手直し：処理中 ${running}件・順番待ち ${queued}件。終わると下に並びます`;
+        status.className = 'text-xs mt-1 text-yellow-700';
+      } else if (status.className.indexOf('text-red') === -1) {
+        status.textContent = '';
+      }
+    }
+
+    function showVersion(output) {
+      if (!modalState) return;
+      modalState.shown = output;
+      renderModal();
+    }
+
+    async function toggleShownAdopted() {
+      if (!modalState) return;
+      const item = knownItems[modalState.idx] || {};
+      try {
+        await setAdopted(modalState.shown, !adoptedSet.has(modalState.shown), item.group ?? item.index);
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function editImage(action) {
+      if (!modalState) return;
+      const instruction = action === 'instruct' ? document.getElementById('instructText').value.trim() : '';
+      if (action === 'instruct' && !instruction) {
+        alert('直してほしい内容を入力してください');
+        return;
+      }
+      const status = document.getElementById('editStatus');
+      status.textContent = '';
+      status.className = 'text-xs mt-1';
+      try {
+        const data = await postJson(`/api/edit/${JOB_ID}`, { source: modalState.shown, action, instruction });
+        editsList = data.edits || editsList;
+        if (data.edit) modalState.pending = data.edit.output;
+        if (action === 'instruct') document.getElementById('instructText').value = '';
+        renderModal();
+        rebuildGrid(Object.values(knownItems));
+        scheduleEditPoll();
+      } catch (e) {
+        status.textContent = e.message;
+        status.className = 'text-xs mt-1 text-red-600';
+      }
+    }
+
     function closeModal(e) {
       if (e && e.target.tagName === 'IMG') return;
       document.getElementById('modal').classList.add('hidden');
+      modalState = null;
     }
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') closeModal();

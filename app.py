@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""図解つくーる - Flask Web アプリケーション
+"""図解スタジオ（旧 図解つくーる） - Flask Web アプリケーション
 
 シンプルな1機能アプリ:
   原稿アップロード → N 枚の図解画像を並列生成 → ZIP ダウンロード
@@ -9,6 +9,7 @@ import functools
 import json
 import os
 import secrets
+import shutil
 import tempfile
 import threading
 import zipfile
@@ -28,10 +29,22 @@ from flask import (
     url_for,
 )
 
+import re
+
 from utils import load_env, load_json, save_json
 from pipeline import DiagramPipeline
+from job_control import Cancellation, JobCancelled
 from generator import (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS,
-                       OPENAI_IMAGE_MODEL_CHOICES, resolve_openai_image_model)
+                       OPENAI_IMAGE_MODEL_CHOICES, DEFAULT_GEMINI_MODEL, resolve_openai_image_model, resolve_edit_model)
+from prompter import CANDIDATE_MODES, MAP_MODES
+import director_routes
+import image_edit
+import map_renderer
+import retention
+import resource_diagnostics
+import retry_missing
+import job_health
+from image_resources import IMAGE_TASK_LIMIT
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -72,7 +85,11 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 # ジョブ状態（メモリ）
 _jobs: dict[str, dict] = {}
 _job_logs: dict[str, list] = {}
-_jobs_lock = threading.Lock()
+_jobs_lock = threading.RLock()
+_active_jobs = set()  # The production service uses one Gunicorn worker, eight threads.
+TERMINAL_STATUSES = {"completed", "error", "cancelled", "interrupted"}
+_recovery_lock = threading.Lock()
+_recovered_roots = set()
 
 
 # ====== 認証 ======
@@ -123,9 +140,25 @@ def version():
         "image_review_enabled": False,
         "pipeline_phases": 3,
         "partial_download_enabled": True,
+        "memory_safety": {"version": 2, "image_task_limit": IMAGE_TASK_LIMIT,
+                          "scope": "process", "explicit_image_close": True,
+                          "terminal_cache_release": True, "resource_logging": True},
+        "restart_recovery": {"version": 1, "preserves_images": True, "automatic_resume": False},
+        "edit_queue": {"version": 1, "owner_tracking": True, "request_timeout_seconds": 180},
+        "job_cancellation": {"version": 1, "whole_job": True, "preserves_images": True,
+                             "restart_settings": True, "inflight_requests_may_finish": True},
+        "missing_image_retry": {"version": 1, "preserves_completed": True, "confirmation_required": True},
+        "wait_guidance": {"version": 1, "after_seconds": job_health.WAIT_SECONDS, "automatic_cancel": False},
+        "selection_workflow": {"version": 1, "chapter_filter": True, "unselected_groups": True,
+                               "revision_marks": True, "browser_resume": True},
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
         # 従量APIへの明示の切り替え（既定オフ・2026-09-28）。ツール名・環境変数の名前・真偽値だけ
         "llm_api_switch": subscription_runtime.api_switch_status(),
+        "default_image_model": resolve_openai_image_model(),
+        "edit_image_model": resolve_edit_model(),
+        "director_tools": {"candidates": list(CANDIDATE_MODES), "map_renderer": map_renderer.enabled(),
+                           "retention_days": retention.retention_days(), "retention_keeps_adopted": True,
+                           "edits": sorted(image_edit.ACTIONS), "adoption": True},
     })
 
 
@@ -174,6 +207,12 @@ def logout():
 
 
 # ====== ジョブ管理 ======
+@app.before_request
+def start_retention_once():
+    # 古いジョブの自動削除（起動後1回＋6時間ごと）。プロセスごとに1本だけ動く。
+    retention.start_scheduler(OUTPUT_DIR)
+
+
 @app.after_request
 def prevent_stale_progress(response):
     if request.path.startswith(("/api/", "/progress/")) or request.path == "/version":
@@ -183,14 +222,41 @@ def prevent_stale_progress(response):
 
 def _set_job_state(job_id: str, **kwargs):
     with _jobs_lock:
-        state = _jobs.setdefault(job_id, {})
+        state = _get_job_state(job_id)
+        if kwargs.get("status") in {"running", "completed"}:
+            Cancellation(OUTPUT_DIR / job_id).check()
+        if state.get("status") in TERMINAL_STATUSES:
+            return
+        if any(key in kwargs and kwargs[key] != state.get(key) for key in ("phase", "message", "percent")):
+            kwargs.setdefault("last_progress_at", datetime.now().isoformat())
+        phase_changed = "phase" in kwargs and kwargs["phase"] != state.get("phase")
         state.update(kwargs)
         state["updated_at"] = datetime.now().isoformat()
-        # ファイルにも保存
+        save_json(OUTPUT_DIR / job_id / "job.json", state)
+        if state.get("status") in TERMINAL_STATUSES:
+            _jobs.pop(job_id, None)
+            _job_logs.pop(job_id, None)
+        else:
+            _jobs[job_id] = state
+        if phase_changed:
+            resource_diagnostics.record("phase", "generation", active_jobs=len(_active_jobs))
+
+
+def _job_elapsed_seconds(job_id: str, state: dict):
+    """開始から終了（実行中なら今）までの秒数。開始時刻が分からなければ None。"""
+    try:
+        started_at = state.get("attempt_started_at") or state.get("started_at")
+        started = datetime.fromisoformat(started_at) if started_at else datetime.strptime(job_id[:15], "%Y%m%d_%H%M%S")
+    except (ValueError, TypeError):
+        return None
+    end = datetime.now()
+    if state.get("status") in TERMINAL_STATUSES and state.get("updated_at"):
         try:
-            save_json(OUTPUT_DIR / job_id / "job.json", state)
-        except Exception:
+            end = datetime.fromisoformat(state["updated_at"])
+        except ValueError:
             pass
+    seconds = int((end - started).total_seconds())
+    return seconds if 0 <= seconds < 7 * 24 * 3600 else None
 
 
 def _get_job_state(job_id: str) -> dict:
@@ -204,6 +270,41 @@ def _get_job_state(job_id: str) -> dict:
     return {}
 
 
+def _job_dir_for(job_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id or ""):
+        return None
+    path = OUTPUT_DIR / job_id
+    if path.is_symlink() or not path.is_dir() or path.resolve().parent != OUTPUT_DIR.resolve():
+        return None
+    return path
+
+
+def _finish_cancelled(job_id):
+    """Called after this job's local workers have drained; keep all saved results."""
+    with _jobs_lock:
+        if _get_job_state(job_id).get("status") in TERMINAL_STATUSES:
+            return
+        job_dir = OUTPUT_DIR / job_id
+        items = _image_snapshot(job_dir)["items"]
+        for item in items:
+            if item.get("status") not in {"ok", "failed"}:
+                item.update(status="cancelled", success=False)
+        succeeded = sum(i.get("status") == "ok" for i in items)
+        failed = sum(i.get("status") == "failed" for i in items)
+        cancelled = sum(i.get("status") == "cancelled" for i in items)
+        save_json(job_dir / "images_progress.json", {"items": items, "updated_at": datetime.now().isoformat()})
+        analysis = load_json(job_dir / "analysis.json", {})
+        manifest = load_json(job_dir / "manifest.json", {})
+        manifest.update(status="cancelled", title=manifest.get("title") or analysis.get("title", job_id),
+                        items=items, succeeded=succeeded, failed=failed, cancelled=cancelled,
+                        images_planned=len(items), completed_at=datetime.now().isoformat())
+        save_json(job_dir / "manifest.json", manifest)
+        _set_job_state(job_id, status="cancelled", title=manifest["title"], succeeded=succeeded,
+                       failed=failed, cancelled=cancelled,
+                       message=f"中止しました。完成済み {succeeded}枚は保存されています。")
+        _add_log(job_id, "system", f"ジョブを中止（完成済み {succeeded}枚を保持）")
+
+
 def _add_log(job_id: str, category: str, message: str, detail: str = ""):
     entry = {
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -212,12 +313,80 @@ def _add_log(job_id: str, category: str, message: str, detail: str = ""):
         "detail": detail,
     }
     with _jobs_lock:
-        logs = _job_logs.setdefault(job_id, [])
+        logs = _job_logs.get(job_id)
+        if logs is None:
+            logs = load_json(OUTPUT_DIR / job_id / "logs.json", [])
         logs.append(entry)
         try:
             save_json(OUTPUT_DIR / job_id / "logs.json", logs)
         except OSError:
             pass
+        if job_id in _active_jobs and _get_job_state(job_id).get("status") not in TERMINAL_STATUSES:
+            _job_logs[job_id] = logs
+        else:
+            _job_logs.pop(job_id, None)
+
+
+def _release_job_resources(job_id, operation):
+    with _jobs_lock:
+        _active_jobs.discard(job_id)
+        _jobs.pop(job_id, None)
+        _job_logs.pop(job_id, None)
+        active = len(_active_jobs)
+    resource_diagnostics.record("finished", operation, active_jobs=active)
+
+
+def recover_interrupted_jobs():
+    """Run once at worker startup, before accepting requests (one worker only).
+
+    A new worker has no surviving pipeline/edit threads. Do not infer a restart
+    from elapsed time, and never restart paid work automatically.
+    """
+    root = OUTPUT_DIR.resolve()
+    with _recovery_lock, _jobs_lock:
+        identity = (os.getpid(), root)
+        if identity in _recovered_roots:
+            return
+        image_edit.bind_worker()
+        image_edit.release_previous_worker_lock(root / retention.LOCK_NAME)
+        recovered_jobs = recovered_edits = 0
+        for directory in sorted(root.iterdir()):
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            recovered_edits += image_edit.recover_interrupted_edits(directory)
+            state = load_json(directory / "job.json", {})
+            if (directory.name in _active_jobs
+                    or state.get("status") not in {"queued", "running", "cancelling"}):
+                continue
+            # Preserve the exact pre-recovery metadata, not just a rewritten state.
+            history = directory / "recovery_history" / secrets.token_hex(8)
+            history.mkdir(parents=True)
+            for name in ("job.json", "images_progress.json", "manifest.json"):
+                source = directory / name
+                if source.is_file():
+                    shutil.copy2(source, history / name)
+            items = _image_snapshot(directory)["items"]
+            for item in items:
+                if item.get("status") not in {"ok", "failed"}:
+                    item.update(status="interrupted", success=False)
+            succeeded = sum(i.get("status") == "ok" for i in items)
+            failed = sum(i.get("status") == "failed" for i in items)
+            now = datetime.now().isoformat()
+            save_json(directory / "images_progress.json", {"items": items, "updated_at": now})
+            manifest = load_json(directory / "manifest.json", {})
+            manifest.update(status="interrupted", items=items, succeeded=succeeded, failed=failed,
+                            images_planned=len(items), interrupted_at=now)
+            save_json(directory / "manifest.json", manifest)
+            state.update(status="interrupted", updated_at=now, interrupted_at=now,
+                         succeeded=succeeded, failed=failed,
+                         message=f"サーバーの再起動で中断しました。完成済み {succeeded}枚は保存されています。未生成分の再生成、または設定を直した作り直しを選べます。")
+            save_json(directory / "job.json", state)
+            _add_log(directory.name, "system", "サーバー再起動による中断を検出。完成画像を保持しました。")
+            _release_job_resources(directory.name, "startup")
+            recovered_jobs += 1
+        _recovered_roots.add(identity)
+        resource_diagnostics.record("recovered", "startup", recovered_jobs=recovered_jobs,
+                                    recovered_edits=recovered_edits)
 
 
 def _completed_images(result_dir: Path) -> list[Path]:
@@ -248,19 +417,57 @@ def _image_snapshot(result_dir: Path, images=None) -> dict:
     by_index = {item.get("index"): item for item in items}
     known = {item.get("filename") for item in items}
     for path in images:
-        if path.name in known:
-            continue
-        suffix = path.stem.rsplit("_", 1)[-1]
-        idx = int(suffix) if suffix.isdigit() else max(by_index, default=0) + 1
-        item = by_index.get(idx)
-        if item is None:
-            item = {"index": idx}
-            items.append(item)
-            by_index[idx] = item
+        if path.name in known or image_edit.is_edit_file(path.name):
+            continue  # 手直しした版は edits.json で元画像にひも付けて表示する
+        match = _IMAGE_NAME_RE.match(path.stem)
+        variant = match.group(2) if match else None
+        if match and variant:  # 候補（diagram_004_b.png）: 抜粋番号＋案で探す
+            group = int(match.group(1))
+            item = next((i for i in items if i.get("group") == group and i.get("variant") == variant), None)
+            if item is None:
+                item = {"index": max(by_index, default=0) + 1, "group": group, "variant": variant}
+                items.append(item)
+                by_index[item["index"]] = item
+        else:
+            suffix = path.stem.rsplit("_", 1)[-1]
+            idx = int(suffix) if suffix.isdigit() else max(by_index, default=0) + 1
+            item = by_index.get(idx)
+            if item is None:
+                item = {"index": idx}
+                items.append(item)
+                by_index[idx] = item
         item.update(filename=path.name, status="ok", success=True)
+    trimmed = result_dir.is_dir() and retention.is_trimmed(result_dir)
+    edits = image_edit.load_edits(result_dir)
+    if trimmed:  # 保存期限の整理後: 残した（採用した）画像と、その版だけを並べる
+        items = [item for item in items if item.get("filename") in available]
+        edits = [e for e in edits if e.get("output") in available]
     snapshot["items"] = sorted(items, key=lambda item: item.get("index", 0))
     snapshot["available_images"] = len(images)
+    snapshot["edits"] = edits
+    snapshot["adopted"] = sorted(image_edit.load_adoption(result_dir))
+    snapshot["needs_revision"] = sorted(image_edit.load_revision_marks(result_dir))
+    expires = retention.expires_at(result_dir) if result_dir.is_dir() else None
+    snapshot["retention"] = {"days": retention.retention_days(), "trimmed": trimmed,
+                             "expires_at": expires.isoformat(timespec="minutes") if expires else None}
     return snapshot
+
+
+def _retention_notice():
+    """自動削除の知らせ（容量の警告、または直近7日の容量超過による整理）。"""
+    state = retention.load_state(OUTPUT_DIR)
+    if state.get("warning"):
+        return state["warning"]
+    try:
+        at = datetime.fromisoformat(state.get("at") or "")
+    except ValueError:
+        return None
+    if state.get("capacity_triggered") and datetime.now() - at < timedelta(days=7):
+        return "保存領域が上限に近づいたため、古い結果を自動で整理しました（☆で採用した画像は残しています）。"
+    return None
+
+
+_IMAGE_NAME_RE = re.compile(r"^diagram_(\d{3})(?:_([a-c]))?$")
 
 
 def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
@@ -269,8 +476,12 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          openai_quality: str = "medium",
                          worldview_preset: str = "",
                          no_text_mode: bool = False,
-                         openai_model: str = ""):
+                         openai_model: str = "",
+                         candidate_mode: str = "single",
+                         map_mode: str = "data"):
     job_dir = OUTPUT_DIR / job_id
+    cancellation = Cancellation(job_dir)
+    resource_diagnostics.record("started", "generation", active_jobs=len(_active_jobs))
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
         _set_job_state(job_id, status="running", phase=0, message="開始しています...", percent=0)
@@ -282,6 +493,8 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
 
         def on_log(category, message, detail=""):
             _add_log(job_id, category, message, detail)
+            if category in {"extractor", "prompter", "analyze", "generator"}:
+                _set_job_state(job_id, last_progress_at=datetime.now().isoformat())
 
         def on_item(info):
             # 個別画像の進捗は images_progress.json 経由でフロントへ
@@ -301,25 +514,43 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
             progress_callback=on_progress,
             log_callback=on_log,
             item_callback=on_item,
+            candidate_mode=candidate_mode,
+            map_mode=map_mode,
+            cancel_check=cancellation.check,
         )
         manifest = pipeline.run()
+        cancellation.check()
+        planned = manifest.get("images_planned") or manifest.get("target_count", 0)
+        groups = manifest.get("groups") or planned
+        message = f"完了: 成功 {manifest['succeeded']} / {planned} 枚"
+        if groups != planned:
+            message += f"（{groups}箇所の候補）"
         _set_job_state(
             job_id,
             status="completed",
             phase=3,
-            message=f"完了: 成功 {manifest['succeeded']} / {manifest['target_count']} 枚",
+            message=message,
             percent=100,
             title=manifest.get("title", ""),
             succeeded=manifest.get("succeeded", 0),
             failed=manifest.get("failed", 0),
-            target_count=manifest.get("target_count", 0),
+            target_count=planned,
         )
         _add_log(job_id, "system", f"全フェーズ完了（成功 {manifest['succeeded']} / 失敗 {manifest['failed']}）")
+    except JobCancelled:
+        _finish_cancelled(job_id)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        _set_job_state(job_id, status="error", message=str(e)[:200], percent=0)
-        _add_log(job_id, "error", "パイプライン実行エラー", str(e)[:300])
+        with _jobs_lock:
+            if cancellation.requested():
+                _finish_cancelled(job_id)
+            else:
+                _set_job_state(job_id, status="error", message=str(e)[:200], percent=0)
+                _add_log(job_id, "error", "パイプライン実行エラー", str(e)[:300])
+    finally:
+        _release_job_resources(job_id, "generation")
+        retention.run_in_background(OUTPUT_DIR)  # 新しい画像が増えた直後に容量を確かめる
 
 
 # ====== ルート ======
@@ -328,6 +559,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
 def index():
     # 過去ジョブ一覧
     past_jobs = []
+    last_run = None  # 直近の完了ジョブの実績（作成画面の所要時間の目安に使う）
     if OUTPUT_DIR.exists():
         for d in sorted(OUTPUT_DIR.iterdir(), reverse=True):
             if not d.is_dir():
@@ -341,16 +573,26 @@ def index():
                 "title": manifest.get("title", job_state.get("title", d.name)),
                 "status": job_state.get("status", "unknown"),
                 "succeeded": manifest.get("succeeded", job_state.get("succeeded", 0)),
-                "target": manifest.get("target_count", job_state.get("target_count", 0)),
+                # 候補モードは「箇所数」ではなく予定の枚数と比べる（19/10 ではなく 19/20）
+                "target": manifest.get("images_planned") or manifest.get("target_count", job_state.get("target_count", 0)),
                 "date": d.name[:8] if len(d.name) >= 8 else "",
             })
+            seconds = _job_elapsed_seconds(d.name, job_state) if job_state.get("status") == "completed" else None
+            if last_run is None and seconds:
+                last_run = {"places": manifest.get("groups") or manifest.get("target_count") or 0,
+                            "images": manifest.get("images_planned") or manifest.get("succeeded") or 0,
+                            "minutes": max(1, round(seconds / 60))}
     resp = make_response(render_template(
         "upload.html",
         openai_image_models=[{"id": m, "label": l} for m, l in OPENAI_IMAGE_MODEL_CHOICES],
+        default_openai_model=resolve_openai_image_model(),
         past_jobs=past_jobs[:30],
+        last_run=last_run,
+        image_task_limit=IMAGE_TASK_LIMIT,
         has_anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")),
         has_gemini=bool(os.environ.get("GEMINI_API_KEY")),
         has_openai=bool(os.environ.get("OPENAI_API_KEY")),
+        retention_notice=_retention_notice(),
     ))
     # デプロイ後に古いフォーム（新しい入力欄が無い）が使われ続けるのを防ぐ
     resp.headers["Cache-Control"] = "no-store"
@@ -399,22 +641,36 @@ def start_job():
     target_count = max(5, min(target_count, 200))
 
     try:
-        concurrency = int(request.form.get("concurrency", "12"))
+        concurrency = int(request.form.get("concurrency", str(IMAGE_TASK_LIMIT)))
     except ValueError:
-        concurrency = 12
-    concurrency = max(1, min(concurrency, 24))
+        concurrency = IMAGE_TASK_LIMIT
+    concurrency = max(1, min(concurrency, IMAGE_TASK_LIMIT))
 
     user_instructions = request.form.get("user_instructions", "").strip()
     worldview_preset = request.form.get("worldview_preset", "").strip()
     no_text_mode = request.form.get("no_text_mode") == "on"
+    candidate_mode = request.form.get("candidate_mode", "single")
+    if candidate_mode not in CANDIDATE_MODES:
+        candidate_mode = "single"
+    map_mode = request.form.get("map_mode", "data")
+    if map_mode not in MAP_MODES or not map_renderer.enabled():
+        map_mode = "ai" if not map_renderer.enabled() else "data"
 
     # ジョブ作成
-    job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3)
     job_dir = OUTPUT_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+    job_dir.mkdir(parents=True, exist_ok=False)
     (job_dir / "manuscript.txt").write_text(manuscript_text, encoding="utf-8")
     if user_instructions:
         (job_dir / "user_instructions.txt").write_text(user_instructions, encoding="utf-8")
+    # Immutable input settings: result target_count may later become the image count.
+    save_json(job_dir / "request.json", {
+        "target_count": target_count, "concurrency": concurrency, "provider": provider,
+        "openai_quality": openai_quality, "openai_model": openai_model,
+        "worldview_preset": worldview_preset, "no_text_mode": no_text_mode,
+        "user_instructions": user_instructions, "candidate_mode": candidate_mode, "map_mode": map_mode,
+        "gemini_model": os.environ.get("GEMINI_IMAGE_MODEL") or DEFAULT_GEMINI_MODEL,
+    })
 
     _set_job_state(
         job_id,
@@ -422,26 +678,178 @@ def start_job():
         phase=0,
         message="キューに追加しました",
         percent=0,
+        started_at=datetime.now().isoformat(),
         target_count=target_count,
         concurrency=concurrency,
         provider=provider,
         openai_quality=openai_quality if provider == PROVIDER_GPT_IMAGE else None,
         openai_model=openai_model if provider == PROVIDER_GPT_IMAGE else None,
+        candidate_mode=candidate_mode,
+        map_mode=map_mode,
     )
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality, worldview_preset, no_text_mode, openai_model),
+        args=(job_id, manuscript_text, target_count, user_instructions, concurrency, provider, openai_quality,
+              worldview_preset, no_text_mode, openai_model, candidate_mode, map_mode),
         daemon=True,
     )
-    thread.start()
+    with _jobs_lock:
+        _active_jobs.add(job_id)
+    try:
+        thread.start()
+    except Exception:
+        with _jobs_lock:
+            _active_jobs.discard(job_id)
+        _set_job_state(job_id, status="error", message="開始できませんでした。設定を確認して作り直してください。")
+        raise
     return jsonify({"job_id": job_id, "redirect": f"/progress/{job_id}"})
 
 
 @app.route("/progress/<job_id>")
 @login_required
 def progress_page(job_id):
-    return render_template("progress.html", job_id=job_id)
+    if not _job_dir_for(job_id):
+        return "ジョブが見つかりません", 404
+    token = session.setdefault("cancel_csrf", secrets.token_hex(32))
+    return render_template("progress.html", job_id=job_id, cancel_csrf=token)
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+@login_required
+def cancel_job(job_id):
+    expected = session.get("cancel_csrf", "")
+    if not request.is_json or not expected or not secrets.compare_digest(expected, request.headers.get("X-CSRF-Token", "")):
+        return jsonify({"error": "画面を再読み込みしてから中止してください。"}), 403
+    job_dir = _job_dir_for(job_id)
+    if job_dir is None:
+        return jsonify({"error": "ジョブが見つかりません"}), 404
+    with _jobs_lock:
+        state = _get_job_state(job_id)
+        if not state:
+            return jsonify({"error": "ジョブの状態が見つかりません"}), 404
+        if state.get("status") in TERMINAL_STATUSES:
+            return jsonify(state)
+        if not Cancellation(job_dir).requested():
+            save_json(job_dir / "cancel_requested.json", {"requested_at": datetime.now().isoformat()})
+            _add_log(job_id, "system", "利用者がジョブ全体の中止を要求しました")
+        _set_job_state(job_id, status="cancelling",
+                       message="中止処理中です。送信済みの画像を保存して終了します。")
+        if job_id not in _active_jobs:
+            # An old queued/running record left by a server restart has no local worker.
+            _finish_cancelled(job_id)
+        state = _get_job_state(job_id)
+    return jsonify(state), 202 if state.get("status") == "cancelling" else 200
+
+
+@app.route("/api/restart-settings/<job_id>")
+@login_required
+def restart_settings(job_id):
+    job_dir = _job_dir_for(job_id)
+    if job_dir is None:
+        return jsonify({"error": "元のジョブが見つかりません"}), 404
+    try:
+        manuscript = (job_dir / "manuscript.txt").read_text(encoding="utf-8")
+    except OSError:
+        return jsonify({"error": "元の原稿が残っていません。原稿をもう一度入力してください。"}), 404
+    settings = load_json(job_dir / "request.json", {})
+    if not settings:  # Earlier jobs: completed manifests contain the original place count.
+        settings = {**_get_job_state(job_id), **load_json(job_dir / "manifest.json", {})}
+        instructions = job_dir / "user_instructions.txt"
+        if instructions.is_file():
+            settings["user_instructions"] = instructions.read_text(encoding="utf-8")
+    keys = ("target_count", "concurrency", "provider", "openai_quality", "openai_model",
+            "worldview_preset", "no_text_mode", "user_instructions", "candidate_mode", "map_mode")
+    return jsonify({"manuscript_text": manuscript, "settings": {k: settings[k] for k in keys if k in settings}})
+
+
+def _run_missing_thread(job_id, plan):
+    job_dir = OUTPUT_DIR / job_id
+    resource_diagnostics.record("started", "missing_retry", active_jobs=len(_active_jobs))
+    try:
+        _set_job_state(job_id, status="running", phase=3, message="不足分の画像を再生成しています。", percent=50)
+        manifest = retry_missing.generate(job_dir, plan,
+            lambda phase, msg, pct: _set_job_state(job_id, status="running", phase=phase, message=msg, percent=pct))
+        _set_job_state(job_id, status="completed", percent=100, title=manifest.get("title", ""),
+                       succeeded=manifest["succeeded"], failed=manifest["failed"], cancelled=0,
+                       message=f"再生成完了: 保存済み {manifest['succeeded']}/{manifest['images_planned']}枚（失敗 {manifest['failed']}枚）")
+        _add_log(job_id, "system", f"不足分の再生成が完了（画像AI {plan.public['ai_images']}枚・地図 {plan.public['maps']}枚が対象）")
+    except JobCancelled:
+        _finish_cancelled(job_id)
+    except Exception as exc:
+        if Cancellation(job_dir).requested():
+            _finish_cancelled(job_id)
+        else:
+            _set_job_state(job_id, status="error", message="再生成を停止しました。完成画像は残っています。")
+            _add_log(job_id, "error", "不足分の再生成エラー", str(exc)[:200])
+    finally:
+        _release_job_resources(job_id, "missing_retry")
+        retention.run_in_background(OUTPUT_DIR)
+
+
+@app.route("/api/retry-missing/<job_id>", methods=["GET", "POST"])
+@login_required
+def retry_missing_images(job_id):
+    post = request.method == "POST"
+    if post:
+        expected = session.get("cancel_csrf", "")
+        if not request.is_json or not expected or not secrets.compare_digest(expected, request.headers.get("X-CSRF-Token", "")):
+            return jsonify({"error": "画面を再読み込みしてから操作してください。"}), 403
+    with _jobs_lock:
+        # Share the retention lock until the job is marked active, so cleanup cannot
+        # select it as a finished job while a new attempt is being prepared.
+        cleanup_lock = retention._acquire_lock(OUTPUT_DIR) if post else None
+        if post and cleanup_lock is None:
+            return jsonify({"error": "保存データの整理中です。少し待ってからもう一度お試しください。"}), 409
+        try:
+            job_dir = _job_dir_for(job_id)
+            if job_dir is None:
+                return jsonify({"error": "ジョブが見つかりません"}), 404
+            state = _get_job_state(job_id)
+            if job_id in _active_jobs or state.get("status") not in TERMINAL_STATUSES:
+                result = {"enabled": False, "code": "active", "reason": "実行中のジョブです。終了または中止後に操作してください。"}
+                return jsonify(result), 409 if post else 200
+            try:
+                plan = retry_missing.plan(job_dir, state)
+            except retry_missing.RetryUnavailable as exc:
+                return jsonify({"enabled": False, "code": exc.code, "reason": str(exc)}), 409 if post else 200
+            if not post:
+                return jsonify(plan.public)
+            body = request.get_json(silent=True)
+            supplied = body.get("plan_token") if isinstance(body, dict) else None
+            if not isinstance(supplied, str) or not re.fullmatch(r"[a-f0-9]{64}", supplied) or not secrets.compare_digest(plan.public["plan_token"], supplied):
+                return jsonify({"error": "対象や設定が変わりました。もう一度、枚数と設定を確認してください。"}), 409
+            run_id = secrets.token_hex(8)
+            history = job_dir / "retry_history" / run_id
+            history.mkdir(parents=True, exist_ok=False)
+            for name in ("job.json", "images_progress.json", "manifest.json", "cancel_requested.json"):
+                source = job_dir / name
+                if source.is_file():
+                    shutil.copy2(source, history / name)
+            save_json(history / "retry_plan.json", plan.public)
+            (job_dir / "cancel_requested.json").unlink(missing_ok=True)
+            now = datetime.now().isoformat()
+            new_state = dict(state, status="queued", phase=3, percent=50, run_id=run_id,
+                             attempt_started_at=now, last_progress_at=now, updated_at=now,
+                             concurrency=plan.settings["concurrency"],
+                             retry_count=int(state.get("retry_count", 0)) + 1,
+                             retry_missing_count=plan.public["count"],
+                             message=f"不足分 {plan.public['count']}枚の再生成を準備しています。")
+            save_json(job_dir / "job.json", new_state)
+            _jobs[job_id] = new_state
+            _active_jobs.add(job_id)
+            try:
+                thread = threading.Thread(target=_run_missing_thread, args=(job_id, plan), daemon=True)
+                thread.start()
+            except Exception:
+                _active_jobs.discard(job_id)
+                _set_job_state(job_id, status="error", message="再生成を開始できませんでした。もう一度お試しください。")
+                return jsonify({"error": "再生成を開始できませんでした。少し待ってからもう一度お試しください。"}), 503
+            _add_log(job_id, "system", f"不足分 {plan.public['count']}枚の再生成を受付（完成済み {plan.public['kept']}枚を保持）")
+            return jsonify({"status": "queued", "run_id": run_id, "redirect": f"/progress/{job_id}"}), 202
+        finally:
+            if cleanup_lock is not None:
+                cleanup_lock.unlink(missing_ok=True)
 
 
 @app.route("/api/status/<job_id>")
@@ -450,7 +858,8 @@ def api_status(job_id):
     state = _get_job_state(job_id)
     if not state:
         return jsonify({"status": "not_found"}), 404
-    return jsonify(state)
+    wait = job_health.wait_info(OUTPUT_DIR / job_id, state, job_id in _active_jobs)
+    return jsonify(dict(state, elapsed_seconds=_job_elapsed_seconds(job_id, state), wait=wait))
 
 
 @app.route("/api/items/<job_id>")
@@ -537,10 +946,16 @@ def download_zip(job_id):
         raise
 
 
+# 手直し・採用・採用分ZIP（ディレクター向けの追加API）
+director_routes.register(app, login_required, lambda: OUTPUT_DIR,
+                         lambda job_dir: _image_snapshot(job_dir)["items"])
+
+
 if __name__ == "__main__":
+    recover_interrupted_jobs()
     port = int(os.environ.get("PORT", 3001))
     print("\n" + "=" * 50)
-    print("  図解つくーる 起動中...")
+    print("  図解スタジオ 起動中...")
     print(f"  http://localhost:{port}")
     print("=" * 50 + "\n")
     app.run(host="0.0.0.0", port=port, debug=False)

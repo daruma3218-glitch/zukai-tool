@@ -17,7 +17,11 @@ from utils import (
     save_json,
 )
 from extractor import analyze_manuscript, extract_visual_points
-from prompter import generate_all_prompts
+from prompter import generate_all_prompts, CANDIDATE_MODES, MAP_MODES
+import candidates
+import map_renderer
+from job_control import check_cancel
+from image_resources import IMAGE_TASK_LIMIT
 from generator import (
     run_parallel_generation,
     DEFAULT_CONCURRENCY,
@@ -45,14 +49,20 @@ class DiagramPipeline:
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
         item_callback: Optional[Callable] = None,
+        candidate_mode: str = "single",
+        map_mode: str = "ai",
+        cancel_check=None,
     ):
+        self.candidate_mode = candidate_mode if candidate_mode in CANDIDATE_MODES else "single"
+        self.map_mode = map_mode if map_mode in MAP_MODES else "ai"
+        self.cancel_check = cancel_check
         self.manuscript_text = manuscript_text
         self.output_dir = Path(output_dir)
         self.target_count = max(1, min(target_count, 200))
         self.user_instructions = user_instructions
         self.worldview_preset = (worldview_preset or "").strip()
         self.no_text_mode = bool(no_text_mode)
-        self.concurrency = concurrency
+        self.concurrency = max(1, min(concurrency, IMAGE_TASK_LIMIT))
         self.provider = provider if provider in VALID_PROVIDERS else PROVIDER_NANOBANANA
         self.openai_quality = openai_quality
         self.openai_model = (openai_model or "").strip() or None
@@ -120,6 +130,7 @@ class DiagramPipeline:
 
     # ---- メインフロー ----
     def run(self) -> dict:
+        check_cancel(self.cancel_check)
         client = get_anthropic_client()
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         openai_key = os.environ.get("OPENAI_API_KEY", "")
@@ -139,7 +150,8 @@ class DiagramPipeline:
         # Phase 1: 原稿分析
         self._progress(1, "原稿を分析中...", 3)
         self._log("analyze", "ASTRAで原稿の全体構造を分析しています...")
-        analysis = analyze_manuscript(client, self.manuscript_text, log=self._log)
+        analysis = analyze_manuscript(client, self.manuscript_text, log=self._log, cancel_check=self.cancel_check)
+        check_cancel(self.cancel_check)
         title = analysis.get("title", "無題")
         sections = analysis.get("sections", [])
         keywords = analysis.get("keywords", [])
@@ -165,7 +177,9 @@ class DiagramPipeline:
             target_count=self.target_count,
             user_instructions=self.user_instructions,
             log=self._log,
+            cancel_check=self.cancel_check,
         )
+        check_cancel(self.cancel_check)
         save_json(self.output_dir / "excerpts.json", {"items": excerpts})
         self._log("extract", f"抽出完了: {len(excerpts)} 個")
         self._progress(1, f"抽出完了: {len(excerpts)} 個の視覚化ポイント", 25)
@@ -196,10 +210,30 @@ class DiagramPipeline:
             no_text_mode=self.no_text_mode,
             max_workers=5,
             log=self._log,
+            candidate_mode=self.candidate_mode,
+            map_mode=self.map_mode,
+            cancel_check=self.cancel_check,
         )
-        save_json(self.output_dir / "prompts.json", {"items": prompts})
+        check_cancel(self.cancel_check)
         self._log("prompter", f"プロンプト生成完了: {len(prompts)} 件")
-        self._progress(2, f"プロンプト生成完了: {len(prompts)} 件", 45)
+
+        # 候補（複数案）と地図を、1枚ずつの生成項目に展開する。1案なら従来と同じ番号・ファイル名。
+        groups = prompts
+        prompts = candidates.expand(groups, self.candidate_mode, self.map_mode,
+                                    map_enabled=map_renderer.enabled(), no_text=self.no_text_mode)
+        plan = candidates.plan_counts(prompts)
+        if self.candidate_mode != "single" or plan["maps"]:
+            save_json(self.output_dir / "prompt_groups.json", {"items": groups})
+            self._log("prompter", f"{plan['groups']}箇所 → 画像 {plan['images']}枚"
+                      f"（画像AI {plan['ai_images']}枚・地図データ {plan['maps']}枚）")
+        save_json(self.output_dir / "prompts.json", {"items": prompts})
+        with self._items_lock:
+            self._items = {p["index"]: {"index": p["index"], "status": "pending",
+                                        **{k: p.get(k, "") for k in ("section", "excerpt", "keypoint", "type",
+                                                                     "group", "variant", "variant_label")}}
+                           for p in prompts}
+        self._dump_progress_snapshot()
+        self._progress(2, f"プロンプト生成完了: {len(prompts)} 枚分", 45)
 
         # Phase 3: 並列画像生成
         provider_label = "nanobanana (Gemini)" if self.provider == PROVIDER_NANOBANANA else "gpt-image (OpenAI)"
@@ -220,7 +254,9 @@ class DiagramPipeline:
             openai_model=self.openai_model,
             concurrency=self.concurrency,
             progress_callback=self._on_item_event,
+            cancel_check=self.cancel_check,
         )
+        check_cancel(self.cancel_check)
 
         # 結果サマリ
         success_count = sum(1 for r in results if r.get("success"))
@@ -244,6 +280,12 @@ class DiagramPipeline:
             "provider": self.provider,
             "openai_quality": self.openai_quality if self.provider == PROVIDER_GPT_IMAGE else None,
             "openai_model": self.openai_model,
+            "candidate_mode": self.candidate_mode,
+            "map_mode": self.map_mode,
+            "groups": plan["groups"],
+            "images_planned": plan["images"],
+            "ai_images": plan["ai_images"],
+            "maps": plan["maps"],
             "succeeded": success_count,
             "failed": fail_count,
             "items": results,
