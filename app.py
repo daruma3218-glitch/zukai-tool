@@ -37,6 +37,7 @@ from job_control import Cancellation, JobCancelled
 from generator import (PROVIDER_NANOBANANA, PROVIDER_GPT_IMAGE, VALID_PROVIDERS,
                        OPENAI_IMAGE_MODEL_CHOICES, DEFAULT_GEMINI_MODEL, resolve_openai_image_model, resolve_edit_model)
 from prompter import CANDIDATE_MODES, MAP_MODES
+import cloudflare_access
 import director_routes
 import image_edit
 import map_renderer
@@ -93,6 +94,15 @@ _recovered_roots = set()
 
 
 # ====== 認証 ======
+@app.before_request
+def accept_cloudflare_access():
+    """新しい入口（zukai.apprendre.jp・Cloudflare のログイン）を通った人は、パスワードなしでログイン済みにする（2026-10-14）。
+    今までの住所とパスワードはそのまま使える（並行の期間）。証明は署名・発行元・宛先・期限をすべて確かめる（cloudflare_access）。"""
+    if APP_PASSWORD and not session.get("authenticated") and cloudflare_access.verified_email(request.headers):
+        session.permanent = True
+        session["authenticated"] = True
+
+
 def login_required(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
