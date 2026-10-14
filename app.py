@@ -138,8 +138,9 @@ def key_attribution():
 @app.route("/version")
 def version():
     """Render が実際にどの版を動かしているかの軽量診断（認証不要・秘密情報なし）。"""
-    from extractor import CLAUDE_MODEL as EXTRACTOR_MODEL
+    from extractor import CLAUDE_MODEL as EXTRACTOR_MODEL, MAP_SHARE_LIMIT
     from prompter import CLAUDE_MODEL as PROMPTER_MODEL
+    import retype
     import subscription_runtime
     return jsonify({
         "service": "zukai-tool",
@@ -161,6 +162,10 @@ def version():
         "wait_guidance": {"version": 1, "after_seconds": job_health.WAIT_SECONDS, "automatic_cancel": False},
         "selection_workflow": {"version": 1, "chapter_filter": True, "unselected_groups": True,
                                "revision_marks": True, "browser_resume": True},
+        # 地図の出しすぎ対策と、別の種類で作り直すボタン（2026-10-14）
+        "map_fit": {"version": 1, "map_share_limit": MAP_SHARE_LIMIT, "place_name_alone_is_not_map": True,
+                    "retype_targets": list(retype.TARGETS), "retype_concurrency": image_edit.RETYPE_CONCURRENCY,
+                    "learns_from_retype": True},
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
         # 従量APIへの明示の切り替え（既定オフ・2026-09-28）。ツール名・環境変数の名前・真偽値だけ
         "llm_api_switch": subscription_runtime.api_switch_status(),

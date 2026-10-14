@@ -39,9 +39,11 @@ def register(app, login_required, output_dir_getter, items_getter):
     @login_required
     def director_edit(job_id):
         body = request.get_json(silent=True) or {}
+        target = body.get("target_type", "")
         try:
             entry = image_edit.request_edit(job_dir_for(job_id), body.get("source", ""),
-                                            body.get("action", ""), body.get("instruction", ""))
+                                            body.get("action", ""), body.get("instruction", ""),
+                                            target_type=target if isinstance(target, str) else "")
         except (image_edit.EditError, FileNotFoundError, TimeoutError) as exc:
             return fail(exc)
         return jsonify({"edit": entry, "edits": image_edit.load_edits(job_dir_for(job_id))})

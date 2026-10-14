@@ -8,16 +8,86 @@
 
 import json
 import os
+import re
 import time
 from typing import Callable, Optional
 
 import anthropic
 
+import type_feedback
 from utils import claude_query, parse_json_object, parse_json_array
 
 
 # 原稿全体の文脈と図解する箇所をASTRAで判定する。
 CLAUDE_MODEL = os.environ.get("EXTRACTOR_MODEL", "").strip() or "gpt-6-astra"
+
+VALID_TYPES = ("illustration", "realphoto", "map", "diagram", "chart")
+# 地図が合わなかった時の代わりの種類（map_alt）。
+ALT_TYPES = ("illustration", "realphoto", "diagram")
+# 地図は全体の2割まで（2026-10-14）。地名が出るだけで地図になり、地図が3割を超えた回があったため。
+MAP_SHARE_LIMIT = 0.2
+# 上限を超えた時に残す地図を選ぶ手がかり（位置関係を表す言葉）。判断の主役は ASTRA の type。
+GEO_RELATION_WORDS = (
+    "国境", "接し", "接す", "隣", "回廊", "飛び地", "距離", "キロ", "位置", "地図", "ルート", "経由", "結ぶ",
+    "沿岸", "対岸", "海峡", "半島", "航路", "海路", "陸路", "空路", "北上", "南下", "東進", "西進", "進軍",
+    "侵攻", "領土", "割譲", "国土", "広大", "挟ま", "囲ま", "東端", "西端", "前線",
+)
+
+# 画像の種類の決め方。地名・国名が出るだけで地図にしないよう、2026-10-14 に見直した。
+TYPE_RULES = """typeは内容に最適なものを選ぶ:
+   - illustration: 人物・物・シーン・出来事のイラスト的描写
+   - realphoto: 都市・建物・施設・記念碑や像・インフラ・会談・事件・戦争・人々の生活など「実写写真」が映えるシーン
+     （例:「天然ガス施設」「政府庁舎」「工場」「住民のデモ」「夜の都市」「首脳の会談」「広場の記念碑」など物理的な実景）
+   - map: 「どこにあるか・どこと接しているか・どこからどこへ」という位置関係そのものが、その文の要点の時だけ
+     （国境・隣国との接し方・回廊や飛び地・距離・領土や勢力の広がり・進軍や移動のルート・航路や送電線のつながり）
+   - diagram: 仕組み・概念・フロー・構造・対比
+   - chart: 数値比較・統計・割合・推移
+
+【map にするかの決め方（地図の出しすぎを防ぐ）】
+地名・国名・都市名が出てくるだけでは map にしない。「視聴者は地図で場所を見ないと、この文が分からないか」で決める。
+場所が話の舞台・肩書き・国籍・たとえにすぎず、文の主役が人・物・出来事・制度・気持ちなら、その主役を描く。
+- 「ロシアの実業家は〜」「フランスでの会談で〜」「首都にある像を郊外へ移した」「このパスポートなら両方へ渡航できる」
+  → 人物・会談・像・パスポートと国旗を描く（realphoto / illustration）。map にしない
+- 事件・テロ・紛争・併合・戦争が起きたこと自体が要点の文 → その出来事の場面（realphoto / illustration）。
+  どこからどこへ攻め込んだか・どこに挟まれているか、など位置関係が要点の時だけ map
+- 別の国・地域をたとえや比較に出す文（日本の藩、フランスの言語政策など）→ diagram / illustration
+- 話の導入・つなぎ・まとめの一言（「では最後に〜を見ていきましょう」「幸運な変化もありました」）→ map にしない
+- 昔の国・昔の国境（○○共和国の版図、○○分割、帝国の領土の移り変わり）が要点の文 → 地図は今の国境でしか描けないので
+  map にせず、diagram（勢力の移り変わりの図）か illustration にする
+- 町の中の距離・村・川の対岸など、国の地図では見えない狭い範囲の話 → その場所の実景（realphoto）
+- 地図が続く場面では、位置関係が新しく加わる文だけを map にし、同じ地図の繰り返しになる文は別の種類にする
+- map は、地理そのものが主題の原稿でも全体の2割まで。多くの原稿では1割未満になる
+map を選んだ項目には、地図で見せる位置関係を "map_focus" に短く書く（例:「回廊と、それを挟む2つの国の位置」）。
+書けない時は map にしない。あわせて、地図が合わなかった時の代わりの種類を "map_alt"（illustration / realphoto / diagram）に入れる。"""
+
+
+def _map_score(item: dict) -> int:
+    text = f"{item.get('excerpt', '')} {item.get('map_focus', '')}"
+    return (2 if item.get("map_focus") else 0) + min(3, sum(1 for word in GEO_RELATION_WORDS if word in text))
+
+
+def limit_maps(items: list, user_instructions: str = "", log: Optional[Callable] = None) -> int:
+    """地図が全体の2割を超えたら、位置関係が要点の項目だけ地図に残し、残りは代わりの種類にする。
+
+    地図について指示がある時（「地図を多めに」など）は、その指示に任せて数を変えない。戻り値は変えた数。
+    """
+    log = log or (lambda *a, **kw: None)
+    maps = [item for item in items if item.get("type") == "map"]
+    limit = max(2, int(len(items) * MAP_SHARE_LIMIT))
+    if len(maps) <= limit or re.search(r"地図|マップ", user_instructions or ""):
+        return 0
+    ranked = sorted(maps, key=lambda item: (-_map_score(item), item.get("index", 0)))
+    keep = {id(item) for item in ranked[:limit]}
+    changed = 0
+    for item in maps:
+        if id(item) in keep:
+            continue
+        item["type"] = item.get("map_alt") if item.get("map_alt") in ALT_TYPES else "illustration"
+        item["map_limited"] = True
+        changed += 1
+    log("extractor", f"地図の割合を調整: 地図 {len(maps)} → {limit} 個（{changed} 個を代わりの種類へ）",
+        f"上限は全体の{int(MAP_SHARE_LIMIT * 100)}%")
+    return changed
 
 
 def analyze_manuscript(
@@ -74,8 +144,11 @@ def extract_visual_points(
     user_instructions: str = "",
     log: Optional[Callable] = None,
     cancel_check=None,
+    type_examples: Optional[list] = None,
 ) -> list:
     """原稿からN個の視覚化ポイントを抽出する。
+
+    type_examples は、過去にディレクターが種類を直した例（type_feedback.examples）。判定の参考に渡す。
 
     【重要】ハルシネーション防止のため、すべて原文ママの文字列を使う:
         - excerpt: 原稿そのままの一節（1〜3文）
@@ -106,6 +179,8 @@ def extract_visual_points(
 【ユーザーからの指示（最優先で従うこと）】
 {user_instructions.strip()}
 """
+    # ディレクターが直した例は、指示の後ろに置く（指示が最優先）
+    user_block += type_feedback.prompt_block(type_examples or [])
 
     system = (
         "あなたは動画演出家・ビジュアルディレクターです。"
@@ -146,13 +221,7 @@ def extract_visual_points(
 4. 各抜粋は**原稿に実在する文章**を使う（要約や創作は絶対禁止）
 5. 抜粋は1〜3文程度（長すぎず短すぎず、視覚化に必要な情報を含む）
 6. 重要な数値・固有名詞・地名・概念・人物・出来事を優先
-7. typeは内容に最適なものを選ぶ:
-   - illustration: 人物・物・シーン・出来事のイラスト的描写
-   - realphoto: 都市・建物・施設・インフラ・事件・戦争・人々の生活など「実写写真」が映えるシーン
-     （例:「天然ガス施設」「政府庁舎」「工場」「住民のデモ」「夜の都市」など物理的な実景）
-   - map: 地名・場所・地理的位置関係
-   - diagram: 仕組み・概念・フロー・構造
-   - chart: 数値比較・統計・割合・推移
+7. {TYPE_RULES}
 
 【最重要: ハルシネーション禁止】
 - keypoint は**抜粋内の単語のみで構成**された短いフレーズにすること（要約禁止、原文ママ）
@@ -180,11 +249,14 @@ JSON配列のみで返すこと（前置き・後書き・コードブロック�
     "index": 2,
     "excerpt": "...",
     "section": "...",
-    "type": "diagram",
+    "type": "map",
+    "map_focus": "地図で見せる位置関係（type が map の項目だけ）",
+    "map_alt": "realphoto",
     "keypoint": "...",
     "allowed_terms": ["..."]
   }}
 ]
+map_focus と map_alt は type が map の項目だけに付ける。
 
 合計**{target_count}個**返すこと。それ未満は無効です。"""
 
@@ -216,10 +288,12 @@ JSON配列のみで返すこと（前置き・後書き・コードブロック�
 - 原稿の順番通り
 - 必ず{remaining}個返す
 - 同じJSON形式で返す（index は {len(excerpts) + 1} から始める）
+- excerpt は原稿に実在する文章（原文ママ）。allowed_terms は excerpt 内に実在する語句だけ
+- {TYPE_RULES}
 
 JSON配列のみで返すこと:
 [
-  {{"index": {len(excerpts) + 1}, "excerpt": "...", "section": "...", "type": "...", "keypoint": "..."}}
+  {{"index": {len(excerpts) + 1}, "excerpt": "...", "section": "...", "type": "...", "keypoint": "...", "allowed_terms": ["..."]}}
 ]"""
         log("extractor", f"補充リクエスト（残り {remaining} 個）...")
         result2 = claude_query(client, supplement_query, system, max_tokens=10000, model=CLAUDE_MODEL, workload="diagram_selection", cancel_check=cancel_check)
@@ -233,8 +307,17 @@ JSON配列のみで返すこと:
     for i, e in enumerate(excerpts[:target_count]):
         e["index"] = i + 1
         # type のデフォルト値
-        if e.get("type") not in ("illustration", "realphoto", "map", "diagram", "chart"):
+        if e.get("type") not in VALID_TYPES:
             e["type"] = "illustration"
+        # 地図の項目だけ、見せる位置関係と代わりの種類を持つ（画面のおすすめと割合の調整に使う）
+        if e["type"] == "map":
+            focus = e.get("map_focus")
+            e["map_focus"] = focus.strip()[:80] if isinstance(focus, str) else ""
+            if e.get("map_alt") not in ALT_TYPES:
+                e["map_alt"] = ""
+        else:
+            e.pop("map_focus", None)
+            e.pop("map_alt", None)
         # 必須フィールドの補完
         e.setdefault("section", "")
         e.setdefault("excerpt", "")
@@ -267,6 +350,7 @@ JSON配列のみで返すこと:
 
     final = excerpts[:target_count]
     log("extractor", f"最終抽出数: {len(final)} 個")
+    limit_maps(final, user_instructions, log)
 
     # 不足分をダミーで埋める（保険）
     while len(final) < target_count:

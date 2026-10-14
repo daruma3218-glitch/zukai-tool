@@ -3,6 +3,8 @@
 
 - 左右反転: AI を使わずその場で作る（費用なし）。
 - 文字を全部消す / 指示して直す: OpenAI の画像編集（既定 gpt-image-2.5-sunburst）。1回で画像1枚分の費用。
+- 別の種類で作り直す（2026-10-14・retype.py）: 地図を図解・イラスト・実写風にするなど、同じ抜粋から作り直す。
+  生成時と同じ画像モデルで1枚分の費用（地図にする時は画像代なし）。順番待ちで受け付け、同時に進める数を絞る。
 - 元の画像は上書きしない。直した画像は diagram_012__e1.png のような別ファイル（版）として保存し、
   edits.json に記録する。
 - どの画像を使うかは adoption.json に「採用」として記録し、採用分だけ ZIP で取り出せる。
@@ -30,12 +32,18 @@ from image_resources import image_task
 import generator
 import resource_diagnostics
 import retention
+import retype
+import type_feedback
 
 EDITS_NAME = "edits.json"
 ADOPTION_NAME = "adoption.json"
 SELECTION_NAME = "selection.json"
 LOCK_TIMEOUT = 10.0
 MAX_RUNNING_EDITS_PER_JOB = 3
+# 作り直しは何枚もまとめて押されるので、順番待ちで受け付け、同時に進める数だけを絞る。
+MAX_ACTIVE_RETYPES_PER_JOB = 30
+RETYPE_CONCURRENCY = max(1, min(int(os.environ.get("ZUKAI_RETYPE_CONCURRENCY", "2") or 2), 4))
+_RETYPE_SLOTS = threading.BoundedSemaphore(RETYPE_CONCURRENCY)
 ACTIVE_EDIT_STATUSES = {"queued", "running"}
 # The deployed service has one worker. A fresh worker cannot own old threads.
 PROCESS_OWNER = f"{os.getpid()}-{uuid.uuid4().hex}"
@@ -54,8 +62,9 @@ INSTRUCT_SUFFIX = (
     "\n\nOnly change what is requested above. Keep everything else in the image exactly the same: "
     "composition, style, colors, other objects and any existing text that is not mentioned."
 )
-ACTIONS = {"flip", "remove_text", "instruct"}
-ACTION_LABELS = {"flip": "左右反転", "remove_text": "文字を全部消す", "instruct": "指示して直す"}
+ACTIONS = {"flip", "remove_text", "instruct", "retype"}
+ACTION_LABELS = {"flip": "左右反転", "remove_text": "文字を全部消す", "instruct": "指示して直す",
+                 "retype": "別の種類で作り直し"}
 
 
 class EditError(ValueError):
@@ -249,35 +258,66 @@ def _next_edit_name(job_dir: Path, source: str, edits: list) -> str:
 
 # ===== 手直し =====
 def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
-                 run_async: bool = True, client_factory=None) -> dict:
-    """手直しを受け付け、記録の1件を返す。左右反転はその場で完了、AIの手直しは別スレッドで進める。"""
+                 run_async: bool = True, client_factory=None, target_type: str = "",
+                 retype_runner=None) -> dict:
+    """手直しを受け付け、記録の1件を返す。左右反転はその場で完了、AIの手直しは別スレッドで進める。
+
+    action="retype" は target_type（diagram / illustration / realphoto / map）の種類で、同じ抜粋から作り直す。
+    retype_runner はテスト用（設計と生成の代わり）。
+    """
     job_dir = Path(job_dir)
     if action not in ACTIONS:
         raise EditError("手直しの種類が不正です")
     instruction = (instruction or "").strip()
+    target_type = (target_type or "").strip() if action == "retype" else ""
+    plan = settings = None
+    if action == "retype":
+        if target_type not in retype.TARGETS:
+            raise EditError("作り直す種類が不正です")
+        try:
+            plan = retype.plan_item(job_dir, source)
+            settings = retype.job_settings(job_dir)
+        except retype.RetypeError as exc:
+            raise EditError(str(exc)) from None
+        if retype.original_type(plan) == target_type:
+            raise EditError("元の画像と同じ種類です。直したい時は「指示して直す」をお使いください")
+        source, instruction = plan["filename"], ""  # 版を指していても、元の候補にひも付ける
     if action == "instruct" and not instruction:
         raise EditError("直してほしい内容を入力してください")
     if len(instruction) > 1000:
         raise EditError("指示は1000文字以内にしてください")
     source_path = _image_path(job_dir, source)
-    model = "" if action == "flip" else generator.resolve_edit_model()
-    if action != "flip" and not os.environ.get("OPENAI_API_KEY") and client_factory is None:
-        raise EditError("OPENAI_API_KEY が設定されていないため、AIの手直しは使えません")
+    if action == "retype":
+        model = retype.model_label(target_type, settings)
+        key = retype.required_key(target_type, settings)
+        if key and not os.environ.get(key) and retype_runner is None:
+            raise EditError(f"{key} が設定されていないため、作り直せません")
+    else:
+        model = "" if action == "flip" else generator.resolve_edit_model()
+        if action != "flip" and not os.environ.get("OPENAI_API_KEY") and client_factory is None:
+            raise EditError("OPENAI_API_KEY が設定されていないため、AIの手直しは使えません")
+    label = f"{retype.LABELS[target_type]}で作り直し" if action == "retype" else ACTION_LABELS[action]
 
     def reserve(data):
         edits = data.setdefault("edits", [])
         _mark_stale(edits, job_dir)
         running = [e for e in edits if e.get("status") in ACTIVE_EDIT_STATUSES]
         for e in running:  # 同じ依頼の二重送信は、進行中の1件を返して重複させない
-            if e.get("source") == source and e.get("action") == action and e.get("instruction") == instruction:
+            if (e.get("source") == source and e.get("action") == action and e.get("instruction") == instruction
+                    and e.get("target_type", "") == target_type):
                 return dict(e, duplicate=True)
-        if action != "flip" and len(running) >= MAX_RUNNING_EDITS_PER_JOB:
+        if action == "retype":
+            if sum(e.get("action") == "retype" for e in running) >= MAX_ACTIVE_RETYPES_PER_JOB:
+                raise EditError(f"作り直しの順番待ちが{MAX_ACTIVE_RETYPES_PER_JOB}件に達しました。終わるまでお待ちください")
+        elif action != "flip" and sum(e.get("action") != "retype" for e in running) >= MAX_RUNNING_EDITS_PER_JOB:
             raise EditError(f"同時に進められる手直しは{MAX_RUNNING_EDITS_PER_JOB}件までです。終わるまでお待ちください")
         entry = {"id": uuid.uuid4().hex[:12], "source": source,
                  "output": _next_edit_name(job_dir, source, edits), "action": action,
-                 "label": ACTION_LABELS[action], "instruction": instruction, "model": model,
+                 "label": label, "instruction": instruction, "model": model,
                  "status": "queued", "owner": PROCESS_OWNER, "error": "",
                  "created_at": datetime.now().isoformat(timespec="seconds")}
+        if action == "retype":
+            entry["target_type"] = target_type
         edits.append(entry)
         return dict(entry)
 
@@ -291,6 +331,12 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
         cleanup_lock.unlink(missing_ok=True)
     if entry.get("duplicate"):
         return entry
+    if action == "retype":
+        try:  # 「この文はこの種類ではなかった」を、次の回の抽出の例として残す
+            type_feedback.record(job_dir.parent, plan.get("excerpt", ""), retype.original_type(plan),
+                                 target_type, job_dir.name)
+        except OSError:
+            pass  # 例が書けなくても、作り直しは進める
     output_path = job_dir / "images" / entry["output"]
 
     def started():
@@ -327,7 +373,17 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
 
     prompt = REMOVE_TEXT_PROMPT if action == "remove_text" else instruction + INSTRUCT_SUFFIX
 
-    def work():
+    def retype_work():
+        ok, error = False, ""
+        with _RETYPE_SLOTS:  # 順番待ち（queued）のまま、空いたら設計と生成を始める
+            try:
+                started()
+                ok, error = (retype_runner or retype.run)(job_dir, plan, target_type, settings, entry["output"])
+            except Exception as exc:
+                ok, error = False, str(exc)
+        finish(ok, "" if ok else retype.friendly_error(error))
+
+    def edit_work():
         client = None
         try:
             if client_factory is not None:
@@ -348,6 +404,7 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
                     pass
         finish(ok, error)
 
+    work = retype_work if action == "retype" else edit_work
     if run_async:
         try:
             threading.Thread(target=work, name=f"zukai-edit-{entry['id']}", daemon=True).start()
@@ -419,8 +476,10 @@ def adopted_zip(job_dir: Path, items: list, title: str, start: int = 1) -> tuple
             name = f"{number:0{width}d}_{label}{path.suffix}" if label else f"{number:0{width}d}{path.suffix}"
             zf.write(path, name)
             edit = edits.get(filename, {})
+            # 別の種類で作り直した版は、作り直した後の種類を書く（元が地図でも「図解」など）
+            kind = retype.LABELS.get(edit.get("target_type"), "") if edit.get("action") == "retype" else ""
             rows.append([number, name, filename, item.get("group") or item.get("index") or "", item.get("variant", ""),
-                         item.get("variant_label", ""), edit.get("label", ""), item.get("section", ""),
+                         kind or item.get("variant_label", ""), edit.get("label", ""), item.get("section", ""),
                          item.get("excerpt", "")])
         count = len(rows)
         buffer = io.StringIO()
