@@ -264,6 +264,7 @@
           <button onclick="editImage('instruct')" class="px-3 py-1.5 rounded-lg text-sm border border-purple-400 text-purple-700 hover:bg-purple-50">指示して直す</button>
         </div>
         <p class="text-[11px] text-gray-400 mt-1">左右反転は費用なし。文字消し・指示直しは画像1枚分の費用（GPT Image 2.5 Sunburst）。元の画像は残り、直した画像は別の版として下に並びます。</p>
+        <div id="retypeRow" class="mt-2 flex flex-wrap items-center gap-2"></div>
         <p id="editStatus" class="text-xs mt-1"></p>
         <p id="modalRevisionError" class="hidden mt-1 text-xs text-red-700" role="alert"></p>
         <div id="versionStrip" class="mt-2 flex gap-2 overflow-x-auto"></div>
@@ -358,9 +359,40 @@
     function isAdopted(item) {
       return !!item.filename && adoptedVersionsOf(item.filename).length > 0;
     }
+
+    // ===== 別の種類で作り直す（地図をやめる など） =====
+    const RETYPE_LABELS = { diagram: '図解', illustration: 'イメージ画像', realphoto: '実写風', map: '地図' };
+    let retypeNotice = null;  // {idx, message} 作り直しを受け付けられなかった理由（そのカードに出す）
+    function originalType(item) { return item.render === 'map' ? 'map' : (item.type || ''); }
+    function retypesFor(filename) { return editsFor(filename).filter(e => e.action === 'retype'); }
+    function latestRetype(filename) {
+      const done = retypesFor(filename).filter(e => e.status === 'ok');
+      return done.length ? done[done.length - 1] : null;
+    }
+    // カードには、作り直した最新の版を出す（元の画像は拡大画面の「元の画像」に残る）
+    function displayFile(item) {
+      const latest = item.filename ? latestRetype(item.filename) : null;
+      return latest ? latest.output : item.filename;
+    }
+    function retypeRowHtml(item) {
+      const active = retypesFor(item.filename).filter(e => ['queued', 'running'].includes(e.status));
+      const recommended = RETYPE_LABELS[item.map_alt] && item.map_alt !== 'map' ? item.map_alt : '';
+      const buttons = ['diagram', 'illustration', 'realphoto'].map(t => {
+        const busy = active.some(e => e.target_type === t);
+        const strong = t === recommended;
+        return `<button type="button" onclick="event.stopPropagation(); retypeImage(${item.index}, '${t}')" ${busy ? 'disabled' : ''} title="${RETYPE_LABELS[t]}で作り直します。元の地図は残ります。" class="rounded px-1.5 py-0.5 text-[11px] disabled:opacity-60 ${strong ? 'bg-sky-700 text-white hover:bg-sky-800' : 'border border-sky-300 bg-white text-sky-800 hover:bg-sky-100'}">${busy ? '作成中…' : RETYPE_LABELS[t]}</button>`;
+      }).join('');
+      const notice = retypeNotice && retypeNotice.idx === item.index
+        ? `<p class="mt-1 text-[10px] text-red-700" role="alert">${escapeHtml(retypeNotice.message)}</p>` : '';
+      return `<div class="border-t border-sky-100 bg-sky-50 px-2 py-1.5">
+          <p class="mb-1 text-[10px] text-sky-900">地図をやめて作り直す${recommended ? `（おすすめ：${RETYPE_LABELS[recommended]}）` : ''}</p>
+          <div class="flex flex-wrap gap-1">${buttons}</div>${notice}
+        </div>`;
+    }
     function cardSignature(item) {
       const edits = item.filename ? editsFor(item.filename).map(e => e.status).join('') : '';
-      return `${item.status}|${item.filename || ''}|${isAdopted(item)}|${edits}|${revisionSet.has(item.filename)}|${revisionBusy}`;
+      const notice = retypeNotice && retypeNotice.idx === item.index ? retypeNotice.message : '';
+      return `${item.status}|${item.filename || ''}|${isAdopted(item)}|${edits}|${revisionSet.has(item.filename)}|${revisionBusy}|${notice}`;
     }
 
     // ===== 選定の絞り込み・前回の位置 =====
@@ -502,7 +534,7 @@
         inner = `
           <div class="aspect-video bg-gray-100 overflow-hidden cursor-pointer pop-in"
                onclick='openModal(${idx})'>
-            <img src="/results/${JOB_ID}/images/${filename}" alt="${keypoint}" class="w-full h-full object-cover" loading="lazy">
+            <img src="/results/${JOB_ID}/images/${displayFile(item)}" alt="${keypoint}" class="w-full h-full object-cover" loading="lazy">
           </div>
           <div class="px-2 py-1.5 bg-white">
             <p class="text-[10px] text-gray-400 truncate">${section}</p>
@@ -544,13 +576,18 @@
       const number = `${String(item.group ?? idx).padStart(3, '0')}${item.variant || ''}`;
       const adopted = isAdopted(item);
       const edits = filename ? editsFor(filename) : [];
-      const running = edits.some(e => ['queued', 'running'].includes(e.status));
-      const typeBadge = (item.variant || item.render === 'map') && item.variant_label
-        ? `<span class="absolute bottom-20 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(item.variant_label)}</span>` : '';
+      const active = edits.filter(e => ['queued', 'running'].includes(e.status));
+      const running = active.length > 0;
+      const shownRetype = filename ? latestRetype(filename) : null;
+      const typeLabel = shownRetype ? `${RETYPE_LABELS[shownRetype.target_type] || ''}（作り直し）`
+        : (item.variant || item.render === 'map') && item.variant_label ? item.variant_label : '';
+      const typeBadge = typeLabel
+        ? `<span class="absolute top-9 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(typeLabel)}</span>` : '';
+      const retypeRow = status === 'ok' && filename && originalType(item) === 'map' ? retypeRowHtml(item) : '';
       const adoptBtn = status === 'ok' && filename
         ? `<button type="button" title="採用する（もう一度押すと取り消し）" onclick="event.stopPropagation(); toggleCardAdopted(${idx})" class="absolute top-1 right-1 z-10 w-7 h-7 rounded-full ${adopted ? 'bg-amber-400 text-white' : 'bg-black/40 text-white hover:bg-amber-400'} text-sm leading-7 text-center">${adopted ? '★' : '☆'}</button>` : '';
       const editBadge = edits.length
-        ? `<span class="absolute top-1.5 right-9 z-10 ${running ? 'bg-yellow-400' : 'bg-purple-600'} text-white text-[10px] px-1.5 py-0.5 rounded">${running ? '直し中' : '直し' + edits.filter(e => e.status === 'ok').length}</span>` : '';
+        ? `<span class="absolute top-1.5 right-9 z-10 ${running ? 'bg-yellow-400' : 'bg-purple-600'} text-white text-[10px] px-1.5 py-0.5 rounded">${running ? (active.some(e => e.action === 'retype') ? '作り直し中' : '直し中') : '直し' + edits.filter(e => e.status === 'ok').length}</span>` : '';
       const needsRevision = revisionSet.has(filename);
       const revisionButton = status === 'ok' && filename
         ? `<button type="button" onclick="toggleRevision(${idx})" aria-pressed="${needsRevision}" ${revisionBusy ? 'disabled' : ''} title="この候補に要修正の印を付けます。手直しや採用のあとも、自分で解除するまで残ります。" class="w-full border-t px-2 py-2 text-xs disabled:opacity-50 ${needsRevision ? 'bg-orange-100 border-orange-200 text-orange-900 font-semibold' : 'bg-gray-50 border-gray-100 text-gray-600 hover:bg-orange-50'}">${needsRevision ? '要修正 ✓（解除）' : '要修正にする'}</button>` : '';
@@ -559,6 +596,7 @@
           <span class="absolute top-1.5 left-1.5 z-10 bg-black/60 text-white text-[10px] font-mono px-1.5 py-0.5 rounded">${number}</span>
           ${adoptBtn}${editBadge}${typeBadge}
           ${inner}
+          ${retypeRow}
           ${revisionButton}
         </div>`;
     }
@@ -920,11 +958,34 @@
         if (versions.length) {
           for (const f of versions) await setAdopted(f, false, item.group ?? item.index);
         } else {
-          await setAdopted(item.filename, true, item.group ?? item.index);
+          // カードに出ている版（作り直した版があればそれ）を採用する
+          await setAdopted(displayFile(item), true, item.group ?? item.index);
         }
       } catch (e) {
         alert(e.message);
       }
+    }
+
+    // 同じ抜粋から、別の種類で1枚作り直す（元の画像は残り、別の版として並ぶ）
+    async function retypeImage(idx, target) {
+      const item = knownItems[idx];
+      if (!item || !item.filename || !RETYPE_LABELS[target]) return;
+      retypeNotice = null;
+      try {
+        const data = await postJson(`/api/edit/${JOB_ID}`, { source: item.filename, action: 'retype', target_type: target });
+        editsList = data.edits || editsList;
+        if (modalState && modalState.idx === idx && data.edit) modalState.pending = data.edit.output;
+      } catch (e) {
+        retypeNotice = { idx, message: e.message };
+        if (modalState && modalState.idx === idx) {
+          const status = document.getElementById('editStatus');
+          status.textContent = e.message;
+          status.className = 'text-xs mt-1 text-red-600';
+        }
+      }
+      rebuildGrid(Object.values(knownItems));
+      if (modalState) renderModal();
+      scheduleEditPoll();
     }
 
     function scheduleEditPoll() {
@@ -1117,7 +1178,7 @@
       const filename = (item && item.filename) || (card && card.getAttribute('data-filename'));
       if (!filename) return;
       rememberSelectionPosition();
-      modalState = { idx, source: filename, shown: filename, pending: null };
+      modalState = { idx, source: filename, shown: (item && displayFile(item)) || filename, pending: null };
       const title = (item && (item.keypoint || (item.excerpt || '').substring(0, 30))) || `図 ${idx}`;
       const prefix = item && item.variant
         ? `No.${String(item.group ?? idx).padStart(3, '0')}${item.variant} ${item.variant_label || ''}　` : '';
@@ -1182,6 +1243,23 @@
       } else if (status.className.indexOf('text-red') === -1) {
         status.textContent = '';
       }
+      renderRetypeRow();
+    }
+
+    function renderRetypeRow() {
+      const row = document.getElementById('retypeRow');
+      const item = modalState && knownItems[modalState.idx];
+      if (!item || !item.filename) { row.innerHTML = ''; return; }
+      const own = originalType(item);
+      const active = retypesFor(item.filename).filter(e => ['queued', 'running'].includes(e.status));
+      const targets = ['diagram', 'illustration', 'realphoto', 'map'].filter(t => t !== own);
+      row.innerHTML = `<span class="text-xs text-gray-600">${own === 'map' ? '地図をやめて作り直す：' : '別の種類で作り直す：'}</span>` +
+        targets.map(t => {
+          const busy = active.some(e => e.target_type === t);
+          const strong = own === 'map' && t === item.map_alt;
+          return `<button type="button" onclick="retypeImage(${item.index}, '${t}')" ${busy ? 'disabled' : ''} class="px-3 py-1.5 rounded-lg text-sm border disabled:opacity-60 ${strong ? 'border-sky-700 bg-sky-700 text-white hover:bg-sky-800' : 'border-sky-300 text-sky-800 hover:bg-sky-50'}">${busy ? `${RETYPE_LABELS[t]}を作成中…` : RETYPE_LABELS[t]}${strong ? '（おすすめ）' : ''}</button>`;
+        }).join('') +
+        '<span class="text-[11px] text-gray-400">同じ抜粋から作り直します。生成時と同じ画像モデルで1枚分の費用（地図は費用なし）。元の画像は残ります。</span>';
     }
 
     function showVersion(output) {

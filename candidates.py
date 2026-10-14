@@ -68,7 +68,8 @@ def expand(prompts: list, candidate_mode: str = "single", map_mode: str = "ai",
                     break
             specs = chosen or [single]
 
-        base = {key: item[key] for key in ("section", "excerpt", "keypoint", "allowed_terms", "used_labels")
+        base = {key: item[key] for key in ("section", "excerpt", "keypoint", "allowed_terms", "used_labels",
+                                           "map_focus", "map_alt", "map_limited")
                 if key in item}
         if no_text or item.get("no_text"):
             base["no_text"] = True

@@ -20,6 +20,7 @@ from extractor import analyze_manuscript, extract_visual_points
 from prompter import generate_all_prompts, CANDIDATE_MODES, MAP_MODES
 import candidates
 import map_renderer
+import type_feedback
 from job_control import check_cancel
 from image_resources import IMAGE_TASK_LIMIT
 from generator import (
@@ -170,6 +171,10 @@ class DiagramPipeline:
             f"原稿から {self.target_count} 個の視覚化ポイントを抽出中...",
             f"目標: {self.target_count} 個 / ユーザー指示: {'あり' if self.user_instructions else 'なし'}",
         )
+        # ディレクターが「地図をやめて作り直す」などで種類を直した例を、次の回の判定に活かす
+        type_examples = type_feedback.examples(self.output_dir.parent)
+        if type_examples:
+            self._log("extract", f"ディレクターが種類を直した例 {len(type_examples)} 件を判定の参考に渡します")
         excerpts = extract_visual_points(
             client,
             self.manuscript_text,
@@ -178,6 +183,7 @@ class DiagramPipeline:
             user_instructions=self.user_instructions,
             log=self._log,
             cancel_check=self.cancel_check,
+            type_examples=type_examples,
         )
         check_cancel(self.cancel_check)
         save_json(self.output_dir / "excerpts.json", {"items": excerpts})
@@ -228,9 +234,10 @@ class DiagramPipeline:
                       f"（画像AI {plan['ai_images']}枚・地図データ {plan['maps']}枚）")
         save_json(self.output_dir / "prompts.json", {"items": prompts})
         with self._items_lock:
+            # map_alt は、地図の項目を別の種類で作り直す時の画面のおすすめに使う
             self._items = {p["index"]: {"index": p["index"], "status": "pending",
                                         **{k: p.get(k, "") for k in ("section", "excerpt", "keypoint", "type",
-                                                                     "group", "variant", "variant_label")}}
+                                                                     "group", "variant", "variant_label", "map_alt")}}
                            for p in prompts}
         self._dump_progress_snapshot()
         self._progress(2, f"プロンプト生成完了: {len(prompts)} 枚分", 45)

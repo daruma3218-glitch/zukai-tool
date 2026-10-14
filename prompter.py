@@ -81,7 +81,9 @@ CANDIDATE_BLOCKS = {
 【候補を型違いで2〜3案】
 各項目について、その文に合う見せ方を種類違いで2〜3案作ること。種類は diagram（図解）/ illustration（イメージ画像）/
 realphoto（実写風）/ map（地図）/ chart（グラフ）から選ぶ。1案目（a）は元の type にする。
-- map は、国・地域・位置関係が文に出てくる項目だけ。chart は、数値の比較・推移が文にある項目だけ。
+- map は、位置関係（どこにあるか・どこと接するか・どこからどこへ）そのものが文の要点の項目だけ。
+  国名・都市名が出てくるだけの項目（人物・会談・像・出来事が主役の文）では map を作らない。
+  chart は、数値の比較・推移が文にある項目だけ。
 - 出力の各項目に "variants": [{"variant": "a", "type": "diagram", "prompt": "..."},
   {"variant": "b", "type": "illustration", "prompt": "..."}] を入れる。"prompt" には a と同じものを入れる。
 - どの案も【必須ルール】をすべて守ること。
@@ -100,6 +102,7 @@ MAP_SPEC_BLOCK = """
   "pins": [{"name": "旅順", "country": "CHN", "lon": 121.26, "lat": 38.81}],
   "arrows": [{"from": "RUS", "to": "旅順", "tone": "main"}]
 }
+- 項目に map_focus（地図で見せる位置関係）がある時は、その位置関係が一目で分かる範囲・強調・ピン・矢印にする。
 - focus: 画面に収める国（ISO 3166-1 alpha-3、1〜8か国）。highlight: 強調する国と色
   （tone は main / compare / neutral / warn / attention）。
 - 話の舞台が大国の一部（極東、黒海沿岸など）の時は、その大国を focus に入れず highlight だけにし、
@@ -244,6 +247,9 @@ JSON配列のみで返すこと（マークダウン禁止）:
             p.setdefault("excerpt", ex.get("excerpt", ""))
             p.setdefault("type", ex.get("type", "illustration"))
             p.setdefault("keypoint", ex.get("keypoint", ""))
+            for key in ("map_focus", "map_alt", "map_limited"):  # 抽出段の判断を画面と作り直しへ引き継ぐ
+                if ex.get(key):
+                    p[key] = ex[key]
             ex_terms = ex.get("allowed_terms", [])
             if not ex_terms:
                 # 安全網: 抽出段で allowed_terms が欠けても（大量件数時の出力切り詰め等）、
@@ -274,6 +280,7 @@ JSON配列のみで返すこと（マークダウン禁止）:
                 "type": t,
                 "keypoint": ex.get("keypoint", ""),
                 "allowed_terms": ex.get("allowed_terms", []),
+                "fallback": True,  # ASTRA の設計が返らなかった印（1枚の作り直しはこの印で止める）
                 **({"no_text": True} if no_text_mode else {}),
             })
     return merged
