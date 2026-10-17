@@ -28,13 +28,14 @@
 
   <!-- Navbar -->
   <nav class="bg-white/80 backdrop-blur border-b border-gray-200 sticky top-0 z-50">
-    <div class="max-w-6xl mx-auto px-6 h-14 flex items-center justify-between">
+    <div class="max-w-6xl mx-auto px-6 min-h-14 py-2 flex flex-wrap gap-2 items-center justify-between">
       <div class="flex items-center gap-2.5">
         <img src="/static/brand/favicon.svg?v=20261016" width="32" height="32" alt="" class="shrink-0">
         <span class="font-bold text-gray-900 text-base">図解スタジオ</span>
         <span class="hidden md:inline text-xs text-gray-400 ml-2">原稿から図解を並列生成</span>
       </div>
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-3">
+        {% include '_hub_link.html' %}
         <span class="hidden md:inline text-xs text-gray-400">ASTRA + GPT Image 2.5 + 地図データ</span>
         <a href="/logout" class="text-xs text-gray-400 hover:text-gray-600 transition">ログアウト</a>
       </div>

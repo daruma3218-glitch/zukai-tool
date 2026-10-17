@@ -43,12 +43,13 @@
 
   <!-- Navbar -->
   <nav class="bg-white/90 backdrop-blur border-b border-gray-200 sticky top-0 z-50">
-    <div class="max-w-7xl mx-auto px-6 h-14 flex items-center justify-between">
+    <div class="max-w-7xl mx-auto px-6 min-h-14 py-2 flex flex-wrap gap-2 items-center justify-between">
       <a href="/" class="flex items-center gap-2.5">
         <img src="/static/brand/favicon.svg?v=20261016" width="32" height="32" alt="" class="shrink-0">
         <span class="font-bold text-gray-900 text-base">図解スタジオ</span>
       </a>
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-3">
+        {% include '_hub_link.html' %}
         <span class="text-xs text-gray-400 font-mono">{{ job_id }}</span>
         <a href="/" class="text-xs text-purple-600 hover:underline">+ 新規ジョブ</a>
       </div>
