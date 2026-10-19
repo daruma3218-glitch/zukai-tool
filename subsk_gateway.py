@@ -50,11 +50,9 @@ DEFAULT_TIMEOUT_SEC = int(os.environ.get("SUBSK_GW_TIMEOUT", "420"))
 def _conf() -> tuple[str, str] | None:
     if os.environ.get("SUBSK_GW", "1").strip() == "0":
         return None
-    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
-    key = os.environ.get("SUPABASE_KEY", "").strip()
-    if not url or not key:
-        return None
-    return url, key
+    # 2026-10-19: 中継の接続先は共通部品が決める（R2 → 中継だけの Supabase → 従来の SUPABASE_*。
+    # 一部だけの設定なら止める）。素材の保存の SUPABASE_* とは別にできる。
+    return _subscription.relay_conf()
 
 
 def _storage(method: str, path: str, body=None, headers=None, timeout: float = 20.0):
@@ -63,6 +61,8 @@ def _storage(method: str, path: str, body=None, headers=None, timeout: float = 2
     if not conf:
         raise RuntimeError("gateway disabled")
     url, key = conf
+    if url.startswith(_subscription.R2_SCHEME):
+        return _subscription.relay_storage(_subscription.relay_r2_conf(), method, path, body, timeout=timeout)
     h = {"Authorization": f"Bearer {key}", "apikey": key}
     if headers:
         h.update(headers)

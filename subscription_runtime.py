@@ -11,6 +11,7 @@ import base64
 import contextlib
 import contextvars
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -726,11 +727,143 @@ def run_local_request(request, cancel_check=None):
     _terminal(request,attempts,"both_cli_unavailable" if len(providers)==2 else "primary_cli_unavailable")
 
 
+# ── 中継の置き場所（2026-10-19 社長「進めよう」）──
+# 中継の箱は、素材の保存に使う Supabase とは別の Cloudflare R2 に置ける。優先は
+#   1) SUBSK_GW_R2_ACCOUNT_ID / SUBSK_GW_R2_ACCESS_KEY_ID / SUBSK_GW_R2_SECRET_ACCESS_KEY（箱の名前は SUBSK_GW_R2_BUCKET・既定 subsk-gateway）
+#   2) SUBSK_GW_SUPABASE_URL / SUBSK_GW_SUPABASE_KEY（中継だけの Supabase プロジェクト）
+#   3) 従来の SUPABASE_URL / SUPABASE_KEY
+# 1) か 2) の設定が一部だけの時は中継を止める（古い置き場所へ黙って戻らない）。
+# 呼び出す側は Supabase Storage の REST の形（/storage/v1/object/...）のままで、R2 の時は relay_storage が読み替える。
+R2_ENV = ("SUBSK_GW_R2_ACCOUNT_ID", "SUBSK_GW_R2_ACCESS_KEY_ID", "SUBSK_GW_R2_SECRET_ACCESS_KEY")
+R2_SCHEME = "r2://"
+
+
+def relay_r2_conf(source=None):
+    """R2 の設定。無ければ None、一部だけ・形が違えば False、そろっていれば dict。"""
+    env = os.environ if source is None else source
+    vals = [str(env.get(k, "") or "").strip() for k in R2_ENV]
+    if not any(vals):
+        return None
+    if not all(vals):
+        return False
+    bucket = str(env.get("SUBSK_GW_R2_BUCKET", "") or "").strip() or BUCKET
+    if not re.fullmatch(r"[0-9a-f]{32}", vals[0]) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", bucket):
+        return False
+    return {"account": vals[0], "access_key": vals[1], "secret": vals[2], "bucket": bucket}
+
+
+def relay_conf(source=None):
+    """中継の接続先 (url, key)。R2 は ("r2://<account>/<bucket>", 秘密鍵)。使えなければ None。"""
+    env = os.environ if source is None else source
+    r2 = relay_r2_conf(env)
+    if r2 is False:
+        return None
+    if r2:
+        return (R2_SCHEME + r2["account"] + "/" + r2["bucket"], r2["secret"])
+    gw_url = str(env.get("SUBSK_GW_SUPABASE_URL", "") or "").strip().rstrip("/")
+    gw_key = str(env.get("SUBSK_GW_SUPABASE_KEY", "") or "").strip()
+    if gw_url or gw_key:
+        return (gw_url, gw_key) if gw_url and gw_key else None
+    url = str(env.get("SUPABASE_URL", "") or "").strip().rstrip("/")
+    key = str(env.get("SUPABASE_KEY") or env.get("SUPABASE_SERVICE_KEY")
+              or env.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    return (url, key) if url and key else None
+
+
+def _hmac_sha256(key, text):
+    return hmac.new(key, text.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _sigv4_authorization(method, uri, query, headers, payload_hash, access_key, secret, amz_date, region="auto"):
+    """AWS 署名 v4 の Authorization の値。headers は小文字の名前（host を含む）。R2 の地域は auto。"""
+    day = amz_date[:8]
+    signed = ";".join(sorted(headers))
+    canonical = "\n".join([method, uri, query, "".join(f"{k}:{str(headers[k]).strip()}\n" for k in sorted(headers)),
+                           signed, payload_hash])
+    scope = f"{day}/{region}/s3/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode("utf-8")).hexdigest()])
+    k = _hmac_sha256(("AWS4" + secret).encode("utf-8"), day)
+    for part in (region, "s3", "aws4_request"):
+        k = _hmac_sha256(k, part)
+    signature = hmac.new(k, to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={signature}"
+
+
+def _r2_request(r2, method, key="", body=None, query=None, timeout=20.0):
+    """R2 の S3 互換 API を SigV4 で1回呼ぶ。(status, bytes)。標準ライブラリだけで動く。"""
+    host = r2["account"] + ".r2.cloudflarestorage.com"
+    uri = "/" + r2["bucket"] + ("/" + urllib.parse.quote(key, safe="/-_.~") if key else "")
+    q = "&".join(urllib.parse.quote(k, safe="-_.~") + "=" + urllib.parse.quote(str(v), safe="-_.~")
+                 for k, v in sorted((query or {}).items()))
+    payload = body if isinstance(body, bytes) else (b"" if body is None else str(body).encode("utf-8"))
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    headers = {"host": host, "x-amz-content-sha256": payload_hash, "x-amz-date": amz_date}
+    if method == "PUT":
+        headers["content-type"] = "application/json"
+    send = {name: value for name, value in headers.items() if name != "host"}
+    send["Authorization"] = _sigv4_authorization(method, uri, q, headers, payload_hash,
+                                                 r2["access_key"], r2["secret"], amz_date)
+    req = urllib.request.Request("https://" + host + uri + ("?" + q if q else ""),
+                                 data=payload if method == "PUT" else None, headers=send, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def _r2_list_names(xml_bytes, prefix):
+    import xml.etree.ElementTree as ET
+    names = []
+    for el in ET.fromstring(xml_bytes).iter():
+        if el.tag.rsplit("}", 1)[-1] == "Key" and el.text and el.text.startswith(prefix):
+            rest = el.text[len(prefix):]
+            if rest and "/" not in rest:  # Supabase の一覧と同じく、その下の直接のファイルだけ
+                names.append(rest)
+    return sorted(names)
+
+
+def relay_storage(r2, method, path, body=None, timeout=20.0):
+    """Supabase Storage の REST の形の呼び出しを R2 へ読み替える。(status, bytes)。
+
+    - POST /storage/v1/object/list/<bucket> {"prefix","limit"} → 一覧（[{"name": ...}] の JSON）
+    - POST|PUT /storage/v1/object/<bucket>/<key> → 置く（上書き）／ GET → 読む ／ DELETE → 消す（成功は 200 に揃える）
+    箱の名前は設定の bucket を使う（path の中の名前は見ない）。
+    """
+    if not isinstance(r2, dict):
+        raise CliFailure("gateway_not_configured")
+    list_prefix, obj_prefix = "/storage/v1/object/list/", "/storage/v1/object/"
+    if path.startswith(list_prefix):
+        req = body if isinstance(body, dict) else json.loads(body or b"{}")
+        prefix = str(req.get("prefix", "") or "")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        limit = max(1, min(int(req.get("limit", 100) or 100), 1000))
+        code, raw = _r2_request(r2, "GET", "", query={"list-type": "2", "prefix": prefix, "max-keys": str(limit)},
+                                timeout=timeout)
+        if code != 200:
+            return code, raw
+        return 200, json.dumps([{"name": n} for n in _r2_list_names(raw, prefix)]).encode("utf-8")
+    if not path.startswith(obj_prefix):
+        raise ValueError("unsupported relay path")
+    rest = path[len(obj_prefix):]
+    key = rest.split("/", 1)[1] if "/" in rest else ""
+    if not key or ".." in key.split("/"):
+        raise ValueError("unsupported relay key")
+    if method in {"POST", "PUT"}:
+        data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return _r2_request(r2, "PUT", key, data, timeout=timeout)
+    if method == "DELETE":
+        code, raw = _r2_request(r2, "DELETE", key, timeout=timeout)
+        return (200 if code == 204 else code), raw
+    if method == "GET":
+        return _r2_request(r2, "GET", key, timeout=timeout)
+    raise ValueError("unsupported relay method")
+
+
 def _gateway_conf():
-    url=os.environ.get("SUPABASE_URL","").strip().rstrip("/")
-    key=(os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
-         or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
-    return (url,key) if url and key else None
+    return relay_conf()
 
 
 def _storage(method,path,body=None):
@@ -738,6 +871,12 @@ def _storage(method,path,body=None):
     if not conf:
         raise CliFailure("gateway_not_configured")
     url,key=conf
+    if url.startswith(R2_SCHEME):
+        code,raw=relay_storage(relay_r2_conf(),method,"/storage/v1/object/"+BUCKET+"/"+path,body)
+        try:
+            return code,(json.loads(raw) if code==200 and raw else {})
+        except ValueError:
+            return code,{}
     data=json.dumps(body,ensure_ascii=False).encode() if body is not None else None
     req=urllib.request.Request(url+"/storage/v1/object/"+BUCKET+"/"+path,data=data,method=method,
                                headers={"Authorization":"Bearer "+key,"apikey":key,"Content-Type":"application/json","x-upsert":"true"})
