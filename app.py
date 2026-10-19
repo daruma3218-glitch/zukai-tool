@@ -96,11 +96,9 @@ _recovered_roots = set()
 # ====== 認証 ======
 @app.before_request
 def accept_cloudflare_access():
-    """新しい入口（zukai.apprendre.jp・Cloudflare のログイン）を通った人は、パスワードなしでログイン済みにする（2026-10-14）。
-    今までの住所とパスワードはそのまま使える（並行の期間）。証明は署名・発行元・宛先・期限をすべて確かめる（cloudflare_access）。"""
-    if APP_PASSWORD and not session.get("authenticated") and cloudflare_access.verified_email(request.headers):
-        session.permanent = True
-        session["authenticated"] = True
+    """旧入口を閉じ、画面・APIのすべてでCloudflareの証明を毎回検証する。"""
+    return cloudflare_access.enforce_studio_access(
+        "https://zukai.apprendre.jp", health_paths=("/version", "/api/subsk-health"))
 
 
 def login_required(f):

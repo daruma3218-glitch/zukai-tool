@@ -3,10 +3,10 @@
 新しい入口（〇〇.apprendre.jp）は Cloudflare Access（チーム apprendre・登録メールへのコード）の後ろにある。
 Access を通った要求には、署名つきの証明（ヘッダー Cf-Access-Jwt-Assertion）が付く。
 ここでは署名（RS256・チームの公開鍵）・発行元・宛先（このアプリの AUD）・期限をすべて確かめ、
-合えばログイン済みとして扱う。どれか1つでも合わなければ「証明なし」と同じ扱い（今までのパスワードの画面）。
+合えばログイン済みとして扱う。本番では毎回証明を要求し、旧パスワードや過去のセッションだけでは通さない。
 
-- 設定（環境変数 CF_ACCESS_AUD）が無ければ何もしない＝今までのパスワードのログインだけ。
-- 今までの住所（onrender.com など）とパスワードは、並行の期間はそのまま使える。
+- ローカルで設定がない場合だけ従来のパスワード認証を使う。本番でAUDが欠けた場合は拒否する。
+- 旧住所の画面は新住所へ案内し、APIや旧パスワードの送信は401にする。
 - 作られた証明（ヘッダーを手で付けた要求）は、署名が合わないので通らない。
 - 証明の中身・鍵・メールはログに出さない（合わなかった理由の種類だけ）。
 """
@@ -35,6 +35,42 @@ def _settings() -> tuple[str, tuple[str, ...]]:
 def enabled() -> bool:
     """Cloudflare のログインを受け付ける設定か（AUD が入っているか）。"""
     return bool(_settings()[1])
+
+
+def required() -> bool:
+    """本番は設定漏れでも閉じる。ローカルでは従来の開発用ログインを維持する。"""
+    return enabled() or bool(os.environ.get("RENDER_SERVICE_ID", "").strip())
+
+
+def enforce_studio_access(canonical_url: str, *, health_paths=()):
+    """全画面・APIを保護し、既存の非機密な診断口だけを残す。
+
+    更新制御は外側のDeployGuardが署名を検証するため、ここでは例外を設けない。
+    """
+    from urllib.parse import urlsplit
+    from flask import jsonify, redirect, request, session
+
+    if not required():
+        return None
+    if request.method in {"GET", "HEAD"} and request.path in health_paths:
+        return None
+    if verified_email(request.headers):
+        session.permanent = True
+        session["authenticated"] = True
+        return None
+
+    session.pop("authenticated", None)
+    canonical = urlsplit(canonical_url)
+    if (request.method in {"GET", "HEAD"} and not request.path.startswith("/api/")
+            and request.host.partition(":")[0].lower() != canonical.hostname):
+        path = request.full_path.rstrip("?")
+        destination = canonical_url if request.path in {"/login", "/logout"} else canonical_url.rstrip("/") + path
+        response = redirect(destination, code=302)
+    else:
+        response = jsonify(error="新しい入口からログインしてください。", login_url=canonical_url)
+        response.status_code = 401
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _jwks(team: str) -> "jwt.PyJWKClient":
