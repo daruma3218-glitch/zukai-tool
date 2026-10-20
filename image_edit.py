@@ -279,7 +279,7 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
             settings = retype.job_settings(job_dir)
         except retype.RetypeError as exc:
             raise EditError(str(exc)) from None
-        if retype.original_type(plan) == target_type:
+        if retype.original_type(plan) == target_type and target_type != "diagram":
             raise EditError("元の画像と同じ種類です。直したい時は「指示して直す」をお使いください")
         source, instruction = plan["filename"], ""  # 版を指していても、元の候補にひも付ける
     if action == "instruct" and not instruction:
@@ -297,6 +297,8 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
         if action != "flip" and not os.environ.get("OPENAI_API_KEY") and client_factory is None:
             raise EditError("OPENAI_API_KEY が設定されていないため、AIの手直しは使えません")
     label = f"{retype.LABELS[target_type]}で作り直し" if action == "retype" else ACTION_LABELS[action]
+    if action == "retype" and target_type == "diagram" and retype.original_type(plan) == "diagram":
+        label = "図解（再生成）"
 
     def reserve(data):
         edits = data.setdefault("edits", [])

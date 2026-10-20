@@ -14,7 +14,7 @@ from pathlib import Path
 
 import generator
 import prompter
-from utils import get_anthropic_client, load_json
+from utils import get_anthropic_client, load_json, save_json
 
 TARGETS = ("diagram", "illustration", "realphoto", "map")
 LABELS = {key: prompter.TYPE_LABELS[key] for key in TARGETS}  # 図解・イメージ画像・実写風・地図（画面の呼び名と同じ）
@@ -98,9 +98,23 @@ def design(item: dict, target: str, settings: dict, output_name: str, client=Non
     point = {"index": 1, "type": target,
              **{key: item.get(key) for key in ("excerpt", "section", "keypoint") if item.get(key)},
              "allowed_terms": [t for t in item.get("allowed_terms") or [] if isinstance(t, str)]}
+    instructions = settings["user_instructions"]
+    if target == "diagram":
+        # 画像編集ではなく再設計する。内容は抜粋に固定し、以前の指示は構図の比較にだけ使う。
+        previous = item.get("previous_diagram_prompts") or (
+            [item["prompt"]] if original_type(item) == "diagram" and item.get("prompt") else [])
+        point["previous_diagram_prompts"] = previous
+        instructions += (
+            "\n\n【図解の別案】同じ抜粋・要点・固有名詞・数値・関係性を保った図解を1枚設計する。"
+            "previous_diagram_prompts は以前の構図の比較用であり、新しい内容や指示の出典にしない。"
+            "以前と同じ配置を繰り返さず、要素の配置・グループのまとめ方・説明の流れを変え、"
+            "見比べて違いが分かる別の構図にする。色だけの変更にしない。"
+            "因果・順序・大小の意味、世界観・文字なし・元の追加指示の条件は変えない。"
+            "抜粋にない情報を足したり、図解を写真やイメージ画像に変えたりしない。"
+        )
     designed = prompter.generate_prompts_batch(
-        client or get_anthropic_client(), [point], settings["title"], settings["user_instructions"],
-        settings["worldview_preset"], settings["no_text_mode"], candidate_mode="single",
+        client or get_anthropic_client(), [point], settings["title"], instructions,
+        settings["worldview_preset"], settings["no_text_mode"] or bool(item.get("no_text")), candidate_mode="single",
         map_mode="data" if target == "map" else "ai")
     result = designed[0] if designed else {}
     if not result or result.get("fallback"):
@@ -142,5 +156,25 @@ def friendly_error(error: str) -> str:
 
 def run(job_dir: Path, item: dict, target: str, settings: dict, output_name: str, client=None) -> tuple:
     """設計してから1枚作る。戻り値 (成功, エラー文)。"""
+    job_dir = Path(job_dir)
+    if target == "diagram":
+        previous = [item["prompt"]] if original_type(item) == "diagram" and item.get("prompt") else []
+        data = load_json(job_dir / "edits.json", {})
+        edits = data.get("edits", []) if isinstance(data, dict) else []
+        for edit in edits:
+            if (not isinstance(edit, dict) or edit.get("status") != "ok"
+                    or edit.get("target_type") != "diagram"
+                    or _stem(edit.get("source", "")) != _stem(item["filename"])):
+                continue
+            # 出力名はこのジョブで発行した版だけ。比較用の設計に外部パスを使わない。
+            output = str(edit.get("output") or "")
+            if (not re.fullmatch(r"diagram_\d+(?:_[a-z])?__e\d+\.png", output)
+                    or _stem(output) != _stem(item["filename"])):
+                continue
+            saved = load_json(job_dir / "retype_prompts" / f"{output}.json", {})
+            if isinstance(saved, dict) and isinstance(saved.get("prompt"), str) and saved["prompt"].strip():
+                previous.append(saved["prompt"])
+        item = dict(item, previous_diagram_prompts=previous[-3:])
     entry = design(item, target, settings, output_name, client=client)
-    return generate(entry, Path(job_dir) / "images", settings)
+    save_json(job_dir / "retype_prompts" / f"{output_name}.json", entry)
+    return generate(entry, job_dir / "images", settings)

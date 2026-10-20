@@ -218,6 +218,73 @@ def test_retype_makes_a_new_version_and_keeps_the_map(client, tmp_path, monkeypa
     assert snapshot["edits"][0]["output"] == "diagram_001__e1.png"
 
 
+@pytest.mark.parametrize("filename", ["diagram_002.png", "diagram_002_a.png"])
+def test_diagram_regeneration_keeps_content_settings_and_previous_versions(client, tmp_path, monkeypatch, filename):
+    item = {"index": 2, "group": 2, "type": "diagram", "prompt": "Three boxes in a horizontal row.",
+            "filename": filename, "excerpt": "制度の仕組みを説明します。", "section": "第2章",
+            "keypoint": "制度の仕組み", "allowed_terms": ["制度"], "no_text": True}
+    root = map_job(tmp_path, items=[item])
+    original = (root / "images" / filename).read_bytes()
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-only")
+    monkeypatch.setattr(image_edit.threading, "Thread", InlineThread)
+    monkeypatch.setattr(retype, "get_anthropic_client", lambda: object())
+    designs, generations = [], []
+
+    def fake_batch(client, batch, title, instructions, worldview, no_text, **kwargs):
+        designs.append((batch[0], instructions, worldview, no_text))
+        return [{"index": 1, "prompt": f"Alternative composition {len(designs)}"}]
+
+    def fake_generate(**kwargs):
+        generations.append(kwargs)
+        png(kwargs["output_dir"] / kwargs["prompts"][0]["filename"], "blue")
+        return [{"success": True}]
+
+    monkeypatch.setattr(prompter, "generate_prompts_batch", fake_batch)
+    monkeypatch.setattr(generator, "run_parallel_generation", fake_generate)
+    source = filename
+    for number in (1, 2):
+        res = client.post(f"/api/edit/{root.name}", json={"source": source, "action": "retype",
+                                                        "target_type": "diagram"})
+        assert res.status_code == 200, res.json
+        edit = res.json["edits"][-1]
+        source = edit["output"]  # 新しい版を指しても同じ元画像にひも付く
+        assert source == f"{Path(filename).stem}__e{number}.png"
+        assert edit["source"] == filename and edit["status"] == "ok" and edit["label"] == "図解（再生成）"
+        assert (root / "images" / source).exists()
+    assert (root / "images" / filename).read_bytes() == original
+    assert designs[0][0]["previous_diagram_prompts"] == [item["prompt"]]
+    assert designs[1][0]["previous_diagram_prompts"] == [item["prompt"], "Alternative composition 1"]
+    for point, instructions, worldview, no_text in designs:
+        assert point["excerpt"] == item["excerpt"] and point["allowed_terms"] == ["制度"]
+        assert point["type"] == "diagram" and "色だけの変更にしない" in instructions
+        assert worldview == "roshia" and no_text is True
+    assert all(g["provider"] == "gpt-image" and g["openai_model"] == "gpt-image-2.5-flare"
+               and g["openai_quality"] == "medium" and g["concurrency"] == 1 for g in generations)
+    assert not (tmp_path / "type_feedback.jsonl").exists()  # 構図違いは種類の訂正として学習しない
+    adopted = client.post(f"/api/adopt/{root.name}", json={"filename": source, "adopted": True, "group": 2})
+    assert adopted.status_code == 200 and adopted.json["adopted"] == [source]
+    with zipfile.ZipFile(io.BytesIO(client.get(f"/download-adopted/{root.name}").data)) as archive:
+        assert len([name for name in archive.namelist() if name.endswith(".png")]) == 1
+
+
+def test_pending_diagram_regeneration_is_not_charged_twice(client, tmp_path, monkeypatch):
+    root = map_job(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-only")
+    started = []
+
+    class Parked(InlineThread):
+        def start(self):
+            started.append(self)
+
+    monkeypatch.setattr(image_edit.threading, "Thread", Parked)
+    body = {"source": "diagram_002.png", "action": "retype", "target_type": "diagram"}
+    first = client.post(f"/api/edit/{root.name}", json=body)
+    second = client.post(f"/api/edit/{root.name}", json=body)
+    assert first.status_code == second.status_code == 200
+    assert second.json["edit"]["duplicate"] is True
+    assert first.json["edit"]["id"] == second.json["edit"]["id"] and len(started) == 1
+
+
 @pytest.mark.parametrize("body, message", [
     ({"source": "diagram_001.png", "action": "retype", "target_type": "chart"}, "種類が不正"),
     ({"source": "diagram_001.png", "action": "retype", "target_type": "map"}, "同じ種類"),
@@ -330,6 +397,8 @@ def test_version_reports_map_fit(client):
     assert data["map_fit"]["map_share_limit"] == 0.2 and data["map_fit"]["place_name_alone_is_not_map"] is True
     assert data["map_fit"]["retype_targets"] == ["diagram", "illustration", "realphoto", "map"]
     assert "retype" in data["director_tools"]["edits"] and data["map_fit"]["learns_from_retype"] is True
+    assert data["diagram_regeneration"] == {
+        "version": 1, "alternative_composition": True, "preserves_original": True}
 
 
 # ===== 直した例を次の回に活かす（素材スタジオの「ルート違い」と同じ考え方） =====

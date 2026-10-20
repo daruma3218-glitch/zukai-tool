@@ -102,7 +102,7 @@ test('作り直しが済んだら、カードはその版を出し、☆はそ�
   assert.match(p.element('versionStrip').innerHTML, /元の画像/);  // 地図は元の画像として残る
 });
 
-test('拡大画面では、元と同じ種類を除いて作り直しの種類を並べる', async () => {
+test('拡大画面では、図解だけ同じ種類の再生成も並べる', async () => {
   const p = page(mapJob);
   await p.run('pollItems()');
   p.run('openModal(1)');
@@ -114,9 +114,39 @@ test('拡大画面では、元と同じ種類を除いて作り直しの種類�
   const diagramRow = p.element('retypeRow').innerHTML;
   assert.match(diagramRow, /別の種類で作り直す：/);
   assert.match(diagramRow, /retypeImage\(2, 'map'\)/);
-  assert.doesNotMatch(diagramRow, /retypeImage\(2, 'diagram'\)/);
+  assert.match(diagramRow, /retypeImage\(2, 'diagram'\)/);
+  assert.match(diagramRow, />図解（再生成）</);
+  assert.match(diagramRow, /配置や見せ方を変えた別案/);
 });
 
+test('図解の再生成を受け付けたらボタンを止め、完了後は元と比較できる', async () => {
+  const edit = { id: 'r2', source: 'diagram_002.png', output: 'diagram_002__e1.png', action: 'retype',
+    target_type: 'diagram', label: '図解（再生成）', status: 'queued' };
+  const p = page(mapJob, { status: 200, data: { edit, edits: [edit] } });
+  await p.run('pollItems()');
+  p.run('openModal(2)');
+  await p.run("retypeImage(2, 'diagram')");
+  assert.deepEqual(p.posts[0].body, { source: 'diagram_002.png', action: 'retype', target_type: 'diagram' });
+  assert.match(p.element('retypeRow').innerHTML, /disabled[^>]*>図解を作成中…</);
+  assert.match(p.element('versionStrip').innerHTML, /図解（再生成）：順番待ち/);
+  p.run("editsList[0].status = 'ok'; renderModal();");
+  assert.equal(p.run('modalState.shown'), 'diagram_002__e1.png');
+  assert.match(p.element('versionStrip').innerHTML, /元の画像/);
+  assert.match(p.element('versionStrip').innerHTML, /図解（再生成）/);
+  assert.match(p.element('retypeRow').innerHTML, />図解（再生成）</);
+});
+
+test('地図から作り直した図解にも再生成を表示する', async () => {
+  const p = page({ ...mapJob, edits: [
+    { source: 'diagram_001.png', output: 'diagram_001__e1.png', action: 'retype',
+      target_type: 'diagram', label: '図解で作り直し', status: 'ok' },
+  ] });
+  await p.run('pollItems()');
+  p.run('openModal(1)');
+  assert.match(p.element('retypeRow').innerHTML, />図解（再生成）</);
+  p.run("showVersion('diagram_001.png')");
+  assert.doesNotMatch(p.element('retypeRow').innerHTML, /button[^>]*>図解（再生成）</);
+});
 test('受け付けられなかった理由は、そのカードに出す', async () => {
   const p = page(mapJob, { status: 400, data: { error: 'OPENAI_API_KEY が設定されていないため、作り直せません' } });
   await p.run('pollItems()');

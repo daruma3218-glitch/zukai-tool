@@ -1250,14 +1250,19 @@
       if (!item || !item.filename) { row.innerHTML = ''; return; }
       const own = originalType(item);
       const active = retypesFor(item.filename).filter(e => ['queued', 'running'].includes(e.status));
-      const targets = ['diagram', 'illustration', 'realphoto', 'map'].filter(t => t !== own);
+      const shownEdit = editsFor(item.filename).find(e => e.output === modalState.shown);
+      const shownType = shownEdit && shownEdit.target_type || own;
+      const targets = ['diagram', 'illustration', 'realphoto', 'map'].filter(t => t !== own || t === 'diagram');
       row.innerHTML = `<span class="text-xs text-gray-600">${own === 'map' ? '地図をやめて作り直す：' : '別の種類で作り直す：'}</span>` +
         targets.map(t => {
           const busy = active.some(e => e.target_type === t);
           const strong = own === 'map' && t === item.map_alt;
-          return `<button type="button" onclick="retypeImage(${item.index}, '${t}')" ${busy ? 'disabled' : ''} class="px-3 py-1.5 rounded-lg text-sm border disabled:opacity-60 ${strong ? 'border-sky-700 bg-sky-700 text-white hover:bg-sky-800' : 'border-sky-300 text-sky-800 hover:bg-sky-50'}">${busy ? `${RETYPE_LABELS[t]}を作成中…` : RETYPE_LABELS[t]}${strong ? '（おすすめ）' : ''}</button>`;
+          const regenerate = t === 'diagram' && shownType === 'diagram';
+          const label = regenerate ? '図解（再生成）' : RETYPE_LABELS[t];
+          const title = regenerate ? '同じ内容で、配置や見せ方を変えた図解を追加します。元の画像は残ります。' : `${RETYPE_LABELS[t]}で作り直します。元の画像は残ります。`;
+          return `<button type="button" onclick="retypeImage(${item.index}, '${t}')" ${busy ? 'disabled' : ''} title="${title}" class="px-3 py-1.5 rounded-lg text-sm border disabled:opacity-60 ${strong ? 'border-sky-700 bg-sky-700 text-white hover:bg-sky-800' : 'border-sky-300 text-sky-800 hover:bg-sky-50'}">${busy ? `${RETYPE_LABELS[t]}を作成中…` : label}${strong ? '（おすすめ）' : ''}</button>`;
         }).join('') +
-        '<span class="text-[11px] text-gray-400">同じ抜粋から作り直します。生成時と同じ画像モデルで1枚分の費用（地図は費用なし）。元の画像は残ります。</span>';
+        '<span class="text-[11px] text-gray-400">同じ抜粋から作り直します。図解（再生成）は配置や見せ方を変えた別案です。生成時と同じ画像モデルで1枚分の費用（地図は費用なし）。元の画像は残ります。</span>';
     }
 
     function showVersion(output) {

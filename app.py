@@ -164,6 +164,7 @@ def version():
         "map_fit": {"version": 1, "map_share_limit": MAP_SHARE_LIMIT, "place_name_alone_is_not_map": True,
                     "retype_targets": list(retype.TARGETS), "retype_concurrency": image_edit.RETYPE_CONCURRENCY,
                     "learns_from_retype": True},
+        "diagram_regeneration": {"version": 1, "alternative_composition": True, "preserves_original": True},
         "llm_billing": "subscription_cli_only", "llm_api_fallback": False,
         # 従量APIへの明示の切り替え（既定オフ・2026-09-28）。ツール名・環境変数の名前・真偽値だけ
         "llm_api_switch": subscription_runtime.api_switch_status(),
