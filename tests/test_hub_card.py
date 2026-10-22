@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 
 import pytest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as service
@@ -62,3 +63,25 @@ def test_job_thread_sets_the_card_for_ai_calls(client, tmp_path, monkeypatch):
     service._set_job_card(job_id)
     service._set_job_card("missing-job")
     assert seen == ["Ab3dE6gH", ""]
+
+
+def test_hub_source_reads_only_russia_cards_through_the_worker(client):
+    import trello_source
+    doc = {"title": "原稿", "text": "本文", "content_kind": "manuscript", "provider": "Googleドキュメント",
+           "choices": [{"label": "原稿", "url": "https://docs.google.com/document/d/abc/edit"}]}
+    with patch("cloudflare_access.verified_email", return_value="member@example.test"), \
+         patch.object(trello_source, "_request", return_value=doc) as read:
+        data = client.get("/api/trello-source?card=Ab3dE6gH").get_json()
+        assert data["ok"] and data["text"] == "本文"
+        assert read.call_args.args == ("roshia", "member@example.test")
+        assert read.call_args.kwargs["source_id"] == "trello:Ab3dE6gH"
+        bad = client.get("/api/trello-source?card=../x").get_json()
+        assert not bad["ok"] and read.call_count == 1  # 正しくないカードは中継へ送らない
+    with patch("cloudflare_access.verified_email", return_value=""), patch.object(trello_source, "_request") as read:
+        assert not client.get("/api/trello-source?card=Ab3dE6gH").get_json()["ok"]
+        read.assert_not_called()  # 共通ログインのメールが無ければ読まない
+
+
+def test_index_shows_the_hub_source_panel_only_with_a_card(client):
+    assert 'id="hubSource" class="text-sm' in client.get("/?card=Ab3dE6gH").get_data(as_text=True)
+    assert 'id="hubSource" class="hidden ' in client.get("/").get_data(as_text=True)

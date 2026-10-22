@@ -177,6 +177,23 @@ def version():
     })
 
 
+@app.route("/api/trello-source")
+@login_required
+def api_trello_source():
+    """ハブの案件から開いた時、カードにある原稿の本文を読む（原稿欄に入れるだけ・生成はしない・2026-10-22）。"""
+    import trello_source
+    card = subscription_runtime.clean_card(request.args.get("card", ""))
+    try:
+        data = trello_source.load("russia", cloudflare_access.verified_email(request.headers),
+                                  "https://trello.com/c/" + card if card else "",
+                                  resource=request.args.get("resource", "")[:500])
+        resp = jsonify(ok=True, **data)
+    except trello_source.SourceError as exc:
+        resp = jsonify(ok=False, error=str(exc))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/api/subsk-health")
 def api_subsk_health():
     """サブスクLLMゲートウェイの状態確認 (2026-08-13・shiryou-tool と同型)。真偽値のみ。

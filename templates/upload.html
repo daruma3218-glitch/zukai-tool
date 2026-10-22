@@ -75,6 +75,14 @@
           <p id="restoreJobNotice" class="hidden p-3 rounded-xl bg-purple-50 text-purple-800 text-sm" role="status"></p>
           <input type="hidden" name="card" id="hubCard" value="{{ hub_card or '' }}">
           <p id="hubCardNotice" class="{{ '' if hub_card else 'hidden ' }}p-3 rounded-xl bg-slate-50 text-slate-700 text-sm" role="status">制作の進行ハブの案件（Trello のカード <span id="hubCardId">{{ hub_card or '' }}</span>）の作業として記録します。</p>
+          <!-- ハブの案件のカードの原稿を原稿欄へ入れる（2026-10-22）。生成は「図解を一気に生成する」を押した時だけ -->
+          <div id="hubSource" class="{{ '' if hub_card else 'hidden ' }}text-sm text-slate-700">
+            <p id="hubSourceStatus">Trello のカードから原稿を探しています…</p>
+            <div id="hubSourcePick" class="hidden mt-2 flex flex-wrap gap-2 items-center">
+              <select id="hubSourceChoice" aria-label="入れる原稿" class="px-2 py-1 border border-slate-300 rounded-lg bg-white max-w-full"></select>
+              <button type="button" id="hubSourceUse" class="px-3 py-1 rounded-lg bg-purple-600 text-white font-bold">この原稿を入れる</button>
+            </div>
+          </div>
           <label id="restoredNoText" class="hidden text-sm text-gray-600"><input type="checkbox" name="no_text_mode" id="noTextMode"> 元のジョブの「文字なし」を引き継ぐ</label>
 
           <!-- 原稿入力 -->
@@ -417,6 +425,41 @@
     manuscriptText.addEventListener('input', () => {
       charCount.textContent = manuscriptText.value.length.toLocaleString();
     });
+
+    // ハブの案件から開いた時：カードの原稿を原稿欄へ入れる。入力済みの原稿は上書きしない。生成はまだ始めない。
+    (function () {
+      const card = document.getElementById('hubCard').value;
+      const box = document.getElementById('hubSource');
+      if (!card || new URLSearchParams(window.location.search).get('retry')) { box.classList.add('hidden'); return; }
+      const status = document.getElementById('hubSourceStatus');
+      const pick = document.getElementById('hubSourcePick');
+      const choice = document.getElementById('hubSourceChoice');
+      const say = text => { status.textContent = text; };
+      async function load(resource) {
+        const url = `/api/trello-source?card=${encodeURIComponent(card)}` + (resource ? `&resource=${encodeURIComponent(resource)}` : '');
+        let data = {};
+        try { data = await (await fetch(url, { credentials: 'same-origin' })).json(); } catch (e) { data = { ok: false, error: '原稿を読み込めませんでした。原稿は貼り付けでも入れられます。' }; }
+        if (!data.ok) { say(data.error || '原稿を読み込めませんでした。原稿は貼り付けでも入れられます。'); return; }
+        if (data.manuscript && data.text) {
+          if (manuscriptText.value.trim() && manuscriptText.value !== data.text && !resource) {
+            say(`Trello のカードに原稿「${data.title}」があります。原稿欄に入力済みのため入れていません。`);
+          } else {
+            manuscriptText.value = data.text;
+            charCount.textContent = manuscriptText.value.length.toLocaleString();
+            say(`Trello のカードから原稿「${data.title}」（${data.provider}）を入れました。確かめて「図解を一気に生成する」を押すと始まります。`);
+          }
+        } else {
+          say('カードに原稿が複数あるか、本文が見つかりませんでした。入れる原稿を選んでください。');
+        }
+        const docs = data.choices || [];
+        if (docs.length > (data.manuscript ? 1 : 0)) {
+          choice.replaceChildren(...docs.map((c, i) => { const o = document.createElement('option'); o.value = c.url; o.textContent = `${c.label}（${i + 1}）`; return o; }));
+          pick.classList.remove('hidden');
+        }
+      }
+      document.getElementById('hubSourceUse').addEventListener('click', () => { say('原稿を読み込んでいます…'); load(choice.value); });
+      load('');
+    })();
 
     // 画像の枚数の目安（候補の出し方 × 箇所）
     const planEstimate = document.getElementById('planEstimate');
