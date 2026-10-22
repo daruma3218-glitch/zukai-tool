@@ -203,7 +203,7 @@
                 type="range"
                 name="target_count"
                 id="targetCount"
-                min="10" max="200" step="5" value="50"
+                min="5" max="200" step="5" value="50"
                 class="w-full"
               >
               <div class="flex justify-between text-xs text-gray-400 mt-1">
@@ -360,7 +360,8 @@
                       <p class="text-xs text-gray-400 mt-0.5">{{ job.id }}</p>
                     </div>
                     <span class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded
-                      {% if job.status == 'completed' %}bg-green-100 text-green-700
+                      {% if job.status == 'completed' and job.succeeded < job.target %}bg-amber-100 text-amber-800
+                      {% elif job.status == 'completed' %}bg-green-100 text-green-700
                       {% elif job.status == 'running' %}bg-blue-100 text-blue-700
                       {% elif job.status == 'error' %}bg-red-100 text-red-700
                       {% else %}bg-gray-100 text-gray-600{% endif %}">
@@ -370,6 +371,7 @@
                       {% elif job.status == 'cancelled' %}中止済み・{{ job.succeeded }}枚保存
                       {% elif job.status == 'queued' %}待機中
                       {% elif job.status == 'error' %}エラー
+                      {% elif job.status == 'interrupted' %}中断
                       {% else %}{{ job.status }}{% endif %}
                     </span>
                   </div>

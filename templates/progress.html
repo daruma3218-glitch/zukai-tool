@@ -64,6 +64,8 @@
         <div class="flex-1 min-w-0">
           <h1 id="jobTitle" class="text-xl font-bold text-gray-900 truncate">生成中...</h1>
           <p id="jobMessage" class="text-sm text-gray-500 mt-1">原稿を分析しています...</p>
+          <!-- 切断・ログイン切れを知らせる（2026-10-22 の見直し。今までは黙って止まって見えた） -->
+          <p id="connectionNotice" class="hidden mt-2 p-2 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-sm" role="alert"></p>
         </div>
         <div id="statusBadge" class="flex-shrink-0 inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-50 text-blue-700 text-sm font-medium">
           <span class="w-2 h-2 bg-blue-500 rounded-full ring-pulse"></span>
@@ -504,7 +506,10 @@
               .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
     }
 
-    function statusBadgeHtml(status) {
+    function statusBadgeHtml(status, failed) {
+      if (status === 'completed' && failed > 0) {
+        return `<span class="w-2 h-2 rounded-full bg-amber-500"></span><span>完了（失敗 ${failed}枚）</span>`;
+      }
       const map = {
         running:    { color: 'bg-blue-50 text-blue-700',   dot: 'bg-blue-500 ring-pulse',   label: '実行中' },
         queued:     { color: 'bg-gray-100 text-gray-700',  dot: 'bg-gray-400',             label: '待機中' },
@@ -1045,10 +1050,26 @@
       }
     }
 
+    let connectionFailures = 0;
+    function connectionProblem(status, redirected) {
+      const box = document.getElementById('connectionNotice');
+      if (status === 0) { connectionFailures = 0; box.classList.toggle('hidden', true); return; }
+      connectionFailures += 1;
+      let text = '';
+      if (status === 401 || redirected) text = 'ログインが切れました。ページを再読み込みして、ログインし直してください。';
+      else if (status === 404) text = 'このジョブの記録が見つかりません（削除された可能性があります）。作成画面の「最近のジョブ」から開き直してください。';
+      else if (connectionFailures >= 3) text = 'サーバーとの接続が切れています。自動でつなぎ直しを続けています。直らない時はページを再読み込みしてください。';
+      if (text) { box.textContent = text; box.classList.toggle('hidden', false); }
+    }
+
     async function pollStatus() {
       try {
         const res = await fetch(`/api/status/${JOB_ID}`);
-        if (!res.ok) return;
+        // ログイン切れは /login の HTML へ転送される。届いた物が JSON でなければ切れたとみなす
+        const contentType = res.headers && res.headers.get ? (res.headers.get('content-type') || '') : 'application/json';
+        const isJson = !contentType || contentType.includes('json');
+        if (!res.ok || res.redirected || !isJson) { connectionProblem(res.status, res.redirected || (res.ok && !isJson)); return; }
+        connectionProblem(0);
         const state = await res.json();
         // Ignore a running poll that was already in flight when cancel was accepted.
         if ((jobStatus === 'cancelling' || terminalStatuses.has(jobStatus)) && ['running', 'queued'].includes(state.status)) return;
@@ -1071,7 +1092,7 @@
         document.title = `${state.status === 'interrupted' ? '中断' : state.status === 'error' ? 'エラー' : state.status === 'cancelled' ? '中止済み' : state.status === 'cancelling' ? '中止処理中' : state.status === 'completed' ? '生成完了' : '生成中'} - 図解スタジオ`;
 
         // ステータスバッジ
-        els.statusBadge.innerHTML = statusBadgeHtml(state.status);
+        els.statusBadge.innerHTML = statusBadgeHtml(state.status, Number(state.failed) || 0);
         const colorMap = {
           running: 'bg-blue-50 text-blue-700',
           queued: 'bg-gray-100 text-gray-700',
@@ -1080,7 +1101,8 @@
           cancelling: 'bg-amber-50 text-amber-700',
           cancelled: 'bg-gray-100 text-gray-700',
         };
-        els.statusBadge.className = `flex-shrink-0 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${colorMap[state.status] || 'bg-gray-100 text-gray-700'}`;
+        const badgeColor = state.status === 'completed' && Number(state.failed) > 0 ? 'bg-amber-50 text-amber-800' : colorMap[state.status];
+        els.statusBadge.className = `flex-shrink-0 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${badgeColor || 'bg-gray-100 text-gray-700'}`;
 
         if (state.status === 'completed') {
           stopped = true;
@@ -1094,6 +1116,7 @@
           }
         }
       } catch (e) {
+        connectionProblem(-1);
         console.error('status error', e);
       }
     }

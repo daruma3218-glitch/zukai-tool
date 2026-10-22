@@ -304,6 +304,24 @@ def test_adopted_zip_numbers_in_manuscript_order_from_the_start_number(client, t
     bad.close()
 
 
+def test_adopted_zip_numbers_follow_places_not_adoption_count(client, tmp_path):
+    # 2026-10-22：同じ箇所で2枚・採用の無い箇所があっても、後ろの番号がずれない
+    root = job_with_images(tmp_path, "diagram_001_a.png", "diagram_001_b.png", "diagram_003_a.png")
+    utils.save_json(root / "images_progress.json", {"items": [
+        {"index": 1, "group": 1, "variant": "a", "status": "ok", "filename": "diagram_001_a.png", "keypoint": "一"},
+        {"index": 2, "group": 1, "variant": "b", "status": "ok", "filename": "diagram_001_b.png", "keypoint": "一"},
+        {"index": 5, "group": 3, "variant": "a", "status": "ok", "filename": "diagram_003_a.png", "keypoint": "三"}]})
+    for name in ("diagram_001_a.png", "diagram_001_b.png", "diagram_003_a.png"):
+        client.post("/api/adopt/20260924_120000", json={"filename": name})
+    res = client.get("/download-adopted/20260924_120000?start=105")
+    with zipfile.ZipFile(io.BytesIO(res.data)) as archive:
+        images = [n for n in archive.namelist() if n.endswith(".png")]
+        readme = archive.read("README.txt").decode("utf-8")
+    res.close()
+    assert images == ["105a_一.png", "105b_一.png", "107_三.png"]  # 2箇所目は採用なし＝106 は空く
+    assert "番号 105a〜107" in readme
+
+
 def test_new_routes_require_login(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(appmod, "APP_PASSWORD", "test-password")

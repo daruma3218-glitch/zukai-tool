@@ -445,6 +445,34 @@ def _short_label(item: dict, limit: int = 20) -> str:
     return ""
 
 
+def _place_numbers(items: list, start: int) -> list:
+    """箇所の番号（開始番号＋箇所−1）で名前の番号を決める（2026-10-22 の見直し）。
+
+    採用した順の通し番号だと、同じ箇所で2枚採用した時や採用の無い箇所があると後ろが全部ずれ、
+    ディレクターの表と合わなくなっていた。同じ箇所の2枚目以降は a・b… を付け、採用の無い箇所は番号を空ける。
+    箇所の分からない画像は、いちばん後ろの番号の続きに置く。"""
+    places = []
+    for item in items:
+        place = item.get("group") or item.get("index")
+        places.append(int(place) if str(place).isdigit() and int(place) > 0 else None)
+    known = [p for p in places if p]
+    next_free = start + (max(known) if known else 0)
+    counts = {}
+    for place in places:
+        if place:
+            counts[place] = counts.get(place, 0) + 1
+    seen, numbers = {}, []
+    for place in places:
+        if not place:
+            numbers.append(str(next_free))
+            next_free += 1
+            continue
+        base = str(start + place - 1)
+        seen[place] = seen.get(place, 0) + 1
+        numbers.append(base + ("abcdefghijklmnopqrstuvwxyz"[seen[place] - 1] if counts[place] > 1 else ""))
+    return numbers
+
+
 def adopted_zip(job_dir: Path, items: list, title: str, start: int = 1) -> tuple:
     """採用した画像だけの ZIP（一時ファイル）と中身の枚数。
 
@@ -469,18 +497,21 @@ def adopted_zip(job_dir: Path, items: list, title: str, start: int = 1) -> tuple
         chosen.append(((order, item.get("variant") or "", filename), filename, path, item))
     chosen.sort(key=lambda entry: entry[0])
     start = max(1, int(start or 1))
-    width = max(3, len(str(start + len(chosen) - 1)))
+    numbers = _place_numbers([entry[3] for entry in chosen], start)
+    width = max(3, max((len(str(n).rstrip("abcdefghijklmnopqrstuvwxyz")) for n in numbers), default=3))
     rows = []
     archive = tempfile.TemporaryFile(mode="w+b")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
-        for number, (_key, filename, path, item) in enumerate(chosen, start=start):
+        for raw_number, (_key, filename, path, item) in zip(numbers, chosen):
+            digits = str(raw_number).rstrip("abcdefghijklmnopqrstuvwxyz")
+            number = digits.zfill(width) + str(raw_number)[len(digits):]
             label = _short_label(item)
-            name = f"{number:0{width}d}_{label}{path.suffix}" if label else f"{number:0{width}d}{path.suffix}"
+            name = f"{number}_{label}{path.suffix}" if label else f"{number}{path.suffix}"
             zf.write(path, name)
             edit = edits.get(filename, {})
             # 別の種類で作り直した版は、作り直した後の種類を書く（元が地図でも「図解」など）
             kind = retype.LABELS.get(edit.get("target_type"), "") if edit.get("action") == "retype" else ""
-            rows.append([number, name, filename, item.get("group") or item.get("index") or "", item.get("variant", ""),
+            rows.append([raw_number, name, filename, item.get("group") or item.get("index") or "", item.get("variant", ""),
                          kind or item.get("variant_label", ""), edit.get("label", ""), item.get("section", ""),
                          item.get("excerpt", "")])
         count = len(rows)
@@ -489,8 +520,9 @@ def adopted_zip(job_dir: Path, items: list, title: str, start: int = 1) -> tuple
         writer.writerow(["番号", "ファイル名", "元のファイル名", "箇所番号", "案", "種類", "手直し", "章", "原稿の抜粋"])
         writer.writerows(rows)
         zf.writestr("採用一覧.csv", "﻿" + buffer.getvalue(), compress_type=zipfile.ZIP_DEFLATED)
-        span = f"（番号 {start}〜{start + count - 1}）" if count else ""
-        zf.writestr("README.txt", f"{title}\n採用した画像 {count} 枚{span}。原稿の順に番号を付けています。対応表は 採用一覧.csv。\n",
+        span = f"（番号 {numbers[0]}〜{numbers[-1]}）" if count else ""
+        zf.writestr("README.txt", f"{title}\n採用した画像 {count} 枚{span}。番号は箇所の番号です（採用の無い箇所は番号が空き、"
+                    f"同じ箇所の2枚目以降は a・b を付けています）。対応表は 採用一覧.csv。\n",
                     compress_type=zipfile.ZIP_DEFLATED)
     archive.seek(0)
     return archive, count
