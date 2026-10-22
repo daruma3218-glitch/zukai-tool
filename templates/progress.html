@@ -36,6 +36,16 @@
     .scroll-y::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
     .selection-tools { position: sticky; top: 3.5rem; z-index: 20; }
     .selection-resumed { outline: 3px solid #a78bfa; outline-offset: 3px; }
+    #modal { padding: 16px; }
+    #modalPanel { max-height: calc(100dvh - 32px); overflow-y: auto; overscroll-behavior: contain; }
+    .modal-heading { position: sticky; top: 0; z-index: 2; background: white; flex-wrap: wrap; gap: 12px; }
+    .modal-browse { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 20px; background: #faf7ff; border-bottom: 1px solid #e9d5ff; }
+    #modal button, #modalDownload { min-height: 44px; }
+    #modal button:focus-visible, #modal a:focus-visible { outline: 3px solid #7e22ce; outline-offset: 2px; }
+    .modal-browse button { border: 1px solid #d8b4fe; border-radius: 10px; background: white; padding: 8px 14px; color: #6b21a8; font-weight: 600; }
+    .modal-browse button:disabled { opacity: .35; cursor: not-allowed; }
+    #modalClose { width: 44px; }
+    @media(max-width:640px) { #modal { padding: 8px; } #modalPanel { max-height: calc(100dvh - 16px); } #modalTitle { white-space: normal; } .modal-browse { padding: 8px 12px; } .modal-browse button { padding: 8px; font-size: 13px; } #instructText { flex-basis: 100%; min-width: 0; } }
   </style>
 {% include '_studio_icons.html' %}
 </head>
@@ -239,17 +249,18 @@
 
   <!-- 拡大表示モーダル -->
   <div id="modal" class="hidden fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6" onclick="closeModal(event)">
-    <div class="max-w-5xl w-full bg-white rounded-2xl overflow-hidden shadow-2xl" onclick="event.stopPropagation()">
-      <div class="flex items-center justify-between px-5 py-3 border-b border-gray-200">
+    <div id="modalPanel" role="dialog" aria-modal="true" aria-labelledby="modalTitle" class="max-w-5xl w-full bg-white rounded-2xl shadow-2xl" onclick="event.stopPropagation()">
+      <div class="modal-heading flex items-center justify-between px-5 py-3 border-b border-gray-200">
         <div class="min-w-0">
           <p id="modalTitle" class="text-sm font-semibold text-gray-900 truncate"></p>
           <p id="modalSection" class="text-xs text-gray-500 mt-0.5"></p>
         </div>
         <div class="flex items-center gap-4">
           <a id="modalDownload" href="" download class="text-sm text-purple-600 hover:underline">この画像をダウンロード</a>
-          <button onclick="closeModal()" class="text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
+          <button id="modalClose" type="button" onclick="closeModal()" aria-label="拡大表示を閉じる" class="text-gray-400 hover:text-gray-700 text-2xl leading-none">&times;</button>
         </div>
       </div>
+      <nav class="modal-browse" aria-label="拡大したまま画像を移動"><button id="modalPrevious" type="button" onclick="moveModal(-1)">← 前の画像</button><span id="modalPosition" class="text-xs text-purple-800" role="status"></span><button id="modalNext" type="button" onclick="moveModal(1)">次の画像 →</button></nav>
       <div class="bg-gray-100 flex items-center justify-center p-4">
         <img id="modalImg" src="" class="max-w-full max-h-[56vh] object-contain rounded-lg shadow">
       </div>
@@ -291,6 +302,10 @@
     let retentionInfo = null;     // 自動削除の予定
     let lastStructure = '';       // 画像の並び（候補の組）が変わった時だけ全体を描き直す
     let modalState = null;        // {idx, source, shown}
+    const modalDrafts = new Map(); // 閉じても同じ画像への手直し指示を、このページ内では保持する。
+    let modalReturnFocus = null;
+    let modalBodyOverflow = '';
+    let modalSequence = [];
     let editPollTimer = null;
     let warnCount = 0;          // 記録の注意・エラーの件数
     let cancelBusy = false;
@@ -1198,6 +1213,14 @@
       const card = document.getElementById(`card-${idx}`);
       const filename = (item && item.filename) || (card && card.getAttribute('data-filename'));
       if (!filename) return;
+      if (modalState) rememberModalDraft();
+      else {
+        modalReturnFocus = document.activeElement;
+        modalBodyOverflow = document.body.style.overflow;
+        document.body.style.overflow = 'hidden';
+        modalSequence = visibleSelectionItems.filter(i => i.filename && i.status === 'ok').map(i => i.index);
+        if (!modalSequence.includes(idx)) modalSequence = [idx];
+      }
       rememberSelectionPosition();
       modalState = { idx, source: filename, shown: (item && displayFile(item)) || filename, pending: null };
       const title = (item && (item.keypoint || (item.excerpt || '').substring(0, 30))) || `図 ${idx}`;
@@ -1208,16 +1231,32 @@
       document.getElementById('modalExcerpt').textContent = (item && item.excerpt) || '';
       const notes = (item && item.notes) || [];
       document.getElementById('modalNotes').textContent = notes.length ? '地図のメモ: ' + notes.join(' / ') : '';
-      document.getElementById('instructText').value = '';
+      document.getElementById('instructText').value = modalDrafts.get(filename) || '';
       document.getElementById('editStatus').textContent = '';
       document.getElementById('modalRevisionError').classList.toggle('hidden', true);
       renderModal();
       document.getElementById('modal').classList.remove('hidden');
+      document.getElementById('modalPanel').scrollTop = 0;
+      document.getElementById('modalClose').focus({preventScroll: true});
+    }
+
+    function rememberModalDraft() {
+      if (modalState) modalDrafts.set(modalState.source, document.getElementById('instructText').value);
+    }
+    function moveModal(direction) {
+      if (!modalState) return;
+      const position = modalSequence.indexOf(modalState.idx);
+      const next = modalSequence[position + direction];
+      if (next !== undefined) openModal(next);
     }
 
     function renderModal() {
       if (!modalState) return;
       const source = modalState.source;
+      const position = modalSequence.indexOf(modalState.idx);
+      document.getElementById('modalPrevious').disabled = position <= 0;
+      document.getElementById('modalNext').disabled = position < 0 || position >= modalSequence.length - 1;
+      document.getElementById('modalPosition').textContent = `${position + 1} / ${modalSequence.length}枚`;
       const edits = editsFor(source);
       // 頼んだ手直しが終わったら、その版を表示する
       const pending = modalState.pending && edits.find(e => e.output === modalState.pending);
@@ -1312,29 +1351,53 @@
         return;
       }
       const status = document.getElementById('editStatus');
+      const requestedSource = modalState.source, requestedShown = modalState.shown;
       status.textContent = '';
       status.className = 'text-xs mt-1';
       try {
-        const data = await postJson(`/api/edit/${JOB_ID}`, { source: modalState.shown, action, instruction });
+        const data = await postJson(`/api/edit/${JOB_ID}`, { source: requestedShown, action, instruction });
         editsList = data.edits || editsList;
-        if (data.edit) modalState.pending = data.edit.output;
-        if (action === 'instruct') document.getElementById('instructText').value = '';
+        if (action === 'instruct' && (modalDrafts.get(requestedSource) || '').trim() === instruction) {
+          modalDrafts.delete(requestedSource);
+        }
+        if (modalState && modalState.source === requestedSource) {
+          if (data.edit) modalState.pending = data.edit.output;
+          const input = document.getElementById('instructText');
+          if (action === 'instruct' && input.value.trim() === instruction) input.value = '';
+        }
         renderModal();
         rebuildGrid(Object.values(knownItems));
         scheduleEditPoll();
       } catch (e) {
-        status.textContent = e.message;
-        status.className = 'text-xs mt-1 text-red-600';
+        if (modalState && modalState.source === requestedSource) {
+          status.textContent = e.message;
+          status.className = 'text-xs mt-1 text-red-600';
+        } else { alert(e.message); }
       }
     }
 
     function closeModal(e) {
       if (e && e.target.tagName === 'IMG') return;
+      if (!modalState) return;
+      rememberModalDraft();
       document.getElementById('modal').classList.add('hidden');
       modalState = null;
+      document.body.style.overflow = modalBodyOverflow;
+      if (modalReturnFocus && modalReturnFocus.isConnected) modalReturnFocus.focus({preventScroll:true});
     }
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape') closeModal();
+      if (!modalState) return;
+      if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+      if (e.key === 'Tab') {
+        const nodes = Array.from(document.getElementById('modalPanel').querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled)')).filter(node => node.getClientRects().length);
+        const first = nodes[0], last = nodes[nodes.length - 1];
+        if (first && e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (last && !e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+      if (!e.target.closest('input,textarea,select,[contenteditable="true"]') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.key === 'ArrowLeft') { e.preventDefault(); moveModal(-1); }
+        if (e.key === 'ArrowRight') { e.preventDefault(); moveModal(1); }
+      }
     });
 
     // ポーリング開始

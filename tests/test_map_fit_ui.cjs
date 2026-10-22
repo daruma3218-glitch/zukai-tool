@@ -29,7 +29,7 @@ function page(itemsPayload, editResponse = null) {
   const context = vm.createContext({
     window: {}, console, setTimeout: () => 0, clearTimeout() {},
     localStorage: { getItem: () => null, setItem() {} },
-    document: { getElementById: element, addEventListener() {} },
+    document: { body: {style: {}}, getElementById: element, addEventListener() {} },
     fetch: async (url, options = {}) => {
       if (options.method === 'POST') {
         posts.push({ url, body: JSON.parse(options.body || '{}') });
@@ -54,6 +54,38 @@ const mapJob = {
   ],
   adopted: [], edits: [], needs_revision: [],
 };
+
+test('拡大したまま前後へ移動し、画像ごとの入力途中の指示を保持する', async () => {
+  const p = page(mapJob);
+  await p.run('pollItems()');
+  p.run('openModal(1)');
+  assert.equal(p.element('modalPrevious').disabled, true);
+  assert.equal(p.element('modalPosition').textContent, '1 / 2枚');
+  p.element('instructText').value = '最初の画像の指示';
+  p.run('moveModal(1)');
+  assert.equal(p.element('instructText').value, '');
+  assert.equal(p.element('modalNext').disabled, true);
+  p.element('instructText').value = '次の画像の指示';
+  p.run('moveModal(-1)');
+  assert.equal(p.element('instructText').value, '最初の画像の指示');
+  p.run('closeModal(); openModal(2)');
+  assert.equal(p.element('instructText').value, '次の画像の指示');
+  assert.equal(p.posts.length, 0);
+});
+
+test('手直しの応答待ちに別の画像へ移っても、その画像の入力や表示を上書きしない', async () => {
+  const p = page(mapJob);
+  await p.run('pollItems()');
+  p.run('openModal(1)');
+  p.element('instructText').value = '地図の文字を直す';
+  const pending = p.run("editImage('instruct')");
+  p.run('moveModal(1)');
+  p.element('instructText').value = '次の図解の指示';
+  await pending;
+  assert.equal(p.posts[0].body.source, 'diagram_001.png');
+  assert.equal(p.element('instructText').value, '次の図解の指示');
+  assert.equal(p.run('modalState.pending'), null);
+});
 
 function card(p, idx) {
   const grid = p.element('imgGrid').innerHTML;
