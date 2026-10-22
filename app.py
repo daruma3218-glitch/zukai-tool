@@ -47,6 +47,7 @@ import retry_missing
 import subscription_runtime
 import job_health
 from image_resources import IMAGE_TASK_LIMIT
+from safe_paths import job_directory, contained_path
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -102,6 +103,13 @@ def accept_cloudflare_access():
         "https://zukai.apprendre.jp", health_paths=("/version", "/api/subsk-health"))
 
 
+@app.before_request
+def validate_job_path():
+    job_id = (request.view_args or {}).get("job_id")
+    if job_id is not None and job_directory(OUTPUT_DIR, job_id) is None:
+        return jsonify({"error": "ジョブが見つかりません"}), 404
+
+
 def login_required(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
@@ -141,8 +149,11 @@ def version():
     from prompter import CLAUDE_MODEL as PROMPTER_MODEL
     import retype
     import subscription_runtime
+    from PIL import __version__ as pillow_version
     return jsonify({
         "service": "zukai-tool",
+        "pillow_version": pillow_version,
+        "file_boundary_version": 1,
         "git_commit": os.environ.get("RENDER_GIT_COMMIT", ""),
         "openai_image_models": [m for m, _ in OPENAI_IMAGE_MODEL_CHOICES],
         "routing_version": subscription_runtime.ROUTING_VERSION,
@@ -303,10 +314,8 @@ def _get_job_state(job_id: str) -> dict:
 
 
 def _job_dir_for(job_id):
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id or ""):
-        return None
-    path = OUTPUT_DIR / job_id
-    if path.is_symlink() or not path.is_dir() or path.resolve().parent != OUTPUT_DIR.resolve():
+    path = job_directory(OUTPUT_DIR, job_id)
+    if path is None or not path.is_dir():
         return None
     return path
 
@@ -423,8 +432,8 @@ def recover_interrupted_jobs():
 
 def _completed_images(result_dir: Path) -> list[Path]:
     """保存が完了した画像だけを列挙する。書き込み途中の.tmpは含めない。"""
-    images_dir = result_dir / "images"
-    if not images_dir.is_dir():
+    images_dir = contained_path(result_dir, "images")
+    if images_dir is None or not images_dir.is_dir():
         return []
     return sorted(path for path in images_dir.iterdir()
                   if path.is_file() and not path.is_symlink()
@@ -940,8 +949,9 @@ def api_manifest(job_id):
 @login_required
 def serve_results(job_id, filename):
     """画像など結果ファイルを配信"""
-    result_dir = OUTPUT_DIR / job_id
-    if not result_dir.exists():
+    result_dir = _job_dir_for(job_id)
+    path = contained_path(result_dir, filename) if result_dir else None
+    if path is None or not path.is_file():
         return "結果が見つかりません", 404
     return send_from_directory(str(result_dir), filename)
 
@@ -949,8 +959,8 @@ def serve_results(job_id, filename):
 @app.route("/download/<job_id>")
 @login_required
 def download_zip(job_id):
-    result_dir = OUTPUT_DIR / job_id
-    if not result_dir.exists():
+    result_dir = _job_dir_for(job_id)
+    if result_dir is None:
         return "結果が見つかりません", 404
 
     images = _completed_images(result_dir)
@@ -977,8 +987,8 @@ def download_zip(job_id):
                 zf.write(img, f"images/{img.name}")
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2),
                         compress_type=zipfile.ZIP_DEFLATED)
-            ms_path = result_dir / "manuscript.txt"
-            if ms_path.exists():
+            ms_path = contained_path(result_dir, "manuscript.txt")
+            if ms_path is not None and ms_path.is_file():
                 zf.write(ms_path, "manuscript.txt", compress_type=zipfile.ZIP_DEFLATED)
 
         size = archive.tell()

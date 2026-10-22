@@ -34,6 +34,7 @@ import resource_diagnostics
 import retention
 import retype
 import type_feedback
+from safe_images import open_image
 
 EDITS_NAME = "edits.json"
 ADOPTION_NAME = "adoption.json"
@@ -237,10 +238,11 @@ def is_edit_file(filename: str) -> bool:
 
 
 def _image_path(job_dir: Path, filename: str) -> Path:
-    if not isinstance(filename, str) or not IMAGE_NAME_RE.match(filename):
+    from safe_paths import contained_path
+    if not isinstance(filename, str) or not IMAGE_NAME_RE.fullmatch(filename):
         raise EditError("画像の指定が不正です")
-    path = job_dir / "images" / filename
-    if not path.is_file():
+    path = contained_path(job_dir, "images/" + filename)
+    if path is None or not path.is_file():
         raise EditError("画像が見つかりません")
     return path
 
@@ -366,7 +368,7 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
         try:
             with image_task():
                 started()
-                with closing(Image.open(source_path)) as img, closing(img.convert("RGB")) as rgb:
+                with closing(open_image(source_path)) as img, closing(img.convert("RGB")) as rgb:
                     with closing(ImageOps.mirror(rgb)) as mirrored:
                         generator._save_png(mirrored, output_path)
             return finish(True)

@@ -12,6 +12,7 @@ from flask import jsonify, request, send_file, session
 
 import image_edit
 from utils import load_json
+from safe_paths import job_directory
 
 JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
@@ -21,10 +22,8 @@ def register(app, login_required, output_dir_getter, items_getter):
     items_getter(job_dir) は画面と同じ画像一覧（_image_snapshot の items）を返す関数。"""
 
     def job_dir_for(job_id: str) -> Path:
-        if not JOB_NAME_RE.match(job_id or ""):
-            raise image_edit.EditError("ジョブの指定が不正です")
-        path = Path(output_dir_getter()) / job_id
-        if path.is_symlink() or not path.is_dir():
+        path = job_directory(output_dir_getter(), job_id)
+        if path is None or not path.is_dir():
             raise FileNotFoundError(job_id)
         return path
 

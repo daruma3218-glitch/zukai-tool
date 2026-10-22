@@ -30,6 +30,7 @@ from google.genai import types
 from PIL import Image
 from job_control import JobCancelled, check_cancel, wait_or_cancel
 from image_resources import IMAGE_TASK_LIMIT, limited_image_task
+from safe_images import open_image
 
 
 # ===== モデル設定 =====
@@ -130,7 +131,7 @@ def _save_as_16_9(image_bytes: bytes, output_path: Path) -> None:
     - 縦長すぎ → 左右に余白を足す
     """
     # Close native pixel buffers immediately, including on save failures.
-    with BytesIO(image_bytes) as buffer, closing(Image.open(buffer)) as source:
+    with BytesIO(image_bytes) as buffer, closing(open_image(buffer)) as source:
         converted = source.convert("RGB") if source.mode not in ("RGB", "RGBA") else None
         img = converted if converted is not None else source
         try:
@@ -414,7 +415,7 @@ def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_
     """元画像を OpenAI の画像編集で直し、元と同じ範囲・大きさで別ファイルに保存する。"""
     if on_start:
         on_start()  # The shared image slot has been acquired by the decorator.
-    with closing(Image.open(source_path)) as src:
+    with closing(open_image(source_path)) as src:
         canvas, box = _pad_to_ratio(src, EDIT_SIZE[0] / EDIT_SIZE[1])
     with closing(canvas):
         canvas_size = canvas.size
@@ -437,7 +438,7 @@ def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_
             if not b64:
                 last_error = "no image in response"
                 continue
-            with BytesIO(base64.b64decode(b64)) as decoded, closing(Image.open(decoded)) as source:
+            with BytesIO(base64.b64decode(b64)) as decoded, closing(open_image(decoded)) as source:
                 with closing(source.convert("RGB")) as rgb, closing(rgb.resize(canvas_size, Image.LANCZOS)) as resized:
                     with closing(resized.crop(box)) as edited:
                         _save_png(edited, output_path)
