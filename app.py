@@ -44,6 +44,7 @@ import map_renderer
 import retention
 import resource_diagnostics
 import retry_missing
+import subscription_runtime
 import job_health
 from image_resources import IMAGE_TASK_LIMIT
 
@@ -484,6 +485,17 @@ def _retention_notice():
 _IMAGE_NAME_RE = re.compile(r"^diagram_(\d{3})(?:_([a-c]))?$")
 
 
+def _set_job_card(job_id: str) -> None:
+    """案件（Trello カード）を、このジョブの AI 呼び出しの記録に付ける。
+
+    制作の進行ハブから ?card=<8文字> で開いた時だけ request.json に残る。PC のワーカーの記録
+    routing.jsonl に入り、ハブが案件に結び付ける（2026-10-22）。読めなくてもジョブは止めない。"""
+    try:
+        subscription_runtime.set_card(load_json(OUTPUT_DIR / job_id / "request.json", {}).get("card", ""))
+    except Exception as exc:
+        print(f"[card] 案件のカードを付けられませんでした（処理は続けます）: {type(exc).__name__}", flush=True)
+
+
 def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          user_instructions: str, concurrency: int,
                          provider: str = PROVIDER_NANOBANANA,
@@ -495,6 +507,7 @@ def _run_pipeline_thread(job_id: str, manuscript_text: str, target_count: int,
                          map_mode: str = "data"):
     job_dir = OUTPUT_DIR / job_id
     cancellation = Cancellation(job_dir)
+    _set_job_card(job_id)
     resource_diagnostics.record("started", "generation", active_jobs=len(_active_jobs))
     provider_label = "nanobanana (Gemini)" if provider == PROVIDER_NANOBANANA else f"gpt-image (OpenAI / {openai_quality})"
     try:
@@ -598,6 +611,7 @@ def index():
                             "minutes": max(1, round(seconds / 60))}
     resp = make_response(render_template(
         "upload.html",
+        hub_card=subscription_runtime.clean_card(request.args.get("card", "")),
         openai_image_models=[{"id": m, "label": l} for m, l in OPENAI_IMAGE_MODEL_CHOICES],
         default_openai_model=resolve_openai_image_model(),
         past_jobs=past_jobs[:30],
@@ -684,6 +698,8 @@ def start_job():
         "worldview_preset": worldview_preset, "no_text_mode": no_text_mode,
         "user_instructions": user_instructions, "candidate_mode": candidate_mode, "map_mode": map_mode,
         "gemini_model": os.environ.get("GEMINI_IMAGE_MODEL") or DEFAULT_GEMINI_MODEL,
+        # ハブの案件から開いた時の Trello カード（8文字）。作り直しにも引き継ぐ。
+        "card": subscription_runtime.clean_card(request.form.get("card", "")),
     })
 
     _set_job_state(
@@ -773,12 +789,13 @@ def restart_settings(job_id):
         if instructions.is_file():
             settings["user_instructions"] = instructions.read_text(encoding="utf-8")
     keys = ("target_count", "concurrency", "provider", "openai_quality", "openai_model",
-            "worldview_preset", "no_text_mode", "user_instructions", "candidate_mode", "map_mode")
+            "worldview_preset", "no_text_mode", "user_instructions", "candidate_mode", "map_mode", "card")
     return jsonify({"manuscript_text": manuscript, "settings": {k: settings[k] for k in keys if k in settings}})
 
 
 def _run_missing_thread(job_id, plan):
     job_dir = OUTPUT_DIR / job_id
+    _set_job_card(job_id)
     resource_diagnostics.record("started", "missing_retry", active_jobs=len(_active_jobs))
     try:
         _set_job_state(job_id, status="running", phase=3, message="不足分の画像を再生成しています。", percent=50)

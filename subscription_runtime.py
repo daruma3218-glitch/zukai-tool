@@ -57,6 +57,10 @@ WORKER_CHECK_DELAYS = (5, 15, 25)
 WORKER_HEARTBEAT_FRESH_SEC = 60
 BUCKET = "subsk-gateway"
 JOB_ID = contextvars.ContextVar("subscription_job_id", default="")
+# 作業中の案件（Trello カードの短いID 8文字）。routing.jsonl に残し、制作の進行ハブが案件に結び付ける(2026-10-22)。
+CARD = contextvars.ContextVar("subscription_card", default="")
+_CARD_THREADS_LOCK = threading.Lock()
+_CARD_THREADS = False
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _PUMP_THREAD = None
 
@@ -377,10 +381,63 @@ def _write_json(path, value):
     os.replace(temp,path)
 
 
+def clean_card(value):
+    """Trello カードの短いID(8文字)だけを返す。カードのURLも受け取る。それ以外は空文字。"""
+    value=str(value or "").strip()
+    match=re.fullmatch(r"https://trello\.com/c/([A-Za-z0-9]{8})(?:/[^?#]*)?/?",value)
+    value=match[1] if match else value
+    return value if re.fullmatch(r"[A-Za-z0-9]{8}",value) else ""
+
+
+def set_card(value):
+    """この処理と、ここから始めるスレッドの AI 呼び出しに案件のカードを付ける。
+
+    スタジオはジョブの処理の頭で呼ぶ。スレッドとスレッドプールにも同じカードを引き継ぐ
+    (contextvars はスレッドへ自動では渡らないため)。戻り値は CARD.reset に渡せる。"""
+    _carry_card_into_threads()
+    return CARD.set(clean_card(value))
+
+
+def _carry_card_into_threads():
+    global _CARD_THREADS
+    with _CARD_THREADS_LOCK:
+        if _CARD_THREADS:
+            return
+        import concurrent.futures
+        start=threading.Thread.start
+        submit=concurrent.futures.ThreadPoolExecutor.submit
+        def start_with_card(self,*args,**kwargs):
+            card=CARD.get()
+            if card and not getattr(self,"_subscription_card",""):
+                self._subscription_card=card
+                run=self.run
+                def run_with_card():
+                    CARD.set(card)
+                    return run()
+                self.run=run_with_card
+            return start(self,*args,**kwargs)
+        def submit_with_card(self,fn,/,*args,**kwargs):
+            card=CARD.get()
+            def call():
+                # 使い回しのスレッドに前の案件を残さないよう、仕事ごとに付け直して戻す。
+                token=CARD.set(card)
+                try:
+                    return fn(*args,**kwargs)
+                finally:
+                    CARD.reset(token)
+            return submit(self,call)
+        threading.Thread.start=start_with_card
+        concurrent.futures.ThreadPoolExecutor.submit=submit_with_card
+        _CARD_THREADS=True
+
+
 def _record(request, **fields):
     row = {"ts":time.time(), "policy_version":POLICY_VERSION, "request_id":request["id"],
            "job_id":request.get("job_id", ""),"tool":request.get("tool", ""),
            "label":request.get("label", ""),"channel":request.get("channel", ""), **fields}
+    card = clean_card(request.get("card"))
+    if card:
+        row["card"] = card
     try:
         with (state_dir()/"routing.jsonl").open("a",encoding="utf-8") as handle:
             handle.write(json.dumps(row,ensure_ascii=False)+"\n")
@@ -1205,7 +1262,7 @@ def run_api_request(request, conf=None, cancel_check=None):
 
 def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900,
              tool="workflow",label="",channel="",job_id="",attachments=None,effort=None,max_tokens=4096,protocol_tools=None,
-              workload="",fallback_model=None,allow_fallback=True,notify=True,cancel_check=None):
+              workload="",fallback_model=None,allow_fallback=True,notify=True,cancel_check=None,card=""):
     _cancel_checkpoint(cancel_check)
     if not isinstance(allow_fallback, bool):
         raise ValueError("allow_fallback must be a boolean")
@@ -1217,7 +1274,7 @@ def generate(system,query,*,model=None,primary=None,use_search=False,timeout=900
     request={"id":uuid.uuid4().hex,"job_id":job_id or JOB_ID.get(),"system":flatten(system),"query":flatten(query),
              "model":model,"primary":primary or ("codex" if str(model).startswith(("gpt-","o3","o4")) else "claude"),
              "use_search":bool(use_search),"timeout":max(30,int(timeout or 900)),"tool":tool,"label":label,
-             "channel":channel,"attachments":attachments or [],"effort":effort,"max_tokens":max_tokens,
+             "channel":channel,"card":clean_card(card or CARD.get()),"attachments":attachments or [],"effort":effort,"max_tokens":max_tokens,
              "protocol_tools":protocol_tools or [], "workload":workload, "fallback_model":fallback_model,
               "routing_version":ROUTING_VERSION,"allow_fallback":allow_fallback,"notify":bool(notify)}
     for provider in ("claude", "codex"):

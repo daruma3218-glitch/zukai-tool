@@ -73,6 +73,8 @@
 
         <form id="uploadForm" enctype="multipart/form-data" class="space-y-6">
           <p id="restoreJobNotice" class="hidden p-3 rounded-xl bg-purple-50 text-purple-800 text-sm" role="status"></p>
+          <input type="hidden" name="card" id="hubCard" value="{{ hub_card or '' }}">
+          <p id="hubCardNotice" class="{{ '' if hub_card else 'hidden ' }}p-3 rounded-xl bg-slate-50 text-slate-700 text-sm" role="status">制作の進行ハブの案件（Trello のカード <span id="hubCardId">{{ hub_card or '' }}</span>）の作業として記録します。</p>
           <label id="restoredNoText" class="hidden text-sm text-gray-600"><input type="checkbox" name="no_text_mode" id="noTextMode"> 元のジョブの「文字なし」を引き継ぐ</label>
 
           <!-- 原稿入力 -->
@@ -535,6 +537,12 @@
         manuscriptText.value = data.manuscript_text;
         charCount.textContent = manuscriptText.value.length.toLocaleString();
         userInstructions.value = data.settings.user_instructions || '';
+        const hubCard = document.getElementById('hubCard');
+        if (!hubCard.value && data.settings.card) {
+          hubCard.value = data.settings.card;
+          document.getElementById('hubCardId').textContent = data.settings.card;
+          document.getElementById('hubCardNotice').classList.remove('hidden');
+        }
         if (data.settings.no_text_mode) {
           document.getElementById('restoredNoText').classList.remove('hidden');
           document.getElementById('noTextMode').checked = true;
