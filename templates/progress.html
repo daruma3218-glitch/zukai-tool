@@ -46,6 +46,16 @@
     .modal-browse button:disabled { opacity: .35; cursor: not-allowed; }
     #modalClose { width: 44px; }
     @media(max-width:640px) { #modal { padding: 8px; } #modalPanel { max-height: calc(100dvh - 16px); } #modalTitle { white-space: normal; } .modal-browse { padding: 8px 12px; } .modal-browse button { padding: 8px; font-size: 13px; } #instructText { flex-basis: 100%; min-width: 0; } }
+    .modal-edit-tools { margin-top: 12px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 0 12px; }
+    .modal-edit-tools summary { min-height: 48px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; cursor: pointer; font-size: 14px; font-weight: 600; color: #6b21a8; }
+    .modal-edit-tools summary::before { content: "＋"; }
+    .modal-edit-tools[open] summary::before { content: "−"; }
+    .modal-edit-tools summary span { font-size: 12px; font-weight: 400; color: #6b7280; }
+    .modal-edit-tools[open] { padding-bottom: 12px; }
+    .modal-edit-tools button small { display: block; font-size: 10px; color: #6b7280; }
+    .modal-edit-tools button { min-height: 44px; }
+    .modal-edit-tools summary:focus-visible { outline: 3px solid #a855f7; outline-offset: 2px; }
+    #modalAdopt, #modalRevision { min-height: 44px; }
   </style>
 {% include '_studio_icons.html' %}
 </head>
@@ -268,14 +278,18 @@
         <div class="flex flex-wrap items-center gap-2">
           <button id="modalAdopt" onclick="toggleShownAdopted()" class="px-3 py-1.5 rounded-lg text-sm font-medium border border-amber-400 text-amber-700 hover:bg-amber-50">☆ この版を採用</button>
           <button id="modalRevision" type="button" onclick="toggleRevision(modalState.idx)" class="px-3 py-1.5 rounded-lg text-sm border border-orange-300 text-orange-800">要修正にする</button>
-          <span class="text-gray-300">|</span>
-          <button onclick="editImage('flip')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">左右反転</button>
-          <button onclick="editImage('remove_text')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">文字を全部消す</button>
-          <input id="instructText" type="text" maxlength="1000" placeholder="例: 背景をもっと暗く / 右の人物を消して" class="flex-1 min-w-[12rem] px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
-          <button onclick="editImage('instruct')" class="px-3 py-1.5 rounded-lg text-sm border border-purple-400 text-purple-700 hover:bg-purple-50">指示して直す</button>
+        </div>
+        <details id="modalEditTools" class="modal-edit-tools">
+          <summary>画像を直す <span>反転・文字消し・別案</span></summary>
+          <div class="flex flex-wrap items-center gap-2">
+          <button onclick="editImage('flip')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">左右反転 <small>費用なし</small></button>
+          <button onclick="editImage('remove_text')" class="px-3 py-1.5 rounded-lg text-sm border border-gray-300 hover:bg-gray-50">文字を全部消す <small>画像1枚分</small></button>
+          <label for="instructText" class="sr-only">直したい内容</label><input id="instructText" type="text" maxlength="1000" placeholder="例: 背景をもっと暗く / 右の人物を消して" class="flex-1 min-w-[12rem] px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500">
+          <button onclick="editImage('instruct')" class="px-3 py-1.5 rounded-lg text-sm border border-purple-400 text-purple-700 hover:bg-purple-50">指示して直す <small>画像1枚分</small></button>
         </div>
         <p class="text-[11px] text-gray-400 mt-1">左右反転は費用なし。文字消し・指示直しは画像1枚分の費用（GPT Image 2.5 Sunburst）。元の画像は残り、直した画像は別の版として下に並びます。</p>
         <div id="retypeRow" class="mt-2 flex flex-wrap items-center gap-2"></div>
+        </details>
         <p id="editStatus" class="text-xs mt-1"></p>
         <p id="modalRevisionError" class="hidden mt-1 text-xs text-red-700" role="alert"></p>
         <div id="versionStrip" class="mt-2 flex gap-2 overflow-x-auto"></div>
@@ -1389,7 +1403,7 @@
       if (!modalState) return;
       if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
       if (e.key === 'Tab') {
-        const nodes = Array.from(document.getElementById('modalPanel').querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled)')).filter(node => node.getClientRects().length);
+        const nodes = Array.from(document.getElementById('modalPanel').querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary')).filter(node => node.getClientRects().length);
         const first = nodes[0], last = nodes[nodes.length - 1];
         if (first && e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
         else if (last && !e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
