@@ -173,11 +173,14 @@
 
       <!-- 1枚でも保存できたら利用できるアクション -->
       <div id="actions" class="hidden mt-5 flex flex-wrap gap-3">
-        <a id="downloadBtn" href="" class="inline-flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-medium rounded-xl hover:from-purple-700 hover:to-pink-700 transition shadow-md">
+        <div class="w-full p-4 rounded-xl border border-purple-200 bg-purple-50"><p class="text-xs text-purple-800 font-bold mb-1">次はここ</p><p id="reviewGuide" class="text-sm text-gray-800" role="status"></p></div>
+        <button id="reviewNextBtn" type="button" class="px-5 py-3 rounded-xl bg-purple-700 text-white font-bold" style="min-height:52px" onclick="reviewNextUnadopted()">画像を確認して採用 →</button>
+        <details class="order-last w-full"><summary class="text-sm text-gray-600 cursor-pointer py-3">全候補をまとめて保存したい場合</summary><a id="downloadBtn" href="" class="inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
           <span id="downloadLabel">ZIP でダウンロード</span>
         </a>
-        <a id="adoptedBtn" href="" class="hidden inline-flex items-center gap-2 px-5 py-2.5 bg-amber-500 text-white font-medium rounded-xl hover:bg-amber-600 transition shadow-md">
+        </details>
+        <a id="adoptedBtn" href="" class="hidden inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-purple-300 text-purple-800 font-bold rounded-xl hover:bg-purple-50 transition min-h-[52px]">
           ★ <span id="adoptedLabel">採用分だけZIP</span>
         </a>
         <a href="/" class="inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition">
@@ -617,7 +620,7 @@
         ? `<span class="absolute top-9 left-1.5 z-10 bg-white/90 text-gray-700 text-[10px] px-1.5 py-0.5 rounded">${escapeHtml(typeLabel)}</span>` : '';
       const retypeRow = status === 'ok' && filename && originalType(item) === 'map' ? retypeRowHtml(item) : '';
       const adoptBtn = status === 'ok' && filename
-        ? `<button type="button" title="採用する（もう一度押すと取り消し）" onclick="event.stopPropagation(); toggleCardAdopted(${idx})" class="absolute top-1 right-1 z-10 w-7 h-7 rounded-full ${adopted ? 'bg-amber-400 text-white' : 'bg-black/40 text-white hover:bg-amber-400'} text-sm leading-7 text-center">${adopted ? '★' : '☆'}</button>` : '';
+        ? `<button type="button" title="採用する（もう一度押すと取り消し）" onclick="event.stopPropagation(); toggleCardAdopted(${idx})" class="absolute top-1 right-1 z-10 w-11 h-11 rounded-full ${adopted ? 'bg-amber-400 text-white' : 'bg-black/40 text-white hover:bg-amber-400'} text-base leading-[44px] text-center">${adopted ? '★' : '☆'}</button>` : '';
       const editBadge = edits.length
         ? `<span class="absolute top-1.5 right-9 z-10 ${running ? 'bg-yellow-400' : 'bg-purple-600'} text-white text-[10px] px-1.5 py-0.5 rounded">${running ? (active.some(e => e.action === 'retype') ? '作り直し中' : '直し中') : '直し' + edits.filter(e => e.status === 'ok').length}</span>` : '';
       const needsRevision = revisionSet.has(filename);
@@ -738,16 +741,41 @@
       els.actions.classList.toggle('hidden', availableImages === 0);
       els.downloadBtn.href = `/download/${JOB_ID}`;
       els.downloadLabel.textContent = jobStatus === 'completed'
-        ? `ZIP でダウンロード（${availableImages}枚）`
+        ? `全候補を保存（${availableImages}枚・未採用も含む）`
         : `完成済み ${availableImages}枚をZIPでダウンロード`;
       const adoptedCount = adoptedSet.size;
       els.adoptedBtn.classList.toggle('hidden', adoptedCount === 0);
       const start = Math.min(Math.max(parseInt(els.adoptStart.value, 10) || 1, 1), 99999);
       els.adoptedBtn.href = `/download-adopted/${JOB_ID}?start=${start}`;
-      els.adoptedLabel.textContent = `採用分だけZIP（${adoptedCount}枚）`;
+      els.adoptedLabel.textContent = `採用画像を保存（${adoptedCount}枚・ZIP）`;
+      updateReviewGuide();
       els.adoptTools.classList.toggle('hidden', adoptedCount === 0);
       els.adoptSummary.textContent = adoptedCount ? adoptSummaryText() : '';
       els.adoptHint.classList.toggle('hidden', availableImages === 0 || adoptedCount > 0);
+    }
+
+    function reviewGroups() {
+      const items = Object.values(knownItems);
+      const chosen = new Set(items.filter(isAdopted).map(i => i.group ?? i.index));
+      return {items, pending:items.filter(i => !chosen.has(i.group ?? i.index))};
+    }
+    function updateReviewGuide() {
+      const {items, pending} = reviewGroups();
+      const next = pending.find(i => i.status === 'ok' && i.filename);
+      const flagged = items.some(i => revisionSet.has(i.filename));
+      const button = document.getElementById('reviewNextBtn');
+      button.disabled = !items.some(i => i.status === 'ok' && i.filename);
+      button.textContent = next ? '未採用の画像を確認 →' : flagged ? '要修正の画像を確認 →' : '採用した画像を見直す';
+      const done = items.length > 0 && !pending.length && !flagged && jobStatus === 'completed';
+      button.classList.toggle('opacity-60', done);
+      els.adoptedBtn.style.background = done ? '#6b21a8' : '';
+      els.adoptedBtn.style.color = done ? '#fff' : '';
+      document.getElementById('reviewGuide').textContent = next ? '画像を拡大して「この版を採用」。決めた画像だけを、ZIPで保存できます。' : flagged ? '要修正の印が残っています。内容を確認し、問題がなければ一覧で印を解除してください。' : done ? 'すべての箇所で採用を選びました。「採用画像を保存」で編集担当へ渡せます。' : '完成した画像から採用できます。未完成・失敗した箇所は一覧で確認してください。';
+    }
+    function reviewNextUnadopted() {
+      const {items, pending} = reviewGroups();
+      const next = pending.find(i => i.status === 'ok' && i.filename) || items.find(i => i.status === 'ok' && revisionSet.has(i.filename)) || items.find(i => i.status === 'ok' && i.filename);
+      if (next) openModal(next.index);
     }
 
     // 採用した画像の種類の内訳と、採用が決まった箇所の数
@@ -969,6 +997,7 @@
         try { data = await res.json(); } catch (e) {}
         if (!res.ok || !Array.isArray(data.needs_revision)) throw new Error(data.error || '要修正の印を保存できませんでした。もう一度お試しください。');
         revisionSet = new Set(data.needs_revision);
+        updateReviewGuide();
       } catch (e) {
         error.textContent = e.message;
         error.classList.toggle('hidden', false);

@@ -21,6 +21,8 @@
       width: 20px; height: 20px;
       background: #9333ea; border-radius: 50%; cursor: pointer; border: none;
     }
+      #submitBtn { min-height:56px; font-size:17px; }
+    #dropZone:focus-visible { outline:3px solid #2563eb; outline-offset:3px; }
   </style>
 {% include '_studio_icons.html' %}
 </head>
@@ -71,6 +73,12 @@
         </div>
         {% endif %}
 
+        <section class="mb-6 p-4 rounded-2xl border border-purple-200 bg-purple-50" aria-label="制作の流れ">
+          <p class="text-xs font-bold text-purple-800 mb-2">まずはここから</p>
+          <ol class="grid grid-cols-3 gap-2 text-xs sm:text-sm text-gray-700" style="list-style:none;padding:0">
+          <li aria-current="step" class="font-bold text-purple-800"><span class="block text-xl mb-1">①</span>原稿を入れる</li><li><span class="block text-xl mb-1">②</span>画像を確認・採用</li><li><span class="block text-xl mb-1">③</span>採用画像を保存</li></ol>
+          <p class="text-sm text-gray-700 mt-3">完成原稿を入れて、下の生成ボタンへ。生成後は使う画像を選び、採用した分を保存します。</p>
+        </section>
         <form id="uploadForm" enctype="multipart/form-data" class="space-y-6">
           <p id="restoreJobNotice" class="hidden p-3 rounded-xl bg-purple-50 text-purple-800 text-sm" role="status"></p>
           <input type="hidden" name="card" id="hubCard" value="{{ hub_card or '' }}">
@@ -92,7 +100,7 @@
               <span class="text-xs text-gray-400 font-normal">（ファイル or テキスト）</span>
             </label>
 
-            <div id="dropZone" class="drop-zone border-2 border-dashed border-gray-300 rounded-xl p-6 text-center cursor-pointer bg-white">
+            <div id="dropZone" role="button" tabindex="0" aria-label="原稿ファイルを選ぶ" class="drop-zone border-2 border-dashed border-gray-300 rounded-xl p-6 text-center cursor-pointer bg-white">
               <input type="file" id="fileInput" name="manuscript_file" accept=".txt,.md" class="hidden">
               <svg class="w-10 h-10 text-gray-400 mx-auto mb-2" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M9 8.25H7.5a2.25 2.25 0 00-2.25 2.25v9a2.25 2.25 0 002.25 2.25h9a2.25 2.25 0 002.25-2.25v-9a2.25 2.25 0 00-2.25-2.25H15M9 12l3 3m0 0l3-3m-3 3V2.25"/>
@@ -404,6 +412,7 @@
 
     // ドラッグ&ドロップ
     dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
     fileInput.addEventListener('change', () => {
       if (fileInput.files.length > 0) {
         dropText.textContent = `📄 ${fileInput.files[0].name}`;

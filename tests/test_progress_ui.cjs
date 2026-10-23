@@ -60,7 +60,7 @@ test('完了通知が画像一覧より先に届いても、一覧取得後に�
   assert.equal(p.element('actions').classList.contains('hidden'), true);
   await p.run('pollItems()');
   assert.equal(p.element('actions').classList.contains('hidden'), false);
-  assert.match(p.element('downloadLabel').textContent, /ZIP でダウンロード（2枚）/);
+  assert.match(p.element('downloadLabel').textContent, /全候補を保存（2枚・未採用も含む）/);
 });
 
 test('保存済み画像がゼロなら空ZIPへのボタンを出さない', async () => {
@@ -68,4 +68,20 @@ test('保存済み画像がゼロなら空ZIPへのボタンを出さない', as
   await p.run('pollStatus()');
   await p.run('pollItems()');
   assert.equal(p.element('actions').classList.contains('hidden'), true);
+});
+
+test('同じ箇所の別案は採用を求めず、全箇所を選ぶと保存へ案内する', () => {
+  const p = page('completed', 3);
+  p.run(`knownItems = {
+    1:{index:1,group:1,status:'ok',filename:'diagram_001_a.png'},
+    2:{index:2,group:1,status:'ok',filename:'diagram_001_b.png'},
+    3:{index:3,group:2,status:'ok',filename:'diagram_002.png'}
+  }; jobStatus='completed'; adoptedSet=new Set(['diagram_001_a.png']); updateReviewGuide();`);
+  assert.equal(p.element('reviewNextBtn').textContent, '未採用の画像を確認 →');
+  p.run(`adoptedSet.add('diagram_002.png'); updateReviewGuide();`);
+  assert.match(p.element('reviewGuide').textContent, /採用画像を保存/);
+  assert.equal(p.element('adoptedBtn').style.background, '#6b21a8');
+  p.run(`revisionSet.add('diagram_002.png'); updateReviewGuide();`);
+  assert.equal(p.element('reviewNextBtn').textContent, '要修正の画像を確認 →');
+  assert.equal(p.element('adoptedBtn').style.background, '');
 });
