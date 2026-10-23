@@ -355,16 +355,17 @@
 
           <!-- 送信ボタン -->
           <div class="generation-action-bar">
+          <p id="generation-readiness" role="status" aria-live="polite" class="text-sm text-gray-600 mb-2">原稿を100文字以上入れると生成できます。</p>
+          <div id="errorBox" role="alert" class="hidden p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700 mb-2"></div>
           <button
             type="submit"
-            id="submitBtn"
+            id="submitBtn" disabled aria-describedby="generation-readiness"
             class="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-bold rounded-xl hover:from-purple-700 hover:to-pink-700 transition shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <span id="submitText">図解を一気に生成する</span>
           </button>
           </div>
 
-          <div id="errorBox" class="hidden p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700"></div>
         </form>
       </div>
 
@@ -426,6 +427,7 @@
     const submitBtn = document.getElementById('submitBtn');
     const submitText = document.getElementById('submitText');
     const errorBox = document.getElementById('errorBox');
+    let submitting = false, restoring = false, restoreFailed = false;
 
     // ドラッグ&ドロップ
     dropZone.addEventListener('click', () => fileInput.click());
@@ -456,12 +458,16 @@
       charCount.textContent = manuscriptText.value.length.toLocaleString();
       const length = manuscriptText.value.trim().length;
       const remaining = Math.max(0, 100 - length);
+      const ready = fileInput.files.length > 0 || remaining === 0;
+      submitBtn.disabled = submitting || restoring || restoreFailed || !ready;
+      document.getElementById('generation-readiness').textContent = restoring ? '元の原稿を読み込んでいます…' : restoreFailed ? '原稿を読み込めませんでした。上の案内を確認してください。' : submitting ? '原稿を送っています…' : ready ? '設定を確認したら、生成できます。' : length ? `あと${remaining}文字で生成できます。` : '原稿を100文字以上入れると生成できます。';
       document.getElementById('input-readiness').textContent = fileInput.files.length
         ? '· ファイルを選択しました。下で作り方を選べます'
         : !length ? '· 原稿を入れてください'
         : remaining ? `· あと${remaining}文字で生成できます` : '· 入力できました。下で作り方を選べます';
     }
     manuscriptText.addEventListener('input', updateInputReadiness);
+    updateInputReadiness();
 
     // ハブの案件から開いた時：カードの原稿を原稿欄へ入れる。入力済みの原稿は上書きしない。生成はまだ始めない。
     (function () {
@@ -604,7 +610,7 @@
     async function restoreJobSettings() {
       const job = new URLSearchParams(window.location.search).get('retry');
       if (!job) return;
-      submitBtn.disabled = true;
+      restoring = true; updateInputReadiness();
       const note = document.getElementById('restoreJobNotice');
       note.classList.remove('hidden');
       note.textContent = '元の原稿と設定を読み込んでいます…';
@@ -628,8 +634,9 @@
           document.getElementById('noTextMode').checked = true;
         }
         note.textContent = '元の原稿と設定を引き継ぎました。設定を直して生成してください。新しいジョブとして最初から作り直します（画像の生成費用がかかります）。元の画像は残ります。';
-        submitBtn.disabled = false;
+        restoring = false; updateInputReadiness();
       } catch (e) {
+        restoring = false; restoreFailed = true; updateInputReadiness();
         note.textContent = e.message + ' 新規ジョブから原稿を入力し直すこともできます。';
       }
     }
@@ -638,8 +645,9 @@
     // フォーム送信
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (submitBtn.disabled) return;
       errorBox.classList.add('hidden');
-      submitBtn.disabled = true;
+      submitting = true; updateInputReadiness();
       submitText.textContent = '送信中...';
       saveSettings();
 
@@ -650,7 +658,7 @@
         if (!res.ok) {
           errorBox.textContent = data.error || 'エラーが発生しました';
           errorBox.classList.remove('hidden');
-          submitBtn.disabled = false;
+          submitting = false; updateInputReadiness();
           submitText.textContent = '図解を一気に生成する';
           return;
         }
@@ -658,7 +666,7 @@
       } catch (err) {
         errorBox.textContent = '通信エラー: ' + err.message;
         errorBox.classList.remove('hidden');
-        submitBtn.disabled = false;
+        submitting = false; updateInputReadiness();
         submitText.textContent = '図解を一気に生成する';
       }
     });
