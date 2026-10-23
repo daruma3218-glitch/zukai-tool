@@ -78,11 +78,11 @@ test('候補は同じ抜粋の案を横に並べ、案の番号と種類を出�
   assert.match(grid.innerHTML, /地図/);
 });
 
-test('採用した画像があると「採用分だけZIP」を出す', async () => {
+test('採用した画像があると「採用画像を保存」を枚数つきで出す', async () => {
   const p = page(candidates);
   await p.run('pollItems()');
   assert.equal(p.element('adoptedBtn').classList.contains('hidden'), false);
-  assert.match(p.element('adoptedLabel').textContent, /採用分だけZIP（1枚）/);
+  assert.match(p.element('adoptedLabel').textContent, /採用画像を保存（1枚・ZIP）/);
   assert.match(p.element('adoptedBtn').href, /^\/download-adopted\//);
   assert.match(p.element('imgGrid').innerHTML, /★/);
 });
