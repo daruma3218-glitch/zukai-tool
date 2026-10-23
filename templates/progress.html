@@ -56,7 +56,22 @@
     .modal-edit-tools button { min-height: 44px; }
     .modal-edit-tools summary:focus-visible { outline: 3px solid #a855f7; outline-offset: 2px; }
     #modalAdopt, #modalRevision { min-height: 44px; }
-  </style>
+
+/* Action cues inherit the diagram logo's geometry and purple. */
+.studio-action-guide { background:#f4f0fb; border-color:#d7c9fa; border-left:5px solid #7553c8; }
+.studio-action-kicker { display:inline-flex; align-items:center; gap:8px; font-size:13px; font-weight:800; color:#7553c8; margin-bottom:10px; }
+.studio-action-kicker::before { content:""; width:25px; height:25px; border-radius:7px; background-color:#7553c8; background-image:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-width%3D%222.3%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%2012h14m-6-6%206%206-6%206%22%2F%3E%3C%2Fsvg%3E"); background-size:18px; background-position:center; background-repeat:no-repeat; }
+#reviewNextBtn { display:inline-flex; align-items:center; justify-content:center; gap:12px; min-height:58px; padding:13px 20px; border-radius:13px; font-size:16px; font-weight:750; line-height:1.45; white-space:normal; }
+#reviewNextBtn::before { content:""; display:block; width:26px; height:26px; flex:0 0 26px; background:currentColor; mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%222.3%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%2012h14m-6-6%206%206-6%206%22%2F%3E%3C%2Fsvg%3E") center/contain no-repeat; }
+#reviewNextBtn:not(:disabled) { background:#7553c8; border-color:#7553c8; color:white; box-shadow:0 3px 0 color-mix(in srgb,#7553c8 70%,black); }
+#reviewNextBtn:not(:disabled):hover { filter:brightness(1.06); }
+#reviewNextBtn:not(:disabled):active { box-shadow:none; transform:translateY(2px); }
+#reviewNextBtn:focus-visible { outline:3px solid #7553c8; outline-offset:4px; }
+#adoptedBtn { border-radius:13px; min-height:58px; font-size:16px; }
+#adoptedBtn::before { content:""; width:26px; height:26px; flex:0 0 26px; background:currentColor; mask:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%222.3%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%2016v5h16v-5M12%203v12m-5-5%205%205%205-5%22%2F%3E%3C%2Fsvg%3E") center/contain no-repeat; }
+#adoptedBtn.bg-purple-700 { background:#7553c8; border-color:#7553c8; box-shadow:0 3px 0 #52388f; }
+@media(max-width:600px) { #reviewNextBtn,#adoptedBtn { width:100%; justify-content:center; } }
+</style>
 {% include '_studio_icons.html' %}
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -173,8 +188,8 @@
 
       <!-- 1枚でも保存できたら利用できるアクション -->
       <div id="actions" class="hidden mt-5 flex flex-wrap gap-3">
-        <div class="w-full p-4 rounded-xl border border-purple-200 bg-purple-50"><p class="text-xs text-purple-800 font-bold mb-1">次はここ</p><p id="reviewGuide" class="text-sm text-gray-800" role="status"></p></div>
-        <button id="reviewNextBtn" type="button" class="px-5 py-3 rounded-xl bg-purple-700 text-white font-bold" style="min-height:52px" onclick="reviewNextUnadopted()">画像を確認して採用 →</button>
+        <div class="studio-action-guide w-full p-4 rounded-xl border border-purple-200 bg-purple-50"><p class="studio-action-kicker">次はこのボタン</p><p id="reviewGuide" class="text-sm text-gray-800" role="status"></p></div>
+        <button id="reviewNextBtn" type="button" class="px-5 py-3 rounded-xl bg-purple-700 text-white font-bold" style="min-height:58px" onclick="reviewNextUnadopted()">画像を確認して採用 →</button>
         <details class="order-last w-full"><summary class="text-sm text-gray-600 cursor-pointer py-3">全候補をまとめて保存したい場合</summary><a id="downloadBtn" href="" class="inline-flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
           <span id="downloadLabel">ZIP でダウンロード</span>
