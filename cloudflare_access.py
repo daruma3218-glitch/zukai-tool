@@ -42,6 +42,36 @@ def required() -> bool:
     return enabled() or bool(os.environ.get("RENDER_SERVICE_ID", "").strip())
 
 
+def _origin(value: str):
+    """Browser Origin is an HTTPS authority, never a path or a trusted Host header."""
+    from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.path or parsed.query or parsed.fragment
+                or "\\" in value or any(char.isspace() for char in value)):
+            return None
+        return parsed.scheme, parsed.hostname.lower(), 443 if parsed.port is None else parsed.port
+    except ValueError:
+        return None
+
+
+def _foreign_browser_write(canonical_url: str) -> bool:
+    from flask import request
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return False
+    site = request.headers.get("Sec-Fetch-Site", "").lower()
+    if site == "cross-site":
+        return True
+    origin = request.headers.get("Origin")
+    if origin is not None:
+        expected = _origin(canonical_url.rstrip("/"))
+        return expected is None or _origin(origin) != expected
+    # Sibling subdomains are not trusted. JWT-authenticated machine clients,
+    # which send neither browser header, retain their existing behavior.
+    return site == "same-site"
+
+
 def enforce_studio_access(canonical_url: str, *, health_paths=()):
     """全画面・APIを保護し、既存の非機密な診断口だけを残す。
 
@@ -55,6 +85,11 @@ def enforce_studio_access(canonical_url: str, *, health_paths=()):
     if request.method in {"GET", "HEAD"} and request.path in health_paths:
         return None
     if verified_email(request.headers):
+        if _foreign_browser_write(canonical_url):
+            response = jsonify(error="正規の画面を開き直して操作してください。")
+            response.status_code = 403
+            response.headers["Cache-Control"] = "no-store"
+            return response
         session.permanent = True
         session["authenticated"] = True
         return None

@@ -99,3 +99,44 @@ def test_local_development_without_cloudflare_keeps_password_login(client, monke
     assert response.status_code == 302 and "/login" in response.headers["Location"]
     assert client.post("/login", data={"password": "test-password"}).status_code == 302
     assert client.get("/").status_code == 200
+
+
+@pytest.mark.parametrize("extra", [
+    {"Origin": "https://outside.example"},
+    {"Origin": "https://other.apprendre.jp"},
+    {"Origin": "null"},
+    {"Origin": CANONICAL.replace("https:", "http:")},
+    {"Origin": CANONICAL + ":444"},
+    {"Origin": CANONICAL + ":0"},
+    {"Origin": CANONICAL + ".outside.example"},
+    {"Origin": CANONICAL + "/path"},
+    {"Origin": CANONICAL + "?query"},
+    {"Origin": CANONICAL.replace("https://", "https://someone@")},
+    {"Origin": CANONICAL + ":invalid"},
+    {"Sec-Fetch-Site": "cross-site"},
+    {"Sec-Fetch-Site": "same-site"},
+    {"Origin": CANONICAL, "Sec-Fetch-Site": "cross-site"},
+])
+def test_foreign_browser_cannot_start_work_with_valid_login(client, monkeypatch, extra):
+    called = []
+    monkeypatch.setitem(appmod.app.view_functions, "start_job", lambda: (called.append(True) or "", 204))
+    response = client.post("/start", base_url=CANONICAL,
+                           headers={ca.HEADER: token(), **extra})
+    assert response.status_code == 403
+    assert response.headers["Cache-Control"] == "no-store"
+    assert not called
+
+
+@pytest.mark.parametrize("extra", [
+    {"Origin": CANONICAL, "Sec-Fetch-Site": "same-origin"},
+    {"Origin": CANONICAL + ":443"},
+    {"Sec-Fetch-Site": "same-origin"},
+    {},  # Authenticated non-browser clients do not send Origin / Fetch Metadata.
+])
+def test_same_origin_and_authenticated_machine_requests_still_work(client, monkeypatch, extra):
+    called = []
+    monkeypatch.setitem(appmod.app.view_functions, "start_job", lambda: (called.append(True) or "", 204))
+    response = client.post("/start", base_url=CANONICAL,
+                           headers={ca.HEADER: token(), **extra})
+    assert response.status_code == 204
+    assert called == [True]
