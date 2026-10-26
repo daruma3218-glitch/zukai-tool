@@ -34,6 +34,13 @@
     #manuscriptText { scroll-margin-top:100px; }
     .generation-action-bar { position:sticky; bottom:0; z-index:20; padding:10px 0; background:rgba(255,255,255,.96); box-shadow:0 -8px 20px #4632580a; border-top:1px solid #eee5f7; }
     #uploadForm { padding-bottom:12px; }
+    .recovery-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .recovery-actions.hidden { display:none; }
+    .recovery-actions button,#clearFile { min-height:44px; border:1px solid #c9b8ed; border-radius:9px; padding:9px 14px; background:white; color:#573898; font-weight:700; font-size:13px; }
+    .recovery-actions .recovery-primary { color:white; background:#7553c8; border-color:#7553c8; }
+    #fileSelection { margin-top:8px; padding:12px; background:#faf5ff; border:1px solid #e9d5ff; border-radius:10px; }
+    #selectedFileName { overflow-wrap:anywhere; }
+    #fileSelection p { font-size:13px; color:#573898; margin-bottom:8px; }
     #input-readiness { color:#655b77; }
     #mainSettings { scroll-margin-top:90px; }
     #uploadForm input:focus-visible,#uploadForm button:focus-visible,#uploadForm summary:focus-visible,.input-cue-link:focus-visible { outline:3px solid #a48acb; outline-offset:3px; }
@@ -95,7 +102,13 @@
 
         </section>
         <form id="uploadForm" enctype="multipart/form-data" class="space-y-6">
-          <p id="restoreJobNotice" class="hidden p-3 rounded-xl bg-purple-50 text-purple-800 text-sm" role="status"></p>
+          <div id="restoreJobNotice" class="hidden p-3 rounded-xl bg-purple-50 text-purple-800 text-sm">
+            <p id="restoreJobMessage" role="status"></p>
+            <div id="restoreJobActions" class="hidden recovery-actions">
+              <button type="button" id="retryRestore" class="recovery-primary">もう一度読み込む</button>
+              <button type="button" id="continueManually">手入力で続ける</button>
+            </div>
+          </div>
           <input type="hidden" name="card" id="hubCard" value="{{ hub_card or '' }}">
           <p id="hubCardNotice" class="{{ '' if hub_card else 'hidden ' }}p-3 rounded-xl bg-slate-50 text-slate-700 text-sm" role="status">制作の進行ハブの案件（Trello のカード <span id="hubCardId">{{ hub_card or '' }}</span>）の作業として記録します。</p>
           <!-- ハブの案件のカードの原稿を原稿欄へ入れる（2026-10-22）。生成は「図解を一気に生成する」を押した時だけ -->
@@ -124,6 +137,10 @@
               <p class="text-xs text-gray-400 mt-1">.txt / .md をドロップしても読み込めます</p>
             </div>
 
+            <div id="fileSelection" class="hidden">
+              <p><strong id="selectedFileName"></strong> を使います。貼り付けた本文は使いません。</p>
+              <button type="button" id="clearFile">ファイルを外して、本文を使う</button>
+            </div>
             <textarea
               id="manuscriptText"
               name="manuscript_text"
@@ -433,10 +450,12 @@
     dropZone.addEventListener('click', () => fileInput.click());
     dropZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
     fileInput.addEventListener('change', () => {
-      if (fileInput.files.length > 0) {
-        dropText.textContent = `📄 ${fileInput.files[0].name}`;
-      }
       updateInputReadiness();
+    });
+    document.getElementById('clearFile').addEventListener('click', () => {
+      fileInput.value = '';
+      updateInputReadiness();
+      manuscriptText.focus();
     });
     ['dragenter', 'dragover'].forEach(ev => {
       dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('dragover'); });
@@ -448,7 +467,6 @@
       const files = e.dataTransfer.files;
       if (files.length > 0) {
         fileInput.files = files;
-        dropText.textContent = `📄 ${files[0].name}`;
         updateInputReadiness();
       }
     });
@@ -458,11 +476,15 @@
       charCount.textContent = manuscriptText.value.length.toLocaleString();
       const length = manuscriptText.value.trim().length;
       const remaining = Math.max(0, 100 - length);
-      const ready = fileInput.files.length > 0 || remaining === 0;
+      const hasFile = fileInput.files.length > 0;
+      dropText.textContent = hasFile ? '別のファイルを選ぶ' : '原稿ファイルを選ぶ';
+      document.getElementById('fileSelection').classList.toggle('hidden', !hasFile);
+      document.getElementById('selectedFileName').textContent = hasFile ? fileInput.files[0].name : '';
+      const ready = hasFile || remaining === 0;
       submitBtn.disabled = submitting || restoring || restoreFailed || !ready;
-      document.getElementById('generation-readiness').textContent = restoring ? '元の原稿を読み込んでいます…' : restoreFailed ? '原稿を読み込めませんでした。上の案内を確認してください。' : submitting ? '原稿を送っています…' : ready ? '設定を確認したら、生成できます。' : length ? `あと${remaining}文字で生成できます。` : '原稿を100文字以上入れると生成できます。';
+      document.getElementById('generation-readiness').textContent = restoring ? '元の原稿を読み込んでいます…' : restoreFailed ? '上の「もう一度読み込む」か「手入力で続ける」を選んでください。' : submitting ? '原稿を送っています…' : hasFile ? '選択したファイルから生成します。' : ready ? '貼り付けた本文から生成できます。' : length ? `あと${remaining}文字で生成できます。` : '原稿を100文字以上入れると生成できます。';
       document.getElementById('input-readiness').textContent = fileInput.files.length
-        ? '· ファイルを選択しました。下で作り方を選べます'
+        ? '· ファイルを使用します'
         : !length ? '· 原稿を入れてください'
         : remaining ? `· あと${remaining}文字で生成できます` : '· 入力できました。下で作り方を選べます';
     }
@@ -609,11 +631,14 @@
 
     async function restoreJobSettings() {
       const job = new URLSearchParams(window.location.search).get('retry');
-      if (!job) return;
-      restoring = true; updateInputReadiness();
+      if (!job || restoring) return;
+      restoreFailed = false; restoring = true; updateInputReadiness();
       const note = document.getElementById('restoreJobNotice');
+      const message = document.getElementById('restoreJobMessage');
+      const actions = document.getElementById('restoreJobActions');
+      actions.classList.add('hidden');
       note.classList.remove('hidden');
-      note.textContent = '元の原稿と設定を読み込んでいます…';
+      message.textContent = '元の原稿と設定を読み込んでいます…';
       try {
         const res = await fetch(`/api/restart-settings/${encodeURIComponent(job)}`);
         let data = {};
@@ -633,13 +658,26 @@
           document.getElementById('restoredNoText').classList.remove('hidden');
           document.getElementById('noTextMode').checked = true;
         }
-        note.textContent = '元の原稿と設定を引き継ぎました。設定を直して生成してください。新しいジョブとして最初から作り直します（画像の生成費用がかかります）。元の画像は残ります。';
+        message.textContent = '元の原稿と設定を引き継ぎました。内容を確認して生成してください。新しいジョブとして生成費用がかかります。元の画像は残ります。';
         restoring = false; updateInputReadiness();
       } catch (e) {
         restoring = false; restoreFailed = true; updateInputReadiness();
-        note.textContent = e.message + ' 新規ジョブから原稿を入力し直すこともできます。';
+        message.textContent = e.message;
+        actions.classList.remove('hidden');
       }
     }
+    document.getElementById('retryRestore').addEventListener('click', restoreJobSettings);
+    document.getElementById('continueManually').addEventListener('click', () => {
+      if (restoring || submitting) return;
+      const url = new URL(window.location.href);
+      url.searchParams.delete('retry');
+      window.history.replaceState(null, '', url.pathname + url.search + url.hash);
+      restoreFailed = false;
+      document.getElementById('restoreJobActions').classList.add('hidden');
+      document.getElementById('restoreJobMessage').textContent = '手入力に切り替えました。原稿と設定を確認してください。';
+      updateInputReadiness();
+      manuscriptText.focus();
+    });
     restoreJobSettings();
 
     // フォーム送信
