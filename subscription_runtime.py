@@ -55,6 +55,9 @@ USAGE_LIMIT_DELAYS = (30, 90)
 # 旧設定（合計20秒）ではワーカーが処理を続けていたのに worker_unavailable の通知が7件出た。
 WORKER_CHECK_DELAYS = (5, 15, 25)
 WORKER_HEARTBEAT_FRESH_SEC = 60
+# A running CLI may survive a temporary relay outage. Keep polling the same
+# request for five minutes after the first stale heartbeat; never resubmit it.
+WORKER_DISCONNECT_GRACE_SEC = 300
 BUCKET = "subsk-gateway"
 JOB_ID = contextvars.ContextVar("subscription_job_id", default="")
 # 作業中の案件（Trello カードの短いID 8文字）。routing.jsonl に残し、制作の進行ハブが案件に結び付ける(2026-10-22)。
@@ -223,7 +226,7 @@ def enqueue_notice(request, attempts, reason, *, test=False):
     title = "CLI障害通知の接続テスト" if test else "サブスクCLI処理停止・要確認"
     body = (f"[info][title]{title}[/title]\n"
             f"ツール: {_safe_label(request.get('tool'))}\n"
-            f"工程: {_safe_label(request.get('label'))}\n"
+            f"工程: {_safe_label(request.get('label') or request.get('workload') or 'CLI処理')}\n"
             f"ジョブ: {_safe_label(job)}\n"
             f"状態: {_safe_label(reason)}\n"
             f"試行: {_safe_label(routes, 320)}\n"
@@ -945,7 +948,7 @@ def _storage(method,path,body=None):
         return exc.code,{}
 
 
-def _worker_heartbeat():
+def _worker_heartbeat(fresh_sec=WORKER_HEARTBEAT_FRESH_SEC):
     """PCワーカーのハートビートを読み、(使えるか, 短い理由) を返す。理由は routing.jsonl と通知の試行欄に残す。"""
     try:
         code,hb=_storage("GET","hb/worker.json")
@@ -961,7 +964,7 @@ def _worker_heartbeat():
         return False,"bad_ts"
     if hb.get("policy_version")!=POLICY_VERSION or hb.get("routing_version")!=ROUTING_VERSION:
         return False,"version"
-    if age>=WORKER_HEARTBEAT_FRESH_SEC:
+    if age>=fresh_sec:
         return False,"age"+str(int(age))+"s"
     return True,""
 
@@ -1012,26 +1015,33 @@ def _gateway_generate(request, cancel_check=None):
         # Worker retries both CLIs. Never time out before that retry budget has elapsed.
         deadline=time.monotonic()+6*(request["timeout"]+30)+2*max(sum(RETRY_DELAYS),sum(USAGE_LIMIT_DELAYS))+600
         last_health=time.monotonic()
-        missed_health=0
+        unhealthy_since=None
+        health_attempts=[]
         while time.monotonic()<deadline:
             _cancel_wait(3, cancel_check)
-            if time.monotonic()-last_health > 30:
-                last_health=time.monotonic()
-                try:
-                    hcode,hb=_storage("GET","hb/worker.json")
-                    healthy=hcode==200 and time.time()-float(hb.get("ts",0))<90
-                except (OSError,ValueError,CliFailure):
-                    healthy=False
-                _cancel_checkpoint(cancel_check)
-                missed_health=0 if healthy else missed_health+1
-                if missed_health>=3:
-                    _terminal(request,attempts,"worker_disconnected")
+            # A completed result is stronger evidence than a delayed heartbeat.
             try:
                 code,result=_storage("GET","res/"+request["id"]+".json")
             except OSError:
-                continue
+                code,result=0,{}
             _cancel_checkpoint(cancel_check)
             if code!=200:
+                if time.monotonic()-last_health > 30:
+                    healthy,detail=_worker_heartbeat(fresh_sec=90)
+                    _cancel_checkpoint(cancel_check)
+                    last_health=time.monotonic()
+                    if healthy:
+                        if health_attempts:
+                            _record(request,outcome="worker_connection_recovered",attempts=health_attempts)
+                        unhealthy_since=None
+                        health_attempts=[]
+                    else:
+                        if unhealthy_since is None:
+                            unhealthy_since=last_health
+                        health_attempts.append({"provider":"worker","attempt":len(health_attempts)+1,
+                                                "reason":"worker_disconnected","heartbeat":detail})
+                        if last_health-unhealthy_since>=WORKER_DISCONNECT_GRACE_SEC:
+                            _terminal(request,attempts+health_attempts,"worker_disconnected")
                 continue
             if result.get("ok") and result.get("text"):
                 completed = result.get("payload") or {}
