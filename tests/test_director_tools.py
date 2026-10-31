@@ -57,6 +57,41 @@ def job_with_images(tmp_path, *names, status="completed"):
 
 
 # ===== 候補の展開 =====
+def test_add_icons_edits_selected_image_and_keeps_original_and_adoption(tmp_path, monkeypatch):
+    job = job_with_images(tmp_path, "diagram_001.png")
+    source = job / "images" / "diagram_001.png"
+    before = source.read_bytes()
+    image_edit.set_adopted(job, source.name, True, 1)
+    seen = []
+
+    def edit(client, path, prompt, output, **kwargs):
+        seen.append((path, prompt))
+        png(output, left="green")
+        return True, ""
+
+    monkeypatch.setattr(generator, "_sync_edit_image_openai", edit)
+    result = image_edit.request_edit(job, source.name, "add_icons", run_async=False, client_factory=lambda: object())
+    assert result["status"] == "ok" and result["label"] == "各ボックスにアイコンを追加"
+    assert seen == [(source, image_edit.ADD_ICONS_PROMPT)]
+    assert "Preserve every existing word" in seen[0][1]
+    assert "national flags" in seen[0][1]
+    assert source.read_bytes() == before
+    assert list(image_edit.load_adoption(job)) == [source.name]
+    assert result["output"] != source.name and (job / "images" / result["output"]).is_file()
+
+
+def test_add_icons_double_click_reuses_pending_edit(tmp_path, monkeypatch):
+    job = job_with_images(tmp_path, "diagram_001.png")
+    started = []
+    class WaitingThread:
+        def __init__(self, **kwargs): pass
+        def start(self): started.append(True)
+    monkeypatch.setattr(image_edit.threading, "Thread", WaitingThread)
+    one = image_edit.request_edit(job, "diagram_001.png", "add_icons", client_factory=lambda: object())
+    two = image_edit.request_edit(job, "diagram_001.png", "add_icons", client_factory=lambda: object())
+    assert two["duplicate"] and one["id"] == two["id"] and len(started) == 1
+
+
 def groups(n, **extra):
     return [dict({"index": i, "excerpt": f"抜粋{i}", "section": "第1章", "type": "diagram",
                   "prompt": f"prompt {i}"}, **extra) for i in range(1, n + 1)]

@@ -2,7 +2,7 @@
 """1枚ずつの手直しと採用の記録（2026-09-24）。
 
 - 左右反転: AI を使わずその場で作る（費用なし）。
-- 文字を全部消す / 指示して直す: OpenAI の画像編集（既定 gpt-image-2.5-sunburst）。1回で画像1枚分の費用。
+- 文字を全部消す / 各ボックスにアイコンを追加 / 指示して直す: OpenAI の画像編集（既定 gpt-image-2.5-sunburst）。1回で画像1枚分の費用。
 - 別の種類で作り直す（2026-10-14・retype.py）: 地図を図解・イラスト・実写風にするなど、同じ抜粋から作り直す。
   生成時と同じ画像モデルで1枚分の費用（地図にする時は画像代なし）。順番待ちで受け付け、同時に進める数を絞る。
 - 元の画像は上書きしない。直した画像は diagram_012__e1.png のような別ファイル（版）として保存し、
@@ -63,8 +63,18 @@ INSTRUCT_SUFFIX = (
     "\n\nOnly change what is requested above. Keep everything else in the image exactly the same: "
     "composition, style, colors, other objects and any existing text that is not mentioned."
 )
-ACTIONS = {"flip", "remove_text", "instruct", "retype"}
+ADD_ICONS_PROMPT = (
+    "Add one small, appropriate pictogram inside each existing content box in this diagram. "
+    "Choose each icon to explain that box's existing text or meaning, and keep all icons in a "
+    "consistent style that matches the original image. Use available empty space without "
+    "covering or changing any text. Preserve every existing word, number, box, arrow, connection, "
+    "color and the overall layout. Do not add new boxes, labels, facts, national flags or logos. "
+    "Keep useful existing icons; do not duplicate them. If a box has no room for an icon, "
+    "leave that box unchanged rather than obscuring its content."
+)
+ACTIONS = {"flip", "remove_text", "add_icons", "instruct", "retype"}
 ACTION_LABELS = {"flip": "左右反転", "remove_text": "文字を全部消す", "instruct": "指示して直す",
+                 "add_icons": "各ボックスにアイコンを追加",
                  "retype": "別の種類で作り直し"}
 
 
@@ -375,7 +385,8 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
         except Exception as exc:
             return finish(False, f"左右反転に失敗: {exc}")
 
-    prompt = REMOVE_TEXT_PROMPT if action == "remove_text" else instruction + INSTRUCT_SUFFIX
+    prompt = {"remove_text": REMOVE_TEXT_PROMPT, "add_icons": ADD_ICONS_PROMPT}.get(
+        action, instruction + INSTRUCT_SUFFIX)
 
     def retype_work():
         ok, error = False, ""
