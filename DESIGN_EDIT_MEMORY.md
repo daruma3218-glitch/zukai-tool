@@ -43,7 +43,8 @@ Windows / OpenAI SDK 2.32.0での比較:
 
 全出力のSHA-256は両版とも
 `44c83040f3ab2270e14a6a277d90824d14896ec1631d3bc5789f8892820182aa`。
-これは本番Linux/SDK 3.14.1の上限保証ではない。CIでもLinux上の同じ模擬計測と安定性検査を行う。
+これは本番環境の上限保証ではない。CIでもLinux上の同じ模擬計測と安定性検査を行う。
+CIの依存指定はRenderのbuildCommandと同じrequirements-migration.txtへ揃える。
 
 `tests/test_edit_memory.py` は実SDKの模擬通信で、空応答・不正な画像・保存失敗・429・タイムアウト後の
 close/再試行、明示GCによる応答解放、2通信と1展開、元画像と採用の不変を確認する。
