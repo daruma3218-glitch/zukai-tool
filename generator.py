@@ -29,7 +29,7 @@ from google.genai import types
 # Pillow（クロップ用）
 from PIL import Image
 from job_control import JobCancelled, check_cancel, wait_or_cancel
-from image_resources import IMAGE_TASK_LIMIT, limited_image_task
+from image_resources import IMAGE_TASK_LIMIT, limited_image_task, edit_pixels, release_unused_memory
 from safe_images import open_image
 
 
@@ -409,12 +409,9 @@ def _pad_to_ratio(img: "Image.Image", ratio: float) -> tuple:
     return canvas, (left, top, left + w, top + h)
 
 
-@limited_image_task
-def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_path: Path,
-                            model_name: str = DEFAULT_EDIT_MODEL, quality: str = "medium", on_start=None) -> tuple:
-    """元画像を OpenAI の画像編集で直し、元と同じ範囲・大きさで別ファイルに保存する。"""
-    if on_start:
-        on_start()  # The shared image slot has been acquired by the decorator.
+@edit_pixels
+def _prepare_edit_image(source_path):
+    """Close the native pixel buffers before waiting for the remote API."""
     with closing(open_image(source_path)) as src:
         canvas, box = _pad_to_ratio(src, EDIT_SIZE[0] / EDIT_SIZE[1])
     with closing(canvas):
@@ -422,41 +419,66 @@ def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_
         with closing(canvas.resize(EDIT_SIZE, Image.LANCZOS)) as sent, BytesIO() as buffer:
             sent.save(buffer, format="PNG")
             upload = buffer.getvalue()
+    return upload, canvas_size, box
+
+
+@edit_pixels
+def _save_edit_response(response, canvas_size, box, output_path):
+    """Read one response only after a pixel slot is available."""
+    result = response.parse()
+    datum = result.data[0] if result and result.data else None
+    b64 = getattr(datum, "b64_json", None) if datum else None
+    if not b64:
+        return False
+    with BytesIO(base64.b64decode(b64)) as decoded, closing(open_image(decoded)) as source:
+        with closing(source.convert("RGB")) as rgb, closing(rgb.resize(canvas_size, Image.LANCZOS)) as resized:
+            with closing(resized.crop(box)) as edited:
+                _save_png(edited, output_path)
+    return True
+
+
+@limited_image_task
+def _sync_edit_image_openai(client, source_path: Path, instruction: str, output_path: Path,
+                            model_name: str = DEFAULT_EDIT_MODEL, quality: str = "medium", on_start=None) -> tuple:
+    """元画像を OpenAI の画像編集で直し、元と同じ範囲・大きさで別ファイルに保存する。"""
+    if on_start:
+        on_start()  # The shared image slot has been acquired by the decorator.
+    upload, canvas_size, box = _prepare_edit_image(source_path)
     last_error = ""
     for attempt in range(MAX_RETRIES):
+        response = None
+        delay = 3 + 2 * attempt
         try:
-            response = client.images.edit(
+            with client.images.with_streaming_response.edit(
                 model=model_name,
                 image=("image.png", upload, "image/png"),
                 prompt=instruction,
                 size=f"{EDIT_SIZE[0]}x{EDIT_SIZE[1]}",
                 quality=quality,
                 n=1,
-            )
-            datum = response.data[0] if response and response.data else None
-            b64 = getattr(datum, "b64_json", None) if datum else None
-            if not b64:
-                last_error = "no image in response"
-                continue
-            with BytesIO(base64.b64decode(b64)) as decoded, closing(open_image(decoded)) as source:
-                with closing(source.convert("RGB")) as rgb, closing(rgb.resize(canvas_size, Image.LANCZOS)) as resized:
-                    with closing(resized.crop(box)) as edited:
-                        _save_png(edited, output_path)
+            ) as response:
+                if not _save_edit_response(response, canvas_size, box, output_path):
+                    last_error = "no image in response"
+                    continue
             return True, ""
         except Exception as e:
             err = str(e)
             last_error = err[:200]
             err_lower = err.lower()
             if "429" in err or "rate" in err_lower:
-                time.sleep(20 * (attempt + 1))
-                continue
-            if "safety" in err_lower or "policy" in err_lower or "moderation" in err_lower:
+                delay = 20 * (attempt + 1)
+            elif "safety" in err_lower or "policy" in err_lower or "moderation" in err_lower:
                 return False, f"content policy blocked: {err[:120]}"
             if "404" in err or "model_not_found" in err_lower or "does not exist" in err_lower:
                 return False, f"model not available: {model_name} ({err[:80]})"
             if "401" in err or "invalid api key" in err_lower:
                 return False, f"invalid OpenAI API key: {err[:80]}"
-            time.sleep(3 + 2 * attempt)
+        finally:
+            response = None
+            release_unused_memory()
+        # Leave the exception scope before sleeping: a traceback can itself
+        # retain a failed response and its image buffers during retry waits.
+        time.sleep(delay)
     return False, last_error or "max retries exceeded"
 
 

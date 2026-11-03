@@ -172,8 +172,12 @@ def test_edit_transitions_only_after_shared_slot_and_closes_client(tmp_path, mon
     def request(**kw):
         entered.set()
         assert release.wait(5)
-        return SimpleNamespace(data=[])
-    sdk.images.edit.side_effect = request
+        from contextlib import contextmanager
+        @contextmanager
+        def response():
+            yield SimpleNamespace(parse=lambda: SimpleNamespace(data=[]))
+        return response()
+    sdk.images.with_streaming_response.edit.side_effect = request
     constructor = Mock(return_value=sdk)
     monkeypatch.setattr("openai.OpenAI", constructor)
     original = image_edit._write

@@ -27,7 +27,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 from contextlib import closing
-from image_resources import image_task
+from image_resources import image_task, release_unused_memory
 
 import generator
 import resource_diagnostics
@@ -417,6 +417,10 @@ def request_edit(job_dir: Path, source: str, action: str, instruction: str = "",
                     client.close()
                 except Exception:
                     pass
+            client = None
+            # Includes client/transport cycles, after the local reference
+            # and all request/image frames have gone. Never restart the worker.
+            release_unused_memory()
         finish(ok, error)
 
     work = retype_work if action == "retype" else edit_work

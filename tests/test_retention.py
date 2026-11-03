@@ -118,6 +118,13 @@ def test_dry_run_reports_but_keeps(tmp_path):
 
 
 def test_expires_at_for_finished_and_none_for_active(tmp_path, monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls):
+            return NOW
+    # Match the job helper's fixed clock; this test must not age into a stale
+    # job simply because the real calendar has advanced past 2026-11-02.
+    monkeypatch.setattr(retention, "datetime", Clock)
     monkeypatch.setenv("ZUKAI_RETENTION_DAYS", "30")
     done = job(tmp_path, "20261001_000000", "completed", 0)
     running = job(tmp_path, "20261002_000000", "running", 0)

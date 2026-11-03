@@ -17,6 +17,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest==8.4.2
       - run: python -m pytest -q -p no:cacheprovider tests
+      - run: python tools/benchmark_edit_memory.py --count 32 --check-stable
       - uses: actions/setup-node@v4
         with:
           node-version: '20'

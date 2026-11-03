@@ -164,13 +164,22 @@ def test_ai_edit_is_cropped_back_to_original_size(tmp_path):
     source = png(tmp_path / "src.png", size=(320, 180))
 
     class FakeImages:
+        @property
+        def with_streaming_response(self):
+            return self
+
         def edit(self, **kwargs):
             assert kwargs["model"] == "gpt-image-2.5-sunburst"
             assert kwargs["size"] == "1536x1024"
             buffer = io.BytesIO()
             Image.new("RGB", (1536, 1024), "green").save(buffer, format="PNG")
             import base64
-            return mock.Mock(data=[mock.Mock(b64_json=base64.b64encode(buffer.getvalue()).decode())])
+            from contextlib import contextmanager
+            @contextmanager
+            def response():
+                yield mock.Mock(parse=lambda: mock.Mock(
+                    data=[mock.Mock(b64_json=base64.b64encode(buffer.getvalue()).decode())]))
+            return response()
 
     ok, error = generator._sync_edit_image_openai(mock.Mock(images=FakeImages()), source, "remove text",
                                                   tmp_path / "out.png", model_name="gpt-image-2.5-sunburst")
