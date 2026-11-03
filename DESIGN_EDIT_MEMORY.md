@@ -59,5 +59,20 @@ close/再試行、明示GCによる応答解放、2通信と1展開、元画像�
 mainへの反映で1回だけ自動deployし、Live・コミット・version=3・受付再開・保存データ一致を確認する。
 検証用の有料画像生成や強制停止は行わない。
 
-2026-11-03時点でブラウザー操作の自動安全確認が現在URLを特定できず停止したため、
-本番Shellでの受付保護・保存データ照合と本番反映は未実施。修正版は専用ブランチでCI確認後に保持する。
+## 本番反映・保持確認（2026-11-03 完了）
+
+ブラウザー操作の自動安全確認が現在URLを特定できず停止したため、本人がShellで受付保護と保存データ照合を実行した。
+生成・手直し0件と保存データの証拠を受領してから、d6d36069a5cf1ad3d7a9660d9d7262fbee4b2885をmainへ早送り。
+Render dep-dbkusebbc2fs738cknt0は23:24:12 JSTにLive。version=3・画像タスク上限2・手直し展開上限1とgateway/workerを確認した。
+
+前後とも3,653ファイル・4,052,190,164 bytes、画像2,811枚、adoption.json 10件、selection.json 6件。
+追加・欠損0件。3,652ファイルのSHA-256が一致し、画像・採用・選定・原稿・設定を保持。
+差分1件は既存の自動整理が保存するretention_state.json（126 bytes）のみ。本文を前後比較していないため時刻だけの差分とは断定しない。
+既存の自動整理処理と保存期間は変更しておらず、この実行状態記録は巻き戻さない。
+新instance khsxwでguard/readonlyマーカー不在・MIGRATION_ACCESS=activeを本人が読戻し、受付再開まで確認した。
+
+Renderと同じrequirements-migration.txt / OpenAI SDK3.14.1のLinux CIはPython296件・JS55件と32回の模擬手直しが成功。
+Linux模擬計測はRSS最大130,424,832 bytes、32回目124,039,168 bytes。本番起動後のRender値は117,047,300 bytes。
+本番の有料画像生成は検証目的で行っておらず、実運用での再発ゼロを保証するものではない。
+
+運用正本はAI_Workspaceのdocs/zukai-edit-memory-release-2026-11-03.md。
