@@ -41,22 +41,29 @@ LEGACY_GEMINI_IMAGE_MODELS = {
     "gemini-3.1-flash-image-preview", "gemini-3.1-flash-image", "gemini-2.5-flash-image",
     "gemini-3-pro-image-preview", "gemini-3-pro-image",
 }
-# 2026-09-24: 既定を gpt-image-2.5 Flare へ（OpenAI公式: gpt-image-2より高品質・待ち時間は約半分・トークン単価は同じ）。
-# 環境変数 OPENAI_IMAGE_MODEL=gpt-image-2 で従来に戻せる。
-DEFAULT_OPENAI_MODEL = "gpt-image-2.5-flare"
+# 2026-11-05: 通常生成は2.6 Flare、手直しは2.6 Sunburst。
+DEFAULT_OPENAI_MODEL = "gpt-image-2.6-flare"
 # UI で選べる OpenAI 画像モデル（順序=表示順）。
 OPENAI_IMAGE_MODEL_CHOICES = [
-    ("gpt-image-2.5-flare", "gpt-image-2.5 Flare（標準・高品質・低遅延）"),
-    ("gpt-image-2.5-sunburst", "gpt-image-2.5 Sunburst（編集制御向け・プレミアム）"),
+    ("gpt-image-2.6-flare", "GPT Image 2.6 Flare（標準・速度重視）"),
+    ("gpt-image-2.6-sunburst", "GPT Image 2.6 Sunburst（細かな編集重視）"),
+    ("gpt-image-2.5-flare", "GPT Image 2.5 Flare（従来・比較用）"),
+    ("gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst（従来・比較用）"),
     ("gpt-image-2", "gpt-image-2（従来）"),
 ]
 VALID_OPENAI_IMAGE_MODELS = {m for m, _ in OPENAI_IMAGE_MODEL_CHOICES}
 # 1枚ずつの手直し（文字消し・指示直し）は、編集の精度を重視した Sunburst を既定にする。
-DEFAULT_EDIT_MODEL = "gpt-image-2.5-sunburst"
+DEFAULT_EDIT_MODEL = "gpt-image-2.6-sunburst"
+CONFIGURED_OPENAI_MODEL_UPGRADES = {
+    "gpt-image-2": DEFAULT_OPENAI_MODEL,
+    "gpt-image-2.5-flare": DEFAULT_OPENAI_MODEL,
+    "gpt-image-2.5-sunburst": DEFAULT_EDIT_MODEL,
+}
 
 
 def resolve_edit_model() -> str:
     env = os.environ.get("ZUKAI_EDIT_MODEL", "").strip()
+    env = CONFIGURED_OPENAI_MODEL_UPGRADES.get(env, env)
     return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_EDIT_MODEL
 
 
@@ -73,6 +80,7 @@ def resolve_openai_image_model(*candidates) -> str:
         if c in VALID_OPENAI_IMAGE_MODELS:
             return c
     env = os.environ.get("OPENAI_IMAGE_MODEL", "").strip()
+    env = CONFIGURED_OPENAI_MODEL_UPGRADES.get(env, env)
     return env if env in VALID_OPENAI_IMAGE_MODELS else DEFAULT_OPENAI_MODEL
 
 
@@ -717,7 +725,7 @@ def run_parallel_generation(
     if gemini_model is None:
         gemini_model = resolve_gemini_image_model(os.environ.get("GEMINI_IMAGE_MODEL"))
     if openai_model is None:
-        openai_model = os.environ.get("OPENAI_IMAGE_MODEL", DEFAULT_OPENAI_MODEL)
+        openai_model = resolve_openai_image_model()
 
     generator = ParallelImageGenerator(
         provider=provider,

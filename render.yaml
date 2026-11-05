@@ -12,7 +12,7 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_IMAGE_MODEL
-        value: "gpt-image-2"
+        value: "gpt-image-2.6-flare"
       - key: GEMINI_IMAGE_MODEL
         value: "gemini-nano-banana-2.1"
       - key: APP_PASSWORD

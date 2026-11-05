@@ -143,14 +143,14 @@ def test_mixed_falls_back_to_single_when_variants_are_unusable():
 
 
 # ===== 既定モデル・編集の比率 =====
-def test_default_models_are_gpt_image_25(monkeypatch):
+def test_default_models_are_gpt_image_26(monkeypatch):
     monkeypatch.delenv("OPENAI_IMAGE_MODEL", raising=False)
     monkeypatch.delenv("ZUKAI_EDIT_MODEL", raising=False)
-    assert generator.resolve_openai_image_model() == "gpt-image-2.5-flare"
-    assert generator.resolve_edit_model() == "gpt-image-2.5-sunburst"
+    assert generator.resolve_openai_image_model() == "gpt-image-2.6-flare"
+    assert generator.resolve_edit_model() == "gpt-image-2.6-sunburst"
     monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-2")
-    assert generator.resolve_openai_image_model() == "gpt-image-2"  # 環境変数で従来に戻せる
-    assert generator.resolve_openai_image_model("gpt-image-2.5-sunburst") == "gpt-image-2.5-sunburst"
+    assert generator.resolve_openai_image_model() == "gpt-image-2.6-flare"  # 旧環境設定も新しい既定へ
+    assert generator.resolve_openai_image_model("gpt-image-2.6-sunburst") == "gpt-image-2.6-sunburst"
 
 
 def test_edit_padding_keeps_original_frame():
@@ -169,7 +169,7 @@ def test_ai_edit_is_cropped_back_to_original_size(tmp_path):
             return self
 
         def edit(self, **kwargs):
-            assert kwargs["model"] == "gpt-image-2.5-sunburst"
+            assert kwargs["model"] == "gpt-image-2.6-sunburst"
             assert kwargs["size"] == "1536x1024"
             buffer = io.BytesIO()
             Image.new("RGB", (1536, 1024), "green").save(buffer, format="PNG")
@@ -182,7 +182,7 @@ def test_ai_edit_is_cropped_back_to_original_size(tmp_path):
             return response()
 
     ok, error = generator._sync_edit_image_openai(mock.Mock(images=FakeImages()), source, "remove text",
-                                                  tmp_path / "out.png", model_name="gpt-image-2.5-sunburst")
+                                                  tmp_path / "out.png", model_name="gpt-image-2.6-sunburst")
     assert ok, error
     with Image.open(tmp_path / "out.png") as out:
         assert out.size == (320, 180)
@@ -244,8 +244,8 @@ def test_remove_text_runs_with_sunburst_and_records_result(client, tmp_path, mon
     res = client.post("/api/edit/20260924_120000", json={"source": "diagram_002.png", "action": "remove_text"})
     assert res.status_code == 200
     edits = client.get("/api/edits/20260924_120000").json["edits"]
-    assert edits[0]["status"] == "ok" and edits[0]["model"] == "gpt-image-2.5-sunburst"
-    assert calls[0][0] == "gpt-image-2.5-sunburst" and "Remove every piece of text" in calls[0][1]
+    assert edits[0]["status"] == "ok" and edits[0]["model"] == "gpt-image-2.6-sunburst"
+    assert calls[0][0] == "gpt-image-2.6-sunburst" and "Remove every piece of text" in calls[0][1]
 
 
 def test_duplicate_running_request_is_not_charged_twice(tmp_path, monkeypatch):
@@ -401,12 +401,12 @@ def test_start_passes_candidate_and_map_modes(client, monkeypatch, sent, expecte
 def test_version_reports_director_tools(client):
     version = client.get("/version").json
     assert version["director_tools"]["adoption"] is True
-    assert version["edit_image_model"] == "gpt-image-2.5-sunburst"
+    assert version["edit_image_model"] == "gpt-image-2.6-sunburst"
 
 
-@pytest.mark.parametrize("env, expected", [(None, "gpt-image-2.5-flare"), ("gpt-image-2", "gpt-image-2")])
+@pytest.mark.parametrize("env, expected", [(None, "gpt-image-2.6-flare"), ("gpt-image-2", "gpt-image-2.6-flare")])
 def test_upload_form_preselects_the_default_image_model(client, monkeypatch, env, expected):
-    # 画面の初期選択も環境変数 OPENAI_IMAGE_MODEL に従う（従来モデルへ戻す切替が画面にも効く）
+    # 旧環境設定が残っていても画面の初期選択は2.6にそろう。
     if env:
         monkeypatch.setenv("OPENAI_IMAGE_MODEL", env)
     else:
