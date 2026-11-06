@@ -372,6 +372,10 @@
 
           <!-- 送信ボタン -->
           <div class="generation-action-bar">
+          <div id="settingsNotice" role="status" aria-live="polite" class="hidden p-2.5 mb-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900">
+            <p><span class="font-semibold">いつもと違う設定です：</span><span id="settingsNoticeText"></span></p>
+            <p class="mt-0.5 flex flex-wrap items-center gap-x-3"><span id="settingsNoticeOrigin" class="text-amber-800"></span><button type="button" id="settingsReset" class="font-semibold text-purple-700 hover:underline">いつもの設定に戻す</button></p>
+          </div>
           <p id="generation-readiness" role="status" aria-live="polite" class="text-sm text-gray-600 mb-2">原稿を100文字以上入れると生成できます。</p>
           <div id="errorBox" role="alert" class="hidden p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700 mb-2"></div>
           <button
@@ -611,9 +615,11 @@
       if (readStore(INSTRUCTIONS_KEY)) restoreInstructions.classList.remove('hidden');
       updateEstimate();
       updateAdvancedSummary();
+      settingsOrigin = override === STANDARD_RESET ? '' : override ? 'retry' : readStore(SETTINGS_KEY) ? 'saved' : '';
+      updateSettingsNotice();
     }
-    function saveSettings() {
-      const data = {
+    function readSettings() {
+      return {
         provider: checkedValue('provider'), candidate_mode: checkedValue('candidate_mode'),
         openai_quality: checkedValue('openai_quality'),
         openai_model: document.querySelector('select[name="openai_model"]').value,
@@ -621,9 +627,73 @@
         worldview_preset: document.querySelector('select[name="worldview_preset"]').value,
         target_count: targetCount.value, concurrency: concurrency.value,
       };
-      writeStore(SETTINGS_KEY, JSON.stringify(data));
+    }
+    function saveSettings() {
+      writeStore(SETTINGS_KEY, JSON.stringify(readSettings()));
       if (userInstructions.value.trim()) writeStore(INSTRUCTIONS_KEY, userInstructions.value);
     }
+
+    // いつもと違う設定を、生成ボタンのそばに出す（2026-11-06）
+    // 前回の設定はこの端末に覚えて黙って戻すため、画質 High・2案のまま次の回に押されることがあった。
+    // 「いつも」＝この画面の初めの値（HTML の checked・selected・value）。図にする箇所は目安の欄に出ているので数えない。
+    function settingsDifferences(now, std, labels = {}) {
+      const out = [];
+      if (now.candidate_mode !== std.candidate_mode) {
+        out.push(now.candidate_mode === 'pair' ? '候補は2案（画像が約2倍）'
+          : now.candidate_mode === 'mixed' ? '候補は型違いで2〜3案（画像が約2〜3倍）' : '候補は1案');
+      }
+      if (now.provider !== std.provider) {
+        out.push(`画像のAIは ${now.provider === 'gpt-image' ? (labels.openai_model || 'GPT Image') : 'nanobanana'}`);
+      } else if (now.provider === 'gpt-image' && now.openai_model !== std.openai_model) {
+        out.push(`画像のモデルは ${labels.openai_model || now.openai_model}`);
+      }
+      if (now.provider === 'gpt-image' && now.openai_quality !== std.openai_quality) {
+        out.push(now.openai_quality === 'high' ? '画質 High（費用と時間が増える）' : now.openai_quality === 'low' ? '画質 Low' : '画質 Medium');
+      }
+      if (now.map_mode !== std.map_mode) {
+        out.push(now.map_mode === 'ai' ? '地図を画像AIで描く（地図にも画像代がかかる）' : '地図を実際の地図データで描く');
+      }
+      if (now.worldview_preset !== std.worldview_preset) {
+        out.push(now.worldview_preset ? `世界観は ${labels.worldview_preset || now.worldview_preset}` : '世界観なし（人物・背景・通貨を固定しない）');
+      }
+      return out;
+    }
+    let settingsOrigin = '';  // 'saved'＝前回この端末で生成した時の設定／'retry'＝元のジョブの設定
+    const STANDARD_SETTINGS = (() => {
+      const radio = name => ([...document.querySelectorAll(`input[name="${name}"]`)].find(r => r.defaultChecked) || {}).value || '';
+      const select = name => {
+        const el = document.querySelector(`select[name="${name}"]`);
+        const option = el && ([...el.options].find(o => o.defaultSelected) || el.options[0]);
+        return option ? option.value : '';
+      };
+      return {
+        provider: radio('provider'), candidate_mode: radio('candidate_mode'), openai_quality: radio('openai_quality'),
+        openai_model: select('openai_model'), map_mode: select('map_mode'), worldview_preset: select('worldview_preset'),
+        target_count: targetCount.defaultValue, concurrency: concurrency.defaultValue,
+      };
+    })();
+    // 戻すのは作り方だけ。図にする箇所は原稿ごとに決めるので、そのままにする。
+    const STANDARD_RESET = Object.assign({}, STANDARD_SETTINGS, {target_count: ''});
+    const settingsNotice = document.getElementById('settingsNotice');
+    function updateSettingsNotice() {
+      const diff = settingsDifferences(readSettings(), STANDARD_SETTINGS,
+        {openai_model: selectedText('openai_model'), worldview_preset: selectedText('worldview_preset')});
+      settingsNotice.classList.toggle('hidden', !diff.length);
+      document.getElementById('settingsNoticeText').textContent = diff.join('・');
+      document.getElementById('settingsNoticeOrigin').textContent = !diff.length ? ''
+        : settingsOrigin === 'saved' ? '前回この端末で生成した時の設定が残っています。'
+        : settingsOrigin === 'retry' ? '元のジョブの設定を引き継いでいます。' : '';
+    }
+    form.addEventListener('change', e => {
+      if (!['provider', 'candidate_mode', 'openai_quality', 'openai_model', 'map_mode', 'worldview_preset'].includes(e.target.name)) return;
+      settingsOrigin = '';
+      updateSettingsNotice();
+    });
+    document.getElementById('settingsReset').addEventListener('click', () => {
+      restoreSettings(STANDARD_RESET);
+      writeStore(SETTINGS_KEY, JSON.stringify(readSettings()));  // 次に開いた時も、いつもの設定から
+    });
+
     restoreInstructions.addEventListener('click', () => {
       userInstructions.value = readStore(INSTRUCTIONS_KEY) || '';
     });
