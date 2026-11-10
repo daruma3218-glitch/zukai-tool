@@ -7,6 +7,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='studio_home.css', v='20261110') }}">
   <style>
     body { font-family: 'Inter', 'Noto Sans JP', sans-serif; }
     .drop-zone { transition: all 0.2s; }
@@ -50,6 +51,7 @@
 {% include '_studio_icons.html' %}
 </head>
 <body class="bg-gradient-to-br from-purple-50 via-white to-pink-50 min-h-screen">
+  <a class="studio-skip-link" href="#studio-input">原稿入力へ移動</a>
 
   <!-- Navbar -->
   <nav class="bg-white/80 backdrop-blur border-b border-gray-200 sticky top-0 z-50">
@@ -67,10 +69,11 @@
   </nav>
 
   <div class="max-w-6xl mx-auto px-6 py-8">
+    <nav class="workspace-switcher" aria-label="作業へのショートカット"><a href="#studio-input" aria-current="page"><span aria-hidden="true">＋</span> 新しくつくる</a><a href="#studio-history"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 11a9 9 0 1 1 2 7M3 4v7h7M12 7v5l3 2"/></svg> 保存した制作を探す <span class="history-total">{{ past_jobs|length }}</span></a></nav>
     <div class="grid grid-cols-1 lg:grid-cols-5 gap-8">
 
       <!-- Main Form -->
-      <div class="lg:col-span-3">
+      <div class="lg:col-span-3" id="studio-input" tabindex="-1">
         <h1 class="text-3xl font-bold text-gray-900 mb-2">原稿から、図解をつくる</h1>
         <p class="text-sm text-gray-500 mb-6">原稿を入れると、図解・イメージ画像・地図の候補が並びます。</p>
 
@@ -322,7 +325,7 @@
                 <div class="p-4 bg-white border-2 border-gray-200 rounded-xl peer-checked:border-pink-500 peer-checked:bg-pink-50 transition hover:border-pink-300">
                   <div class="flex items-start gap-3">
                     <div class="flex-shrink-0 w-10 h-10 rounded-lg bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-white font-bold text-sm">
-                      2.5
+                      2.6
                     </div>
                     <div class="flex-1 min-w-0">
                       <div class="flex items-center gap-2 mb-0.5">
@@ -391,20 +394,27 @@
       </div>
 
       <!-- Sidebar: 過去ジョブ -->
-      <div class="lg:col-span-2">
-        <div class="bg-white rounded-xl border border-gray-200 p-5 sticky top-20">
+      <div class="lg:col-span-2" id="studio-history" tabindex="-1">
+        <div class="history-panel bg-white rounded-xl border border-gray-200 p-5 sticky top-20">
           <h2 class="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
             <svg class="w-4 h-4 text-purple-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-            最近のジョブ
+            保存した制作
           </h2>
           {% if past_jobs %}
-            <div class="space-y-2 max-h-[600px] overflow-y-auto">
+            <p class="history-intro">最近の{{ past_jobs|length }}件から、続きを開けます。</p>
+            <label class="history-search-label" for="history-search">タイトル・制作IDで検索</label><div class="history-search-wrap"><input type="search" id="history-search" placeholder="探したい言葉を入力" autocomplete="off" aria-describedby="history-search-help"><button id="history-clear" type="button" hidden>解除</button></div>
+            <p id="history-search-help" class="history-help">複数の言葉はスペースで区切って検索。</p>
+            <div class="history-filters" role="group" aria-label="制作の状態"><button type="button" data-history-filter="all" aria-pressed="true">すべて</button><button type="button" data-history-filter="working" aria-pressed="false">生成中</button><button type="button" data-history-filter="completed" aria-pressed="false">生成済み</button><button type="button" data-history-filter="attention" aria-pressed="false">要確認</button></div>
+            <p id="history-count" class="history-help" role="status" aria-live="polite"></p>
+            <div class="history-list space-y-2 max-h-[600px] overflow-y-auto">
               {% for job in past_jobs %}
-                <a href="/progress/{{ job.id }}" class="block p-3 rounded-lg border border-gray-100 hover:border-purple-200 hover:bg-purple-50 transition">
+                {% set incomplete = job.status == 'completed' and job.succeeded < job.target %}
+                {% set bucket = 'attention' if incomplete or job.status in ['error','interrupted','cancelled','unknown'] else ('working' if job.status in ['running','queued','cancelling'] else 'completed') %}
+                <a href="/progress/{{ job.id }}" class="history-job block p-3 rounded-lg border border-gray-100 hover:border-purple-200 hover:bg-purple-50 transition" data-history-job data-search="{{ job.title or job.id }} {{ job.id }}" data-bucket="{{ bucket }}">
                   <div class="flex items-start justify-between gap-2">
                     <div class="flex-1 min-w-0">
-                      <p class="text-xs font-medium text-gray-900 truncate">{{ job.title or job.id }}</p>
-                      <p class="text-xs text-gray-400 mt-0.5">{{ job.id }}</p>
+                      <p class="history-job-title text-xs font-medium text-gray-900">{{ job.title or job.id }}</p>
+                      <p class="history-job-id text-xs text-gray-400 mt-0.5">{{ job.id }}</p>
                     </div>
                     <span class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded
                       {% if job.status == 'completed' and job.succeeded < job.target %}bg-amber-100 text-amber-800
@@ -422,11 +432,13 @@
                       {% else %}{{ job.status }}{% endif %}
                     </span>
                   </div>
+                  <span class="history-job-action">{% if bucket == 'working' %}進み具合を見る{% elif bucket == 'attention' %}保存した画像と状態を確認{% else %}画像を見比べて採用{% endif %}<span aria-hidden="true">→</span></span>
                 </a>
               {% endfor %}
             </div>
+            <div class="history-empty" id="history-empty" hidden><strong>一致する制作はありません</strong><p>言葉を短くするか、条件を解除してください。</p><button type="button" id="history-reset">すべての制作に戻す</button></div>
           {% else %}
-            <p class="text-xs text-gray-400 text-center py-8">まだジョブがありません</p>
+            <div class="history-empty"><strong>最初の図解をつくりましょう</strong><p>原稿を入れて生成すると、ここからいつでも続きを開けます。</p><a href="#manuscriptText">原稿を入れる →</a></div>
           {% endif %}
         </div>
       </div>
@@ -434,6 +446,7 @@
     </div>
   </div>
 
+  <script src="{{ url_for('static', filename='studio_home.js', v='20261110') }}"></script>
   <script>
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
