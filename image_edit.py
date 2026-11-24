@@ -178,8 +178,10 @@ def recover_interrupted_edits(job_dir: Path) -> int:
     if not path.is_file():
         return 0
     with _JobLock(job_dir, EDITS_NAME):
-        data = _read(path, {"version": 1, "edits": []})
-        edits = data.get("edits", [])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        edits = data.get("edits", []) if isinstance(data, dict) else None
+        if not isinstance(edits, list) or any(not isinstance(edit, dict) for edit in edits):
+            raise EditError("手直しの記録を確認できませんでした。")
         count = sum(e.get("status") in ACTIVE_EDIT_STATUSES and e.get("owner") != PROCESS_OWNER for e in edits)
         if _mark_stale(edits, job_dir):
             backup = job_dir / "recovery_history" / f"edits-{uuid.uuid4().hex}"

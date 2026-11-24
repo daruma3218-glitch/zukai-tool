@@ -59,6 +59,33 @@ def test_recovery_never_interrupts_current_or_terminal_jobs(client, tmp_path):
     assert [p.joinpath("job.json").read_bytes() for p in (active, complete)] == before
 
 
+@pytest.mark.parametrize(("name", "contents"), [
+    ("job.json", b'[{"old": true}]'),
+    ("manifest.json", b'["unfinished"]'),
+    ("images_progress.json", b'{"items":[null]}'),
+    ("images_progress.json", b'{"items":['),
+    ("edits.json", b'{"edits":[null]}'),
+])
+def test_one_invalid_record_does_not_block_startup_or_other_jobs(client, tmp_path, monkeypatch, name, contents):
+    damaged = job(tmp_path, name="20261004_110000_abcdef", active=False)
+    healthy = job(tmp_path, name="20261004_120000_abcdef", active=False)
+    png(healthy / "images" / "diagram_001.png")
+    path = damaged / name
+    path.write_bytes(contents)
+    before = {p.name: p.read_bytes() for p in damaged.iterdir() if p.is_file()}
+    # Exercise the production WSGI initializer, without enabling a deployment watcher.
+    monkeypatch.setattr(deploy_guard, "install", lambda module, root: module.app)
+    runtime = migration_entry.WorkerRuntime(service, tmp_path, "active")
+    from werkzeug.test import Client
+    assert Client(runtime).get("/version").status_code == 200
+    assert path.read_bytes() == contents
+    after = {p.name: p.read_bytes() for p in damaged.iterdir() if p.is_file()}
+    assert after == before
+    state = client.get(f"/api/status/{healthy.name}").json
+    assert state["status"] == "interrupted" and state["succeeded"] == 1
+    assert client.get("/").status_code == 200
+
+
 def test_restart_clears_only_old_metadata_locks(client, tmp_path):
     path = job(tmp_path, active=False)
     for lock in (path / ".edits.json.lock", path / ".adoption.json.lock", tmp_path / retention.LOCK_NAME):

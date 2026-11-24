@@ -307,7 +307,7 @@ def _job_elapsed_seconds(job_id: str, state: dict):
 def _get_job_state(job_id: str) -> dict:
     # 複数のGunicornワーカーと再起動後も、保存済みの最新状態を優先する。
     state = load_json(OUTPUT_DIR / job_id / "job.json", {})
-    if state:
+    if isinstance(state, dict) and state:
         return state
     with _jobs_lock:
         if job_id in _jobs:
@@ -379,6 +379,52 @@ def _release_job_resources(job_id, operation):
     resource_diagnostics.record("finished", operation, active_jobs=active)
 
 
+def _recovery_metadata(path, default):
+    """During recovery an unreadable file must never be mistaken for an empty one."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid object in {path.name}")
+    items = value.get("items")
+    if items is not None and (not isinstance(items, list) or any(not isinstance(item, dict) for item in items)):
+        raise ValueError(f"Invalid items in {path.name}")
+    return value
+
+
+def _recover_interrupted_job(directory):
+    state = _recovery_metadata(directory / "job.json", {})
+    if directory.name in _active_jobs or state.get("status") not in {"queued", "running", "cancelling"}:
+        return False
+    manifest = _recovery_metadata(directory / "manifest.json", {})
+    items = _image_snapshot(directory, read_metadata=_recovery_metadata)["items"]
+    for item in items:
+        if item.get("status") not in {"ok", "failed"}:
+            item.update(status="interrupted", success=False)
+    succeeded = sum(i.get("status") == "ok" for i in items)
+    failed = sum(i.get("status") == "failed" for i in items)
+    # Preserve the exact pre-recovery metadata before replacing any of the records.
+    history = directory / "recovery_history" / secrets.token_hex(8)
+    history.mkdir(parents=True)
+    for name in ("job.json", "images_progress.json", "manifest.json"):
+        source = directory / name
+        if source.is_file():
+            shutil.copy2(source, history / name)
+    now = datetime.now().isoformat()
+    save_json(directory / "images_progress.json", {"items": items, "updated_at": now})
+    manifest.update(status="interrupted", items=items, succeeded=succeeded, failed=failed,
+                    images_planned=len(items), interrupted_at=now)
+    save_json(directory / "manifest.json", manifest)
+    state.update(status="interrupted", updated_at=now, interrupted_at=now,
+                 succeeded=succeeded, failed=failed,
+                 message=f"サーバーの再起動で中断しました。完成済み {succeeded}枚は保存されています。未生成分の再生成、または設定を直した作り直しを選べます。")
+    save_json(directory / "job.json", state)
+    _add_log(directory.name, "system", "サーバー再起動による中断を検出。完成画像を保持しました。")
+    _release_job_resources(directory.name, "startup")
+    return True
+
+
 def recover_interrupted_jobs():
     """Run once at worker startup, before accepting requests (one worker only).
 
@@ -396,37 +442,12 @@ def recover_interrupted_jobs():
         for directory in sorted(root.iterdir()):
             if directory.is_symlink() or not directory.is_dir():
                 continue
-            recovered_edits += image_edit.recover_interrupted_edits(directory)
-            state = load_json(directory / "job.json", {})
-            if (directory.name in _active_jobs
-                    or state.get("status") not in {"queued", "running", "cancelling"}):
-                continue
-            # Preserve the exact pre-recovery metadata, not just a rewritten state.
-            history = directory / "recovery_history" / secrets.token_hex(8)
-            history.mkdir(parents=True)
-            for name in ("job.json", "images_progress.json", "manifest.json"):
-                source = directory / name
-                if source.is_file():
-                    shutil.copy2(source, history / name)
-            items = _image_snapshot(directory)["items"]
-            for item in items:
-                if item.get("status") not in {"ok", "failed"}:
-                    item.update(status="interrupted", success=False)
-            succeeded = sum(i.get("status") == "ok" for i in items)
-            failed = sum(i.get("status") == "failed" for i in items)
-            now = datetime.now().isoformat()
-            save_json(directory / "images_progress.json", {"items": items, "updated_at": now})
-            manifest = load_json(directory / "manifest.json", {})
-            manifest.update(status="interrupted", items=items, succeeded=succeeded, failed=failed,
-                            images_planned=len(items), interrupted_at=now)
-            save_json(directory / "manifest.json", manifest)
-            state.update(status="interrupted", updated_at=now, interrupted_at=now,
-                         succeeded=succeeded, failed=failed,
-                         message=f"サーバーの再起動で中断しました。完成済み {succeeded}枚は保存されています。未生成分の再生成、または設定を直した作り直しを選べます。")
-            save_json(directory / "job.json", state)
-            _add_log(directory.name, "system", "サーバー再起動による中断を検出。完成画像を保持しました。")
-            _release_job_resources(directory.name, "startup")
-            recovered_jobs += 1
+            try:
+                recovered_edits += image_edit.recover_interrupted_edits(directory)
+                recovered_jobs += int(_recover_interrupted_job(directory))
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                job_id = directory.name if retention.JOB_ID_RE.fullmatch(directory.name) else "(unknown)"
+                app.logger.warning("Skipped recovery for job %s (%s)", job_id, type(exc).__name__)
         _recovered_roots.add(identity)
         resource_diagnostics.record("recovered", "startup", recovered_jobs=recovered_jobs,
                                     recovered_edits=recovered_edits)
@@ -443,13 +464,13 @@ def _completed_images(result_dir: Path) -> list[Path]:
                   and path.stat().st_size > 0)
 
 
-def _image_snapshot(result_dir: Path, images=None) -> dict:
+def _image_snapshot(result_dir: Path, images=None, *, read_metadata=load_json) -> dict:
     """状態保存が途切れた旧ジョブも、残っている画像から表示・DLを復元する。"""
     images = _completed_images(result_dir) if images is None else images
-    snapshot = load_json(result_dir / "images_progress.json", {})
-    items = snapshot.get("items") or load_json(result_dir / "manifest.json", {}).get("items") or []
+    snapshot = read_metadata(result_dir / "images_progress.json", {})
+    items = snapshot.get("items") or read_metadata(result_dir / "manifest.json", {}).get("items") or []
     if not items:
-        items = load_json(result_dir / "prompts.json", {}).get("items", [])
+        items = read_metadata(result_dir / "prompts.json", {}).get("items", [])
     items = [dict(item) for item in items]
     available = {path.name for path in images}
     for item in items:
@@ -621,6 +642,10 @@ def index():
                 continue
             manifest = load_json(d / "manifest.json", {})
             job_state = load_json(d / "job.json", {})
+            if not isinstance(manifest, dict):
+                manifest = {}
+            if not isinstance(job_state, dict):
+                job_state = {}
             if not manifest and not job_state:
                 continue
             past_jobs.append({
