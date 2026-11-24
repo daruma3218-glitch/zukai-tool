@@ -154,6 +154,28 @@ def load_state(output_dir: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _disk_usage(output_dir: Path, usage_fn: Callable):
+    try:
+        usage = usage_fn(str(output_dir))
+    except OSError:
+        return None
+    return usage if usage.total > 0 and 0 <= usage.used <= usage.total else None
+
+
+def _previous_measurement(state: dict) -> Optional[dict]:
+    sample = state.get("last_measurement")
+    if "last_measurement" not in state:
+        # 旧形式は容量整理後の使用率を解放予定量から計算していた。
+        if state.get("capacity_triggered") and (state.get("deleted") or state.get("trimmed")):
+            return None
+        sample = state
+    if isinstance(sample, dict) and _parse_time(sample.get("at")):
+        ratio = sample.get("usage_ratio")
+        if type(ratio) in (int, float) and 0 <= ratio <= 1:
+            return {"at": sample["at"], "usage_ratio": ratio}
+    return None
+
+
 def _job_dirs(output_dir: Path) -> list:
     if not output_dir.is_dir():
         return []
@@ -294,26 +316,41 @@ def run_retention(output_dir: Path, *, now: Optional[datetime] = None, days: Opt
             else:
                 remaining.append((updated, job))
 
-        try:
-            usage = usage_fn(str(output_dir))
-            total, used = usage.total, usage.used
-        except OSError:
-            total = used = 0
-        if total and used / total > max_usage:
+        at = now.isoformat(timespec="seconds")
+        initial = _disk_usage(output_dir, usage_fn)
+        measured = initial
+        ratio = initial.used / initial.total if initial else None
+        if ratio is not None and ratio > max_usage:
             summary["capacity_triggered"] = True
             target = max_usage - 0.10
+            projected_used = initial.used
             for updated, job in remaining:
-                if used / total <= target:
+                if projected_used / initial.total <= target:
                     break
-                used -= dispose(job, updated, f"容量が{int(max_usage * 100)}%を超えた")
-            if used / total > max_usage:
-                summary["warning"] = (f"保存領域の{int(used / total * 100)}%を使っています。採用した画像や"
-                                      "実行中の結果は自動では消さないため、不要な結果の整理かディスクの増量が必要です。")
-                _log(output_dir, {"at": now.isoformat(timespec="seconds"), "action": "warning",
-                                  "reason": summary["warning"], "dry_run": dry_run})
-        summary["usage_ratio"] = round(used / total, 4) if total else None
+                projected_used -= dispose(job, updated, f"容量が{int(max_usage * 100)}%を超えた")
+            if dry_run:
+                ratio = max(0, projected_used) / initial.total
+            elif projected_used != initial.used:
+                measured = _disk_usage(output_dir, usage_fn)
+                ratio = measured.used / measured.total if measured else None
+
+        latest = measured or initial
+        last_measurement = ({"at": at, "usage_ratio": round(latest.used / latest.total, 4)}
+                            if latest else _previous_measurement(load_state(output_dir)))
+        if ratio is None:
+            summary["warning"] = "保存領域の現在の使用率を確認できませんでした。"
+            if last_measurement:
+                when = last_measurement["at"].replace("T", " ")
+                summary["warning"] += (f"前回の実測は{when}（サーバー時刻）の"
+                                       f"{last_measurement['usage_ratio']:.1%}です。")
+        elif ratio > max_usage:
+            summary["warning"] = (f"保存領域の{int(ratio * 100)}%を使っています。採用した画像や"
+                                  "実行中の結果は自動では消さないため、不要な結果の整理かディスクの増量が必要です。")
+        if summary["warning"]:
+            _log(output_dir, {"at": at, "action": "warning", "reason": summary["warning"], "dry_run": dry_run})
+        summary["usage_ratio"] = round(ratio, 4) if ratio is not None else None
         if not dry_run:
-            state = {"at": now.isoformat(timespec="seconds"), "usage_ratio": summary["usage_ratio"],
+            state = {"at": at, "usage_ratio": summary["usage_ratio"], "last_measurement": last_measurement,
                      "deleted": len(summary["deleted"]), "trimmed": len(summary["trimmed"]),
                      "capacity_triggered": summary["capacity_triggered"], "warning": summary["warning"]}
             try:

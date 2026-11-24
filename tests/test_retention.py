@@ -83,8 +83,12 @@ def test_capacity_deletes_oldest_finished_until_target(tmp_path):
     newest = job(tmp_path, "20261010_000000", "completed", 10, size=100)
     active = job(tmp_path, "20261030_110000", "running", 0.01, size=100)
     # 使用率 90% → 上限80%を超過。目標70%まで古い順に消す（1件=100バイトで80%→… と減る想定）
-    summary = retention.run_retention(tmp_path, now=NOW, days=30, max_usage=0.80,
-                                      usage_fn=lambda _p: Usage(1000, 900, 100))
+    def usage(_path):
+        remaining = (oldest, middle, newest)
+        used = 900 - 100 * sum(not folder.exists() for folder in remaining)
+        return Usage(1000, used, 1000 - used)
+
+    summary = retention.run_retention(tmp_path, now=NOW, days=30, max_usage=0.80, usage_fn=usage)
     deleted = [d["job_id"] for d in summary["deleted"]]
     assert deleted[0] == "20261001_000000"
     assert not oldest.exists()
@@ -196,3 +200,63 @@ def test_dry_run_does_not_trim(tmp_path):
     assert len(summary["trimmed"]) == 1
     assert (old / "images" / "diagram_001.png").exists() and not retention.is_trimmed(old)
     assert retention.load_state(tmp_path) == {}
+
+
+def unavailable(_path):
+    raise OSError("disk statistics are unavailable")
+
+
+def test_unreadable_usage_preserves_last_measurement_until_a_new_read_succeeds(tmp_path):
+    active = job(tmp_path, "20261030_110000", "running", 0.01)
+    high = retention.run_retention(tmp_path, now=NOW, usage_fn=lambda _: Usage(1000, 900, 100))
+    assert high["usage_ratio"] == 0.9 and high["warning"]
+    for hour in (1, 2):
+        latest = NOW + timedelta(hours=hour)
+        result = retention.run_retention(tmp_path, now=latest, usage_fn=unavailable)
+        saved = retention.load_state(tmp_path)
+        assert result["usage_ratio"] is None and saved["usage_ratio"] is None
+        assert saved["at"] == latest.isoformat(timespec="seconds")
+        assert saved["last_measurement"] == {"at": NOW.isoformat(timespec="seconds"), "usage_ratio": 0.9}
+        assert "確認できません" in result["warning"] and "前回の実測" in result["warning"]
+        assert "90.0%" in result["warning"] and "90%を使っています" not in result["warning"]
+        assert saved["warning"] == result["warning"] and active.exists()
+    healthy = retention.run_retention(tmp_path, now=NOW + timedelta(hours=3), usage_fn=roomy)
+    assert healthy["usage_ratio"] == 0.1 and healthy["warning"] is None
+    saved = retention.load_state(tmp_path)
+    assert saved["warning"] is None and saved["last_measurement"]["usage_ratio"] == 0.1
+
+
+def test_first_failed_or_zero_capacity_read_is_unknown(tmp_path):
+    for probe in (unavailable, lambda _: Usage(0, 0, 0)):
+        result = retention.run_retention(tmp_path, now=NOW, usage_fn=probe)
+        assert result["usage_ratio"] is None and "確認できません" in result["warning"]
+        assert "%" not in result["warning"]
+        assert retention.load_state(tmp_path)["last_measurement"] is None
+
+
+def test_existing_state_reuses_only_measured_usage(tmp_path):
+    past = (NOW - timedelta(days=1)).isoformat(timespec="seconds")
+    state = tmp_path / retention.STATE_NAME
+    for trimmed, expected in ((0, {"at": past, "usage_ratio": 0.86}), (1, None)):
+        state.write_text(json.dumps({"at": past, "usage_ratio": 0.86, "capacity_triggered": True,
+                                     "deleted": 0, "trimmed": trimmed}), encoding="utf-8")
+        retention.run_retention(tmp_path, now=NOW, usage_fn=unavailable)
+        assert retention.load_state(tmp_path)["last_measurement"] == expected
+
+
+def test_cleanup_reports_measured_usage_even_when_files_did_not_free_expected_space(tmp_path):
+    finished = job(tmp_path, "20261020_000000", "completed", 10, size=600)
+    active = job(tmp_path, "20261030_110000", "running", 0.01)
+    result = retention.run_retention(tmp_path, now=NOW, usage_fn=lambda _: Usage(1000, 900, 100))
+    assert not finished.exists() and active.exists()
+    assert result["usage_ratio"] == 0.9 and "90%" in result["warning"]
+    assert retention.load_state(tmp_path)["last_measurement"]["usage_ratio"] == 0.9
+
+
+def test_failed_post_cleanup_probe_keeps_initial_read_and_reports_uncertainty(tmp_path):
+    finished = job(tmp_path, "20261020_000000", "completed", 10, size=600)
+    readings = iter((lambda _: Usage(1000, 900, 100), unavailable))
+    result = retention.run_retention(tmp_path, now=NOW, usage_fn=lambda path: next(readings)(path))
+    assert not finished.exists()
+    assert result["capacity_triggered"] and result["usage_ratio"] is None
+    assert "確認できません" in result["warning"] and "90.0%" in result["warning"]
